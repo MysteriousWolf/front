@@ -9,13 +9,13 @@ Uses braille characters to render radar reflectivity, weather warnings, and surf
 Needs Rust (1.70+). Quickest way:
 
 ```bash
-cargo install --git https://github.com/mpevec/front
+cargo install --git https://github.com/MysteriousWolf/front
 ```
 
 Or clone and build locally:
 
 ```bash
-git clone https://github.com/mpevec/front
+git clone https://github.com/MysteriousWolf/front
 cd front
 cargo build --release
 ./target/release/front
