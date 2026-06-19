@@ -1,0 +1,46 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock is intentionally tracked (binary crate)
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Claude Code local state
+.claude/settings.local.json
+.sisyphus/
+
+# CLAUDE.md is intentionally tracked (project instructions)
+
+# Runtime caches and logs (written to ~/.cache/front, but guard in-repo paths too)
+*.log
+*.log.*
+
+# Test fixtures / large binary assets (GeoTIFF etc.)
+*.tif
+*.tiff
+*.geotiff
+
+# Profiling artefacts
+perf.data
+perf.data.old
+flamegraph.svg
+callgrind.out.*
+massif.out.*
+
+# Patch leftovers
+*.orig
+*.rej
