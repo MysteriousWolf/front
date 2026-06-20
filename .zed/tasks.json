@@ -9,11 +9,8 @@
   },
   {
     "label": "format",
-    "command": "sh",
-    "args": [
-      "-c",
-      "cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all --check"
-    ],
+    "command": ".zed/format.sh",
+    "args": [],
     "reveal": "always",
     "hide": "never",
     "save": "all"
