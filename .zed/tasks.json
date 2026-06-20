@@ -1,0 +1,29 @@
+[
+  {
+    "label": "run",
+    "command": "cargo",
+    "args": ["run"],
+    "reveal": "always",
+    "hide": "never",
+    "save": "all"
+  },
+  {
+    "label": "format",
+    "command": "sh",
+    "args": [
+      "-c",
+      "cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all --check"
+    ],
+    "reveal": "always",
+    "hide": "never",
+    "save": "all"
+  },
+  {
+    "label": "test",
+    "command": "cargo",
+    "args": ["test", "--all-features"],
+    "reveal": "always",
+    "hide": "never",
+    "save": "all"
+  }
+]

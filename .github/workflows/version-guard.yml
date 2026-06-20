@@ -1,0 +1,76 @@
+name: Version guard
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  validate-version:
+    name: Validate version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version: $VERSION  |  tag push: $IS_TAG"
+
+      - name: Validate YY.N format
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]{2}\.[1-9][0-9]*$'; then
+            MSG="Cargo.toml version '$VERSION' does not match YY.N format (e.g. 26.1). Fix before tagging a release."
+            if [ "$IS_TAG" = "true" ]; then
+              echo "::error::$MSG"
+              exit 1
+            else
+              echo "::warning::$MSG"
+            fi
+          fi
+
+      # Tag-only checks: these only apply when a v* tag is pushed.
+
+      - name: Validate tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${{ steps.ver.outputs.version }}"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Tag '$TAG' does not match Cargo.toml version '$VERSION' (expected tag: v$VERSION)."
+            exit 1
+          fi
+
+      - name: Validate year matches current calendar year
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          YY=$(echo "${{ steps.ver.outputs.version }}" | cut -d. -f1)
+          CURRENT_YY=$(date -u +%y)
+          if [ "$YY" != "$CURRENT_YY" ]; then
+            echo "::error::Version year '$YY' does not match the current year '$CURRENT_YY'. Version must be $CURRENT_YY.N."
+            exit 1
+          fi
+
+      - name: Check for duplicate release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="v$VERSION"
+          RELEASE=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+            --jq '.tag_name' 2>/dev/null || echo "")
+          if [ -n "$RELEASE" ]; then
+            N=$(echo "$VERSION" | cut -d. -f2)
+            YY=$(echo "$VERSION" | cut -d. -f1)
+            echo "::error::Release '$TAG' already exists. Bump to $YY.$((N + 1)) for the next release."
+            exit 1
+          fi

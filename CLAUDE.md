@@ -2,6 +2,26 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git — standing rules
+
+**No agent-initiated git operations.** The agent must never run `git commit`, `git push`, `git branch`, `git checkout -b`, `git tag`, or any command that creates, modifies, or publishes git state. No PRs may be opened by the agent. All git operations — committing, tagging, pushing, branching, opening PRs — are performed manually by the repo owner after manual review. This applies to every task in this repo, not just individual requests.
+
+### Versioning scheme
+
+Version format: `YY.N` — two-digit year, dot, sequential release number starting at 1 for that year.
+
+| Example | Meaning |
+|---|---|
+| `26.1` | First release of 2026 |
+| `26.5` | Fifth release of 2026 |
+| `28.1` | First release of 2028 (resets to 1) |
+
+- `Cargo.toml` `version` field uses this format directly (e.g. `version = "26.1"`).
+- Git tags use the prefix `v` followed by the version (e.g. `v26.1`). Tag and `Cargo.toml` must always match.
+- The sequential counter resets to 1 on each new calendar year.
+- Bumping the version and creating the tag are manual steps only — never automated by the agent.
+- CI (`version-guard.yml`) validates the format, year, tag–Cargo.toml match, and uniqueness on every tag push but never creates or modifies versions.
+
 ## What this is
 
 `front` (Fancy Radar ObservatioN Tool) is a Rust terminal UI application that renders a live weather radar map in the terminal. It uses ratatui for TUI rendering, tokio for async, and crossterm for terminal control. Data comes from three European weather APIs: MeteoGate (radar tiles via S3), MeteoAlarm (weather warnings), and EUMETNET (surface observations via MeteoGate).
