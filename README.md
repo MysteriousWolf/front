@@ -54,6 +54,7 @@ Big thanks to the people behind these:
 | [MeteoAlarm](https://meteoalarm.org) | Weather warning polygons |
 | [EUMETNET](https://eumetnet.eu) | Surface observation network |
 | [Natural Earth](https://naturalearthdata.com) | Country and region borders |
+| [Blitzortung.org](https://blitzortung.org) | Real-time lightning strikes (opt-in, off by default) |
 
 ## License
 

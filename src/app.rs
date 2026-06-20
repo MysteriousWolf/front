@@ -60,6 +60,10 @@ pub struct BorderMaskPoint {
     pub kind: BorderLineKind,
 }
 
+/// Impact animation duration shared between `App` (prune/animate logic)
+/// and `ui` (frame selection).
+pub(crate) const LIGHTNING_IMPACT_MS: u32 = 900;
+
 #[derive(Debug)]
 pub struct App {
     pub viewport: Viewport,
@@ -166,6 +170,15 @@ pub struct App {
     /// `spawn_blocking` threads (tile generation, cache loading)
     /// exit promptly instead of keeping the process alive.
     pub cancel: Arc<AtomicBool>,
+    /// Active strikes `(world_position, arrival_instant, polarity)`.
+    /// polarity > 0 = positive (rare), ≤ 0 = negative (common).  Pruned each tick.
+    pub lightning_strikes: Vec<(WorldPoint, std::time::Instant, i8)>,
+    #[cfg_attr(not(feature = "lightning"), allow(dead_code))]
+    lightning_tx: UnboundedSender<(WorldPoint, i8)>,
+    lightning_rx: UnboundedReceiver<(WorldPoint, i8)>,
+    lightning_task: Option<JoinHandle<()>>,
+    lightning_cancel: Option<Arc<AtomicBool>>,
+    lightning_close_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl App {
@@ -198,6 +211,7 @@ impl App {
         let (warn_tx, warn_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
+        let (lightning_tx, lightning_rx) = unbounded_channel::<(WorldPoint, i8)>();
         write_log(&log, "boot: creating providers");
         let cancel = Arc::new(AtomicBool::new(false));
         let meteogate = MeteoGateProvider::new(
@@ -277,10 +291,23 @@ impl App {
             preload_tasks: Vec::new(),
             frame_list_tx,
             frame_list_rx,
+            lightning_strikes: Vec::new(),
+            lightning_tx,
+            lightning_rx,
+            lightning_task: None,
+            lightning_cancel: None,
+            lightning_close_tx: None,
         };
 
         write_log(&log, "boot: loading saved state");
         app.load_state();
+
+        // If lightning was enabled in the last session, connect immediately
+        // so data starts arriving before the user interacts with the panel.
+        if app.layers.enabled(LayerId::Lightning) {
+            write_log(&log, "boot: lightning enabled, connecting");
+            app.request_lightning_connect();
+        }
 
         // Launch border loading in background — never block boot on it.
         write_log(
@@ -1307,6 +1334,102 @@ impl App {
         if let Some(task) = self.warn_task.take() {
             task.abort();
         }
+        self.abort_lightning();
+    }
+
+    /// Spawn the background Blitzortung WebSocket task.  No-op when the
+    /// `lightning` feature is disabled.
+    pub fn request_lightning_connect(&mut self) {
+        self.abort_lightning();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.lightning_cancel = Some(cancel.clone());
+        self.layers
+            .set_status(LayerId::Lightning, LayerStatus::Loading);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        self.lightning_close_tx = Some(close_tx);
+        #[cfg(feature = "lightning")]
+        {
+            let tx = self.lightning_tx.clone();
+            let log = self.dirs.log_path.clone();
+            self.lightning_task = Some(tokio::spawn(async move {
+                crate::providers::lightning::connect_and_stream(tx, log, cancel, close_rx).await;
+            }));
+        }
+        #[cfg(not(feature = "lightning"))]
+        let _ = close_rx;
+        write_log(&self.dirs.log_path, "lightning: connection requested");
+    }
+
+    /// Signal the WS task to send a Close frame and exit, then abort as
+    /// fallback.  Resets the layer status to Idle.
+    pub fn abort_lightning(&mut self) {
+        // Send WS Close signal first so the server receives a proper goodbye.
+        if let Some(tx) = self.lightning_close_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(cancel) = self.lightning_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(task) = self.lightning_task.take() {
+            task.abort();
+        }
+        self.layers
+            .set_status(LayerId::Lightning, LayerStatus::Idle);
+    }
+
+    /// Drain `(position, polarity)` pairs from the background task channel,
+    /// prune expired strikes, and return `true` when the set changed.
+    pub fn drain_lightning_results(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let trail_dur =
+            std::time::Duration::from_secs(u64::from(self.layers.lightning_trail_minutes) * 60);
+        let impact_dur = std::time::Duration::from_millis(u64::from(LIGHTNING_IMPACT_MS));
+
+        let mut changed = false;
+        while let Ok((point, pol)) = self.lightning_rx.try_recv() {
+            // x < 0 is the CONNECTED_SENTINEL — marks a successful handshake.
+            if point.x < 0.0 {
+                self.layers
+                    .set_status(LayerId::Lightning, LayerStatus::Ready);
+                changed = true;
+                continue;
+            }
+            self.lightning_strikes.push((point, now, pol));
+            changed = true;
+        }
+
+        // Prune strikes beyond the trail window.
+        let before = self.lightning_strikes.len();
+        self.lightning_strikes
+            .retain(|(_, t, _)| now.duration_since(*t) < trail_dur);
+        changed |= self.lightning_strikes.len() < before;
+
+        // Cap to prevent unbounded growth during heavy storm activity.
+        const MAX_STRIKES: usize = 5_000;
+        if self.lightning_strikes.len() > MAX_STRIKES {
+            let excess = self.lightning_strikes.len() - MAX_STRIKES;
+            self.lightning_strikes.drain(..excess);
+            changed = true;
+        }
+
+        // Keep animating as long as any strike is still in impact phase.
+        if !changed {
+            changed = self
+                .lightning_strikes
+                .iter()
+                .any(|(_, t, _)| now.duration_since(*t) < impact_dur);
+        }
+
+        changed
+    }
+
+    /// True when at least one strike is in its impact animation window.
+    pub fn has_lightning_impact(&self) -> bool {
+        let impact_dur = std::time::Duration::from_millis(u64::from(LIGHTNING_IMPACT_MS));
+        let now = std::time::Instant::now();
+        self.lightning_strikes
+            .iter()
+            .any(|(_, t, _)| now.duration_since(*t) < impact_dur)
     }
 
     pub fn drain_obs_results(&mut self) -> bool {
@@ -1411,6 +1534,14 @@ impl App {
                 mode: RenderMode::Braille,
             });
         }
+        // Overlay braille (lightning) is saved with the same mode tag.
+        // load_state routes it back to braille_overlay by layer identity.
+        if let Some(id) = modes.braille_overlay {
+            render_modes.push(LayerRenderMode {
+                layer: id,
+                mode: RenderMode::Braille,
+            });
+        }
         if let Some(id) = modes.color {
             render_modes.push(LayerRenderMode {
                 layer: id,
@@ -1433,6 +1564,7 @@ impl App {
             braille_layer: None,
             color_layer: None,
             text_layer: None,
+            lightning_trail_minutes: Some(self.layers.lightning_trail_minutes),
         };
         let path = self.dirs.config_dir.join("state.toml");
         let _ = state.save(&path);
@@ -1447,13 +1579,22 @@ impl App {
             Err(_) => return,
         };
         self.viewport = Viewport::from_lat_lon(state.center_lat, state.center_lon, state.zoom);
+        if let Some(minutes) = state.lightning_trail_minutes {
+            self.layers.lightning_trail_minutes = minutes.clamp(1, 30);
+        }
         self.layers.restore_enabled(&state.enabled_layers);
         self.layers.set_selected(state.selected_layer);
         let modes = self.layers.mode_state_mut();
         if !state.render_modes.is_empty() {
             // New format: explicit (layer, mode) pairs.
+            // Lightning's braille is stored with RenderMode::Braille but goes
+            // into the overlay slot so it never evicts radar from primary.
             for entry in &state.render_modes {
-                modes.assign(entry.mode, entry.layer);
+                if entry.mode == RenderMode::Braille && entry.layer.is_lightning() {
+                    modes.braille_overlay = Some(entry.layer);
+                } else {
+                    modes.assign(entry.mode, entry.layer);
+                }
             }
         } else {
             // Backward compat: old state.toml with scalar braille/color/text fields.

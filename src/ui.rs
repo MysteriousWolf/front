@@ -21,7 +21,9 @@ use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 
-use crate::app::{App, BorderMask, BorderMaskPoint, BorderMaskStamp, TaskState};
+use crate::app::{
+    App, BorderMask, BorderMaskPoint, BorderMaskStamp, TaskState, LIGHTNING_IMPACT_MS,
+};
 use crate::cache::write_log;
 use crate::geo::{
     lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, WorldPoint, CITY_MATCH_KM,
@@ -246,6 +248,9 @@ async fn run_loop(
         if app.drain_warning_results() {
             dirty = true;
         }
+        if app.drain_lightning_results() {
+            dirty = true;
+        }
         if app.pending_warning_refresh {
             app.pending_warning_refresh = false;
             app.warn_last_attempt = None; // force an immediate fetch
@@ -328,7 +333,9 @@ async fn run_loop(
             terminal.draw(|frame| render(frame, app))?;
             dirty = false;
             last_render = Instant::now();
-        } else if (app.layers.any_loading() || !app.active_tasks.is_empty())
+        } else if (app.layers.any_loading()
+            || !app.active_tasks.is_empty()
+            || app.has_lightning_impact())
             && last_render.elapsed() >= Duration::from_millis(25)
         {
             dirty = true;
@@ -661,6 +668,7 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         TextLine::from("    Region borders:  Natural Earth Data (public domain)"),
         TextLine::from("    Roads:           Natural Earth Data (public domain)"),
         TextLine::from("    Radar:           MeteoGate (meteogate.org)"),
+        TextLine::from("    Lightning:       Blitzortung.org (opt-in, no API key needed)"),
         TextLine::from("    Projection:      Web Mercator (EPSG:3857)"),
         TextLine::from(""),
         TextLine::from("    Built with Rust, ratatui, and lots of coffee."),
@@ -1051,6 +1059,14 @@ fn handle_layer_enable(app: &mut App, id: LayerId, refresh: &mut bool) {
         LayerId::MeteoAlarm => {
             app.pending_warning_refresh = app.layers.enabled(id);
         }
+        LayerId::Lightning => {
+            if app.layers.enabled(LayerId::Lightning) {
+                app.request_lightning_connect();
+            } else {
+                app.abort_lightning();
+                app.lightning_strikes.clear();
+            }
+        }
         id if (id.is_observation()) && app.layers.enabled(id) => {
             app.request_obs_refresh();
         }
@@ -1105,6 +1121,8 @@ fn raster_map_rows(
     }
 
     raster_observations(cells, app, bounds, width, height);
+
+    raster_lightning(cells, app, bounds, width, height);
 
     if let Some(location) = app.location_marker {
         let point = location.to_world();
@@ -1316,6 +1334,289 @@ fn raster_warnings(cells: &mut [RasterCell], app: &App, bounds: Bounds, width: u
                     if in_text {
                         set_subcell_glyph(cells, width, sx as u32, sy as u32, '⚠', color);
                     }
+                }
+            }
+        }
+    }
+}
+
+// Braille bolt layout — top-right → bottom-left zigzag:
+//   row 0  . ●  = 0x08
+//   row 1  ● .  = 0x02   ← kink
+//   row 2  . ●  = 0x20
+//   row 3  ● .  = 0x40
+//
+// Negative strikes (common) grow top-right → bottom-left.
+// Positive strikes (rare)   grow bottom-left → top-right (reversed tip/upper).
+const BOLT_TIP_NEG: u8 = 0x08; // top-right spark
+const BOLT_UPPER_NEG: u8 = 0x08 | 0x02 | 0x20; // top three nodes
+const BOLT_TIP_POS: u8 = 0x40; // bottom-left spark
+const BOLT_UPPER_POS: u8 = 0x40 | 0x20 | 0x02; // bottom three nodes (grows up)
+const BOLT_FULL: u8 = 0x08 | 0x02 | 0x20 | 0x40; // complete zigzag (same for both)
+
+/// Per-frame style shared across all three render modes.
+/// Returns `(fg_color, bg_color, braille_bits)`.
+///
+/// `positive` selects the rare positive-polarity palette (cyan) and reversed
+/// bolt animation (bottom-up).  Negative uses the standard yellow palette.
+fn impact_frame_style(frame: u32, positive: bool) -> (Rgb8, Rgb8, u8) {
+    let (tip, upper) = if positive {
+        (BOLT_TIP_POS, BOLT_UPPER_POS)
+    } else {
+        (BOLT_TIP_NEG, BOLT_UPPER_NEG)
+    };
+    let bits = match frame {
+        0 => tip,
+        1 => upper,
+        _ => BOLT_FULL,
+    };
+
+    let (fg, bg) = if positive {
+        // Cyan / blue-white: visually distinct for the rare positive strikes.
+        match frame {
+            0 => (Rgb8::new(255, 255, 255), Rgb8::new(18, 55, 70)),
+            1 => (Rgb8::new(180, 240, 255), Rgb8::new(90, 215, 240)),
+            2 => (Rgb8::new(60, 220, 255), Rgb8::new(80, 230, 255)),
+            3 => (Rgb8::new(55, 200, 230), Rgb8::new(55, 165, 185)),
+            4 => (Rgb8::new(48, 170, 200), Rgb8::new(38, 120, 140)),
+            5 => (Rgb8::new(40, 140, 165), Rgb8::new(25, 88, 100)),
+            6 => (Rgb8::new(32, 110, 130), Rgb8::new(16, 62, 72)),
+            _ => (Rgb8::new(24, 82, 97), Rgb8::new(10, 40, 48)),
+        }
+    } else {
+        // Amber / yellow: standard negative-strike palette.
+        match frame {
+            0 => (Rgb8::new(255, 255, 255), Rgb8::new(70, 70, 18)),
+            1 => (Rgb8::new(255, 255, 160), Rgb8::new(220, 220, 120)),
+            2 => (Rgb8::new(255, 240, 60), Rgb8::new(255, 245, 100)),
+            3 => (Rgb8::new(230, 210, 55), Rgb8::new(180, 165, 55)),
+            4 => (Rgb8::new(200, 180, 48), Rgb8::new(130, 118, 38)),
+            5 => (Rgb8::new(165, 145, 40), Rgb8::new(90, 80, 25)),
+            6 => (Rgb8::new(130, 112, 32), Rgb8::new(60, 54, 16)),
+            _ => (Rgb8::new(95, 82, 24), Rgb8::new(38, 34, 10)),
+        }
+    };
+    (fg, bg, bits)
+}
+
+/// Interpolate between two u8 channel values linearly.
+fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
+    (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u8
+}
+
+/// Trail style faded by `progress` (0 = just entered trail, 1 = about to expire).
+/// Uses t² so the bolt stays visible for most of the trail window and fades near the end.
+/// `positive` selects the cyan palette to match positive-strike impact colors.
+fn trail_style(progress: f64, positive: bool) -> (Rgb8, Rgb8) {
+    let t = progress.clamp(0.0, 1.0).powi(2);
+    if positive {
+        let fg = Rgb8::new(lerp_u8(80, 4, t), lerp_u8(175, 10, t), lerp_u8(195, 10, t));
+        let bg = Rgb8::new(lerp_u8(10, 1, t), lerp_u8(55, 3, t), lerp_u8(65, 3, t));
+        (fg, bg)
+    } else {
+        let fg = Rgb8::new(lerp_u8(150, 10, t), lerp_u8(130, 8, t), lerp_u8(38, 2, t));
+        let bg = Rgb8::new(lerp_u8(55, 4, t), lerp_u8(50, 3, t), lerp_u8(14, 1, t));
+        (fg, bg)
+    }
+}
+
+fn raster_lightning(cells: &mut [RasterCell], app: &App, bounds: Bounds, width: u16, height: u16) {
+    let modes = app.layers.mode_state();
+    if !modes.has_any(LayerId::Lightning) || app.lightning_strikes.is_empty() {
+        return;
+    }
+
+    let in_braille = modes.has(RenderMode::Braille, LayerId::Lightning);
+    let in_color = modes.has(RenderMode::Color, LayerId::Lightning);
+    let in_text = modes.has(RenderMode::Text, LayerId::Lightning);
+    if !in_braille && !in_color && !in_text {
+        return;
+    }
+
+    let trail_dur_ms = u64::from(app.layers.lightning_trail_minutes) * 60_000;
+    let trail_dur = std::time::Duration::from_millis(trail_dur_ms);
+    let now = std::time::Instant::now();
+
+    let sub_width = u32::from(width) * 2;
+    let sub_height = u32::from(height) * 4;
+    let num_cells = usize::from(width) * usize::from(height);
+
+    // Helper: map a WorldPoint to (sx, sy, cell_idx), or None if out of view.
+    let to_cell = |point: &WorldPoint| -> Option<(u32, u32, usize)> {
+        if point.x < bounds.min_x
+            || point.x > bounds.max_x
+            || point.y < bounds.min_y
+            || point.y > bounds.max_y
+        {
+            return None;
+        }
+        let sx = ((point.x - bounds.min_x) / bounds.width().max(f64::EPSILON)
+            * f64::from(sub_width))
+        .floor()
+        .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
+        let sy = ((point.y - bounds.min_y) / bounds.height().max(f64::EPSILON)
+            * f64::from(sub_height))
+        .floor()
+        .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
+        let idx = (sy / 4) as usize * usize::from(width) + (sx / 2) as usize;
+        (idx < num_cells).then_some((sx, sy, idx))
+    };
+
+    // ── Pass 1: Impact ────────────────────────────────────────────────────
+    // Newest-first, one animation per cell.  Impact clears the cell entirely
+    // so the bolt shape is unambiguous.
+    let mut impact_cells = vec![false; num_cells];
+
+    for (point, arrived, pol) in app.lightning_strikes.iter().rev() {
+        let elapsed = now.duration_since(*arrived);
+        if elapsed >= trail_dur {
+            continue;
+        }
+        let elapsed_ms = elapsed.as_millis() as u32;
+        if elapsed_ms >= LIGHTNING_IMPACT_MS {
+            continue;
+        }
+        let Some((sx, sy, cell_idx)) = to_cell(point) else {
+            continue;
+        };
+        if impact_cells[cell_idx] {
+            continue;
+        }
+        impact_cells[cell_idx] = true;
+
+        let positive = *pol > 0;
+        let text_glyph = if positive { '*' } else { '+' };
+        let frame = elapsed_ms / 100;
+        let (fg, bg, bits) = impact_frame_style(frame, positive);
+
+        if in_braille {
+            if let Some(cell) = cells.get_mut(cell_idx) {
+                // Replace clears radar/border dots — bolt shape is fully visible.
+                cell.bits = bits;
+                cell.color = Some(fg);
+                cell.intensity = 200;
+            }
+        }
+        if in_color {
+            set_subcell_bg(cells, width, sx, sy, bg);
+        }
+        if in_text {
+            if let Some(cell) = cells.get_mut(cell_idx) {
+                cell.glyph = Some(text_glyph);
+                cell.color = Some(fg);
+            }
+        }
+    }
+
+    // ── Pass 2: Trail — float heatmap, auto-range normalised ─────────────
+    // Accumulate per-strike colours into a f32 buffer so u8 saturation never
+    // clips densely overlapping cells before we know the global maximum.
+    // After accumulation one pass finds the peak and scales the entire visible
+    // range so the densest cell lands at TRAIL_TARGET.  Sparse scenes show
+    // strikes at their natural dim colour; busy scenes use the full range up
+    // to the cap, with relative density preserved throughout.
+    //
+    // Impact cells are excluded from the heatmap — the animated bolt owns
+    // those cells.  Text glyph is newest-wins (impact cells skipped too).
+
+    const TRAIL_TARGET: f32 = 85.0; // max brightness any trail cell reaches
+
+    let mut heatmap = vec![0.0_f32; num_cells * 3]; // r/g/b interleaved
+    let mut trail_touched = vec![false; num_cells];
+    let mut trail_cell_list: Vec<usize> = Vec::new();
+    let mut text_cells = vec![false; num_cells];
+
+    for (point, arrived, pol) in app.lightning_strikes.iter().rev() {
+        let elapsed = now.duration_since(*arrived);
+        if elapsed >= trail_dur {
+            continue;
+        }
+        let elapsed_ms = elapsed.as_millis() as u32;
+        if elapsed_ms < LIGHTNING_IMPACT_MS {
+            continue;
+        }
+        let Some((_sx, _sy, cell_idx)) = to_cell(point) else {
+            continue;
+        };
+        // Impact cells are fully owned by pass 1.
+        if impact_cells[cell_idx] {
+            continue;
+        }
+
+        let positive = *pol > 0;
+        let text_glyph = if positive { '*' } else { '+' };
+        let trail_progress = (elapsed_ms as f64 - f64::from(LIGHTNING_IMPACT_MS))
+            / (trail_dur_ms as f64 - f64::from(LIGHTNING_IMPACT_MS)).max(1.0);
+        let (fg, bg) = trail_style(trail_progress, positive);
+
+        if (in_braille || in_color) && (bg.r | bg.g | bg.b) > 0 {
+            heatmap[cell_idx * 3] += bg.r as f32;
+            heatmap[cell_idx * 3 + 1] += bg.g as f32;
+            heatmap[cell_idx * 3 + 2] += bg.b as f32;
+            if !trail_touched[cell_idx] {
+                trail_touched[cell_idx] = true;
+                trail_cell_list.push(cell_idx);
+            }
+        }
+
+        if in_text && !text_cells[cell_idx] {
+            text_cells[cell_idx] = true;
+            if let Some(cell) = cells.get_mut(cell_idx) {
+                if cell.glyph.is_none() {
+                    cell.glyph = Some(text_glyph);
+                    cell.color = Some(fg);
+                }
+            }
+        }
+    }
+
+    // Normalise and write heatmap to cells.
+    if !trail_cell_list.is_empty() {
+        let peak = trail_cell_list
+            .iter()
+            .map(|&idx| {
+                heatmap[idx * 3]
+                    .max(heatmap[idx * 3 + 1])
+                    .max(heatmap[idx * 3 + 2])
+            })
+            .fold(0.0_f32, f32::max);
+
+        if peak > 0.0 {
+            // Global scale: bring the hottest cell down to TRAIL_TARGET.
+            // Never scale up — sparse scenes keep their natural dim colour.
+            let scale = (TRAIL_TARGET / peak).min(1.0);
+
+            // Minimum floor: even a single nearly-expired lonely strike must
+            // remain faintly visible.  Applied per-cell after the global
+            // scale, and only when the scaled peak would drop below the floor.
+            // The boost is proportional (same factor on all channels) so the
+            // hue is preserved.
+            const TRAIL_FLOOR: f32 = 5.0; // minimum peak-channel brightness
+
+            for &idx in &trail_cell_list {
+                let r = heatmap[idx * 3];
+                let g = heatmap[idx * 3 + 1];
+                let b = heatmap[idx * 3 + 2];
+                let raw_peak = r.max(g).max(b);
+                if raw_peak == 0.0 {
+                    continue;
+                }
+
+                // Choose the effective scale: global normalisation or the
+                // minimum floor boost, whichever produces a brighter result.
+                let scaled_peak = raw_peak * scale;
+                let eff = if scaled_peak < TRAIL_FLOOR {
+                    TRAIL_FLOOR / raw_peak
+                } else {
+                    scale
+                };
+
+                let fr = (r * eff).round() as u8;
+                let fg_c = (g * eff).round() as u8;
+                let fb = (b * eff).round() as u8;
+
+                if let Some(cell) = cells.get_mut(idx) {
+                    cell.bg = Some(Rgb8::new(fr, fg_c, fb));
                 }
             }
         }
@@ -2332,6 +2633,12 @@ fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     opt_label_style,
                 ))
             }
+            LayerOption::Range {
+                label, value, unit, ..
+            } => TextLine::from(vec![
+                Span::styled("◦ ", dim),
+                Span::styled(format!("{label}: {value} {unit}"), opt_label_style),
+            ]),
         };
         panel_lines.push(line);
     }

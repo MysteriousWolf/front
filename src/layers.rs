@@ -30,6 +30,11 @@ impl RenderMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderModeState {
     pub braille: Option<LayerId>,
+    /// Non-exclusive overlay braille.  Used by the Lightning layer so its
+    /// braille dots can coexist with another layer's primary braille mode.
+    /// Does not evict the primary `braille` owner when set.
+    #[serde(default)]
+    pub braille_overlay: Option<LayerId>,
     pub color: Option<LayerId>,
     pub text: Option<LayerId>,
 }
@@ -44,12 +49,14 @@ impl RenderModeState {
     pub fn new() -> Self {
         Self {
             braille: None,
+            braille_overlay: None,
             color: None,
             text: None,
         }
     }
 
-    /// Returns the layer assigned to `mode`, if any.
+    /// Returns the *primary* layer assigned to `mode`, if any.
+    /// Does not report the overlay braille layer.
     pub fn get(&self, mode: RenderMode) -> Option<LayerId> {
         match mode {
             RenderMode::Braille => self.braille,
@@ -58,20 +65,24 @@ impl RenderModeState {
         }
     }
 
-    /// Returns `true` when `layer` owns `mode`.
+    /// Returns `true` when `layer` owns `mode` (primary or overlay).
     pub fn has(&self, mode: RenderMode, layer: LayerId) -> bool {
         self.get(mode) == Some(layer)
+            || (mode == RenderMode::Braille && self.braille_overlay == Some(layer))
     }
 
-    /// Returns `true` when `layer` owns at least one mode.
+    /// Returns `true` when `layer` owns at least one mode (primary or overlay).
     pub fn has_any(&self, layer: LayerId) -> bool {
-        self.braille == Some(layer) || self.color == Some(layer) || self.text == Some(layer)
+        self.braille == Some(layer)
+            || self.braille_overlay == Some(layer)
+            || self.color == Some(layer)
+            || self.text == Some(layer)
     }
 
-    /// Returns all modes currently owned by `layer`.
+    /// Returns all modes currently owned by `layer` (primary or overlay).
     pub fn modes_for(&self, layer: LayerId) -> Vec<RenderMode> {
         let mut out = Vec::with_capacity(3);
-        if self.braille == Some(layer) {
+        if self.braille == Some(layer) || self.braille_overlay == Some(layer) {
             out.push(RenderMode::Braille);
         }
         if self.color == Some(layer) {
@@ -83,13 +94,22 @@ impl RenderModeState {
         out
     }
 
-    /// Assign `mode` to `layer`, removing it from any previous owner.
-    /// Returns the previous owner, if any.
+    /// Assign `mode` to `layer`, removing it from any previous primary owner.
+    /// Returns the previous primary owner, if any.
     pub fn assign(&mut self, mode: RenderMode, layer: LayerId) -> Option<LayerId> {
         match mode {
             RenderMode::Braille => self.braille.replace(layer),
             RenderMode::Color => self.color.replace(layer),
             RenderMode::Text => self.text.replace(layer),
+        }
+    }
+
+    /// Toggle overlay braille for `layer` without affecting the primary slot.
+    pub fn toggle_braille_overlay(&mut self, layer: LayerId) {
+        if self.braille_overlay == Some(layer) {
+            self.braille_overlay = None;
+        } else {
+            self.braille_overlay = Some(layer);
         }
     }
 
@@ -105,7 +125,7 @@ impl RenderModeState {
         }
     }
 
-    /// Remove whatever layer owns `mode`.
+    /// Remove the primary owner of `mode`.
     pub fn unassign(&mut self, mode: RenderMode) {
         match mode {
             RenderMode::Braille => self.braille = None,
@@ -114,10 +134,13 @@ impl RenderModeState {
         }
     }
 
-    /// Remove all render modes from `layer`.
+    /// Remove all modes (primary and overlay) from `layer`.
     pub fn remove_all(&mut self, layer: LayerId) {
         if self.braille == Some(layer) {
             self.braille = None;
+        }
+        if self.braille_overlay == Some(layer) {
+            self.braille_overlay = None;
         }
         if self.color == Some(layer) {
             self.color = None;
@@ -127,7 +150,7 @@ impl RenderModeState {
         }
     }
 
-    /// Try to find the "best" (highest-information) mode for `layer`
+    /// Try to find the "best" (highest-information) primary mode for `layer`
     /// that is not already assigned to a different layer.  Returns
     /// `None` when all candidate modes are taken.
     pub fn best_available(&self, layer: LayerId) -> Option<RenderMode> {
@@ -145,6 +168,7 @@ fn preferred_modes(id: LayerId) -> &'static [RenderMode] {
     match id {
         LayerId::Radar => &[RenderMode::Braille, RenderMode::Color, RenderMode::Text],
         LayerId::MeteoAlarm => &[RenderMode::Color, RenderMode::Braille, RenderMode::Text],
+        LayerId::Lightning => &[RenderMode::Braille, RenderMode::Color, RenderMode::Text],
         id if id.is_observation() => &[RenderMode::Text, RenderMode::Braille, RenderMode::Color],
         _ => &[],
     }
@@ -168,12 +192,24 @@ pub enum LayerOption {
         value: usize,
         options: &'static [&'static str],
     },
+    /// An integer that steps between `min` and `max` (inclusive) in `step`
+    /// increments.  Space cycles forward; wraps from `max` back to `min`.
+    Range {
+        label: &'static str,
+        value: u32,
+        min: u32,
+        max: u32,
+        step: u32,
+        unit: &'static str,
+    },
 }
 
 impl LayerOption {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Toggle { label, .. } | Self::Choice { label, .. } => label,
+            Self::Toggle { label, .. } | Self::Choice { label, .. } | Self::Range { label, .. } => {
+                label
+            }
         }
     }
 
@@ -181,7 +217,7 @@ impl LayerOption {
     pub fn is_active(&self) -> bool {
         match self {
             Self::Toggle { value, .. } => *value,
-            Self::Choice { .. } => false,
+            Self::Choice { .. } | Self::Range { .. } => false,
         }
     }
 }
@@ -218,6 +254,7 @@ pub enum LayerId {
     MajorRoads,
     Radar,
     MeteoAlarm,
+    Lightning,
     SurfTemp,
     SurfWind,
     SurfHumidity,
@@ -289,6 +326,7 @@ impl LayerId {
             Self::MajorRoads => "Roads",
             Self::Radar => "Radar",
             Self::MeteoAlarm => "Warnings",
+            Self::Lightning => "Lightning",
             Self::SurfTemp => "Temperature",
             Self::SurfWind => "Wind Speed",
             Self::SurfHumidity => "Humidity",
@@ -324,6 +362,11 @@ impl LayerId {
             self,
             Self::MapBorders | Self::RegionBorders | Self::MajorRoads
         )
+    }
+
+    /// True for the lightning layer.
+    pub fn is_lightning(self) -> bool {
+        matches!(self, Self::Lightning)
     }
 
     pub fn is_rendered(self) -> bool {
@@ -371,6 +414,8 @@ pub struct LayerRegistry {
     selected_main: usize,
     focus: PanelFocus,
     render_modes: RenderModeState,
+    /// Trail duration for the Lightning layer in minutes (1–30).
+    pub lightning_trail_minutes: u8,
 }
 
 impl Default for LayerRegistry {
@@ -412,6 +457,10 @@ impl LayerRegistry {
             LayerId::MeteoAlarm,
             Self::layer_state(LayerId::MeteoAlarm, false, false),
         );
+        states.insert(
+            LayerId::Lightning,
+            Self::layer_state(LayerId::Lightning, false, false),
+        );
         // Temperature enabled by default: any_obs_enabled() must be true on
         // fresh installs so observation fetches trigger immediately.
         states.insert(
@@ -436,6 +485,7 @@ impl LayerRegistry {
             selected_main: 1,
             focus: PanelFocus::Main,
             render_modes,
+            lightning_trail_minutes: 5,
         }
     }
 
@@ -491,6 +541,8 @@ impl LayerRegistry {
             MainItem::Header(_) => 0,
             MainItem::Single(id) if id.is_geographic() => 0,
             MainItem::Single(id) if id.is_observation() => 1,
+            // Lightning has 3 render-mode toggles + 1 trail-duration range.
+            MainItem::Single(id) if id.is_lightning() => 4,
             MainItem::Single(_) => 3,
             MainItem::Group(g) => g.children().len(),
         }
@@ -613,6 +665,30 @@ impl LayerRegistry {
                     None
                 }
             }
+            MainItem::Single(id) if id.is_lightning() => match index {
+                0 => {
+                    // Braille overlay — non-exclusive, coexists with radar braille.
+                    self.render_modes.toggle_braille_overlay(id);
+                    Some(id)
+                }
+                1 => {
+                    self.render_modes.toggle(RenderMode::Color, id);
+                    Some(id)
+                }
+                2 => {
+                    self.render_modes.toggle(RenderMode::Text, id);
+                    Some(id)
+                }
+                _ => {
+                    // Cycle trail duration: increment by 1, wrap 30 → 1.
+                    self.lightning_trail_minutes = if self.lightning_trail_minutes >= 30 {
+                        1
+                    } else {
+                        self.lightning_trail_minutes + 1
+                    };
+                    Some(id)
+                }
+            },
             MainItem::Single(id) => {
                 let mode = match index {
                     0 => RenderMode::Braille,
@@ -654,6 +730,14 @@ impl LayerRegistry {
                     }
                 }
                 self.render_modes.assign(RenderMode::Text, id);
+            }
+        } else if id.is_lightning() {
+            // Lightning uses overlay braille by default so it never evicts radar.
+            // has_any checks overlay too, so this handles all active modes.
+            if self.render_modes.has_any(id) {
+                self.render_modes.remove_all(id);
+            } else {
+                self.render_modes.braille_overlay = Some(id);
             }
         } else if self.render_modes.has_any(id) {
             self.render_modes.remove_all(id);
@@ -789,6 +873,43 @@ impl LayerRegistry {
                     ),
                 },
             )],
+            MainItem::Single(id) if id.is_lightning() => vec![
+                (
+                    "braille",
+                    LayerOption::Toggle {
+                        label: "Braille",
+                        value: self.render_modes.has(RenderMode::Braille, id),
+                        has_error: false,
+                    },
+                ),
+                (
+                    "color",
+                    LayerOption::Toggle {
+                        label: "Color",
+                        value: self.render_modes.has(RenderMode::Color, id),
+                        has_error: false,
+                    },
+                ),
+                (
+                    "text",
+                    LayerOption::Toggle {
+                        label: "Text",
+                        value: self.render_modes.has(RenderMode::Text, id),
+                        has_error: false,
+                    },
+                ),
+                (
+                    "trail",
+                    LayerOption::Range {
+                        label: "Trail",
+                        value: u32::from(self.lightning_trail_minutes),
+                        min: 1,
+                        max: 30,
+                        step: 1,
+                        unit: "min",
+                    },
+                ),
+            ],
             MainItem::Single(id) => vec![
                 (
                     "braille",
@@ -835,12 +956,13 @@ impl LayerRegistry {
         }
     }
 
-    pub const MAIN_ORDER: [MainItem; 8] = [
+    pub const MAIN_ORDER: [MainItem; 9] = [
         // Weather layers first
         MainItem::Header("Weather"),
         MainItem::Single(LayerId::Radar),
         MainItem::Group(LayerGroup::Observations),
         MainItem::Single(LayerId::MeteoAlarm),
+        MainItem::Single(LayerId::Lightning),
         // Geography layers below — Roads on top, Countries fixed at bottom
         MainItem::Header("Geography"),
         MainItem::Single(LayerId::MajorRoads),
@@ -848,12 +970,13 @@ impl LayerRegistry {
         MainItem::Single(LayerId::MapBorders), // Countries — locked, not selectable
     ];
 
-    pub const ORDER: [LayerId; 9] = [
+    pub const ORDER: [LayerId; 10] = [
         LayerId::MapBorders,
         LayerId::RegionBorders,
         LayerId::MajorRoads,
         LayerId::Radar,
         LayerId::MeteoAlarm,
+        LayerId::Lightning,
         LayerId::SurfTemp,
         LayerId::SurfWind,
         LayerId::SurfHumidity,
@@ -895,7 +1018,7 @@ impl LayerRegistry {
         // Show a loading indicator only for layers the user can perceive
         // (radar data is the slowest to fetch).  Static layers (borders)
         // are loaded once at startup and don't need a re-load badge.
-        for id in [LayerId::Radar, LayerId::MeteoAlarm] {
+        for id in [LayerId::Radar, LayerId::MeteoAlarm, LayerId::Lightning] {
             if self
                 .states
                 .get(&id)

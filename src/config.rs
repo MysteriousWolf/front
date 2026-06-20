@@ -184,6 +184,10 @@ pub struct StateConfig {
     pub color_layer: Option<LayerId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_layer: Option<LayerId>,
+
+    /// Lightning trail duration in minutes (1–30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lightning_trail_minutes: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
