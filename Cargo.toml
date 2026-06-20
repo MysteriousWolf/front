@@ -1,6 +1,6 @@
 [package]
 name = "front"
-version = "0.1.0"
+version = "26.1"
 description = "Fancy Radar ObservatioN Tool - a terminal weather radar map"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mpevec/front"

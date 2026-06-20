@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
 
 jobs:
   validate-version:
@@ -13,6 +14,7 @@ jobs:
       contents: read
     env:
       IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+      IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +30,8 @@ jobs:
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
           if ! echo "$VERSION" | grep -qE '^[0-9]{2}\.[1-9][0-9]*$'; then
-            MSG="Cargo.toml version '$VERSION' does not match YY.N format (e.g. 26.1). Fix before tagging a release."
-            if [ "$IS_TAG" = "true" ]; then
+            MSG="Cargo.toml version '$VERSION' does not match YY.N format (e.g. 26.1). Fix before merging to main."
+            if [ "$IS_TAG" = "true" ] || [ "$IS_MAIN" = "true" ]; then
               echo "::error::$MSG"
               exit 1
             else
