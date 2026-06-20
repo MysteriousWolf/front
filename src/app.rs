@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::cache::{write_log, FrontDirs};
 use crate::cli::Cli;
-use crate::config::{Config, StateConfig};
+use crate::config::{Config, LayerRenderMode, StateConfig};
 use crate::geo::{world_to_lat_lon, GeoPoint, Viewport, WorldPoint};
 use crate::layers::{
     resolution_distance, BorderLayer, BorderLine, BorderLineKind, BorderResolution, LayerId,
@@ -88,6 +88,10 @@ pub struct App {
     pub frame_count: u64,
     pub frame_index: usize,
     pub show_help: bool,
+    /// False when the layer panel is defocused (dimmed, no selection indicators,
+    /// submenu hidden).  Toggled by Alt+← from the root list; set to true by
+    /// any layer interaction.  True on startup.
+    pub layer_panel_focused: bool,
     pub location_label: String,
     pub location_marker: Option<GeoPoint>,
     pub dirs: FrontDirs,
@@ -227,6 +231,7 @@ impl App {
             frame_count: 0,
             frame_index: 0,
             show_help: false,
+            layer_panel_focused: false,
             location_label,
             location_marker,
             warning_layer: None,
@@ -1399,15 +1404,35 @@ impl App {
     pub fn save_state(&self) {
         let center = world_to_lat_lon(self.viewport.center);
         let modes = self.layers.mode_state();
+        let mut render_modes = Vec::new();
+        if let Some(id) = modes.braille {
+            render_modes.push(LayerRenderMode {
+                layer: id,
+                mode: RenderMode::Braille,
+            });
+        }
+        if let Some(id) = modes.color {
+            render_modes.push(LayerRenderMode {
+                layer: id,
+                mode: RenderMode::Color,
+            });
+        }
+        if let Some(id) = modes.text {
+            render_modes.push(LayerRenderMode {
+                layer: id,
+                mode: RenderMode::Text,
+            });
+        }
         let state = StateConfig {
             center_lat: center.lat,
             center_lon: center.lon,
             zoom: self.viewport.zoom,
             enabled_layers: self.layers.saved_enabled(),
             selected_layer: self.layers.selected_layer(),
-            braille_layer: modes.braille,
-            color_layer: modes.color,
-            text_layer: modes.text,
+            render_modes,
+            braille_layer: None,
+            color_layer: None,
+            text_layer: None,
         };
         let path = self.dirs.config_dir.join("state.toml");
         let _ = state.save(&path);
@@ -1425,14 +1450,22 @@ impl App {
         self.layers.restore_enabled(&state.enabled_layers);
         self.layers.set_selected(state.selected_layer);
         let modes = self.layers.mode_state_mut();
-        if let Some(id) = state.braille_layer {
-            modes.assign(RenderMode::Braille, id);
-        }
-        if let Some(id) = state.color_layer {
-            modes.assign(RenderMode::Color, id);
-        }
-        if let Some(id) = state.text_layer {
-            modes.assign(RenderMode::Text, id);
+        if !state.render_modes.is_empty() {
+            // New format: explicit (layer, mode) pairs.
+            for entry in &state.render_modes {
+                modes.assign(entry.mode, entry.layer);
+            }
+        } else {
+            // Backward compat: old state.toml with scalar braille/color/text fields.
+            if let Some(id) = state.braille_layer {
+                modes.assign(RenderMode::Braille, id);
+            }
+            if let Some(id) = state.color_layer {
+                modes.assign(RenderMode::Color, id);
+            }
+            if let Some(id) = state.text_layer {
+                modes.assign(RenderMode::Text, id);
+            }
         }
         // Guarantee an obs layer is always in text mode so the staleness
         // check can trigger obs refresh.  Old state files may have saved

@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -26,8 +28,8 @@ use crate::geo::{
     EUROPEAN_CAPITALS, EUROPEAN_CAPITAL_NAMES, EUROPEAN_MAJOR_CITIES,
 };
 use crate::layers::{
-    BorderLine, BorderLineKind, BorderResolution, LayerId, LayerRegistry, LayerStatus, MainItem,
-    ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
+    BorderLine, BorderLineKind, BorderResolution, LayerId, LayerOption, LayerRegistry, LayerStatus,
+    MainItem, ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
 };
 
 const INTERACTION_REFRESH_DEBOUNCE_MS: u64 = 60;
@@ -184,11 +186,26 @@ pub async fn run(mut app: App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Enable keyboard enhancement where supported (iTerm2, WezTerm, Kitty, …)
+    // so Alt+arrow keys are decoded as Alt+Left/Right rather than ESC sequences.
+    // On unsupported terminals (Terminal.app) we fall back to Alt+b/Alt+f.
+    let kbd_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if kbd_enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_loop(&mut terminal, &mut app).await;
 
+    if kbd_enhanced {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -330,20 +347,53 @@ async fn run_loop(
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     match key.code {
                         KeyCode::Up => {
+                            app.layer_panel_focused = true;
                             app.layers.select_previous();
                             dirty = true;
                         }
                         KeyCode::Down => {
+                            app.layer_panel_focused = true;
                             app.layers.select_next();
                             dirty = true;
+                        }
+                        _ => {}
+                    }
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    match key.code {
+                        KeyCode::Up => {
+                            app.layer_panel_focused = true;
+                            app.layers.select_previous();
+                            dirty = true;
+                        }
+                        KeyCode::Down => {
+                            app.layer_panel_focused = true;
+                            app.layers.select_next();
+                            dirty = true;
+                        }
+                        // Enhanced terminals send Alt+arrow; Terminal.app sends ESC+f/b.
+                        KeyCode::Right | KeyCode::Char('f') => {
+                            app.layer_panel_focused = true;
+                            dirty |= app.layers.enter_options();
+                        }
+                        // Alt+Left: exit options → defocus root list → refocus.
+                        KeyCode::Left | KeyCode::Char('b') => {
+                            if !app.layer_panel_focused {
+                                // Panel was defocused — refocus it.
+                                app.layer_panel_focused = true;
+                                dirty = true;
+                            } else if app.layers.is_in_options() {
+                                dirty |= app.layers.exit_options();
+                            } else {
+                                // Already at root list — defocus the panel.
+                                app.layer_panel_focused = false;
+                                dirty = true;
+                            }
                         }
                         _ => {}
                     }
                 } else {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            // The help overlay advertises q/Esc as
-                            // "close" — only quit when it isn't open.
                             if app.show_help {
                                 app.show_help = false;
                                 dirty = true;
@@ -353,12 +403,14 @@ async fn run_loop(
                             }
                         }
                         KeyCode::Char(' ') => {
+                            app.layer_panel_focused = true;
                             if let Some(id) = app.layers.handle_space() {
                                 handle_layer_enable(app, id, &mut refresh);
                             }
                             dirty = true;
                         }
                         KeyCode::Char('b') => {
+                            app.layer_panel_focused = true;
                             let id = app.layers.selected_layer();
                             if id.is_rendered() && !id.is_observation() {
                                 app.layers.mode_state_mut().toggle(RenderMode::Braille, id);
@@ -367,6 +419,7 @@ async fn run_loop(
                             }
                         }
                         KeyCode::Char('c') => {
+                            app.layer_panel_focused = true;
                             let id = app.layers.selected_layer();
                             if id.is_rendered() && !id.is_observation() {
                                 app.layers.mode_state_mut().toggle(RenderMode::Color, id);
@@ -375,6 +428,7 @@ async fn run_loop(
                             }
                         }
                         KeyCode::Char('l') => {
+                            app.layer_panel_focused = true;
                             let id = app.layers.selected_layer();
                             if id.is_rendered() {
                                 app.layers.mode_state_mut().toggle(RenderMode::Text, id);
@@ -386,32 +440,39 @@ async fn run_loop(
                             app.request_border_refetch();
                             dirty = true;
                         }
+                        // Zoom / pan — defocus the panel so the map fills the screen.
                         KeyCode::Char('+') | KeyCode::Char('=') => {
+                            app.layer_panel_focused = false;
                             app.viewport.zoom_by(0.25);
                             refresh = true;
                             dirty = true;
                         }
                         KeyCode::Char('-') => {
+                            app.layer_panel_focused = false;
                             app.viewport.zoom_by(-0.25);
                             refresh = true;
                             dirty = true;
                         }
                         KeyCode::Left => {
+                            app.layer_panel_focused = false;
                             app.viewport.pan(-1.0, 0.0);
                             refresh = true;
                             dirty = true;
                         }
                         KeyCode::Right => {
+                            app.layer_panel_focused = false;
                             app.viewport.pan(1.0, 0.0);
                             refresh = true;
                             dirty = true;
                         }
                         KeyCode::Up => {
+                            app.layer_panel_focused = false;
                             app.viewport.pan(0.0, -1.0);
                             refresh = true;
                             dirty = true;
                         }
                         KeyCode::Down => {
+                            app.layer_panel_focused = false;
                             app.viewport.pan(0.0, 1.0);
                             refresh = true;
                             dirty = true;
@@ -436,6 +497,7 @@ async fn run_loop(
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
+                    app.layer_panel_focused = false;
                     let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
                     let delta = if shift { 0.10 } else { 0.25 };
                     if let Some((column, row)) = relative_mouse(map_area, mouse.column, mouse.row) {
@@ -458,6 +520,7 @@ async fn run_loop(
                     dirty = true;
                 }
                 MouseEventKind::ScrollDown => {
+                    app.layer_panel_focused = false;
                     let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
                     let delta = if shift { -0.10 } else { -0.25 };
                     if let Some((column, row)) = relative_mouse(map_area, mouse.column, mouse.row) {
@@ -483,6 +546,7 @@ async fn run_loop(
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
+                    app.layer_panel_focused = false;
                     if let Some((last_col, last_row)) = last_mouse {
                         let dx = last_col as f64 - mouse.column as f64;
                         let dy = last_row as f64 - mouse.row as f64;
@@ -566,9 +630,11 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         TextLine::from("    arrows     Pan map"),
         TextLine::from("    + / -      Zoom in / out"),
         TextLine::from("    [ / ]      Previous / next frame"),
-        TextLine::from("    space      Toggle / enable best render mode"),
+        TextLine::from("    space      Toggle layer / enable best render mode"),
         TextLine::from("    b / c / l  Toggle braille / color / text render mode"),
         TextLine::from("    ⇧↑ / ⇧↓   Select previous / next layer"),
+        TextLine::from("    Alt+↑/↓   Select previous / next layer"),
+        TextLine::from("    Alt+→/←   Enter / exit layer group"),
         TextLine::from("    m          Refetch map data (clear cache)"),
         TextLine::from(""),
         TextLine::from(Span::styled(
@@ -1881,7 +1947,7 @@ fn clipped_segment(
 /// Fixed area for the left (main) layer panel, bottom-aligned with
 /// 2-character left margin and 1-character bottom margin.
 fn layer_area(area: Rect) -> Rect {
-    let height = (LayerRegistry::MAIN_ORDER.len() + 1) as u16; // header + items
+    let height = LayerRegistry::MAIN_ORDER.len() as u16; // all items (headers are rows too)
     let height = height.min(area.height.saturating_sub(1));
     let width = 30u16.min(area.width.saturating_sub(3));
     let y = area.y + area.height.saturating_sub(1 + height);
@@ -1893,23 +1959,23 @@ fn layer_area(area: Rect) -> Rect {
     }
 }
 
-/// Area for the right (sub-layer) panel, placed to the right of the main
-/// panel and bottom-aligned with it.
-fn sub_layer_area(total_area: Rect, main_area: Rect) -> Rect {
-    let sub_height = 6u16; // header + back + 4 children
-    let sub_height = sub_height.min(total_area.height.saturating_sub(1));
-    let sub_width = 22u16.min(
+/// Area for the right (options) panel, placed to the right of the main
+/// panel and bottom-aligned with it.  Height is computed from the number
+/// of lines the caller needs to render.
+fn options_panel_area(total_area: Rect, main_area: Rect, n_lines: u16) -> Rect {
+    let height = n_lines.min(total_area.height.saturating_sub(1));
+    let width = 22u16.min(
         total_area
             .width
             .saturating_sub(main_area.x + main_area.width + 2),
     );
     let x = main_area.x + main_area.width + 1;
-    let y = total_area.y + total_area.height.saturating_sub(1 + sub_height);
+    let y = total_area.y + total_area.height.saturating_sub(1 + height);
     Rect {
         x,
         y,
-        width: sub_width,
-        height: sub_height,
+        width,
+        height,
     }
 }
 
@@ -1982,160 +2048,323 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), q_area);
 }
 
+/// Saturated colour for each render mode.
+fn mode_color(mode: RenderMode) -> Color {
+    match mode {
+        RenderMode::Braille => Color::Rgb(255, 210, 0),
+        RenderMode::Color => Color::Rgb(210, 40, 255),
+        RenderMode::Text => Color::Rgb(40, 220, 80),
+    }
+}
+
+/// Map colour for a geographic layer — mirrors the border colour on the map.
+fn geo_layer_color(id: LayerId) -> Color {
+    match id {
+        LayerId::RegionBorders => Color::Rgb(80, 80, 80),
+        LayerId::MajorRoads => Color::Rgb(255, 191, 0),
+        _ => Color::Rgb(128, 128, 128), // Countries and fallback
+    }
+}
+
+/// Indicator style for a rendered single layer in the main list.
+/// `selected` = BOLD — BOLD marks the cursor, not the active mode.
+fn primary_mode_style(modes: &RenderModeState, id: LayerId, selected: bool) -> Style {
+    let color = if modes.has(RenderMode::Braille, id) {
+        mode_color(RenderMode::Braille)
+    } else if modes.has(RenderMode::Color, id) {
+        mode_color(RenderMode::Color)
+    } else if modes.has(RenderMode::Text, id) {
+        mode_color(RenderMode::Text)
+    } else {
+        Color::DarkGray
+    };
+    let s = Style::default().fg(color);
+    if selected {
+        s.add_modifier(Modifier::BOLD)
+    } else {
+        s
+    }
+}
+
+/// Same as `primary_mode_style` but aggregates across a group's children.
+fn group_mode_style(modes: &RenderModeState, children: &[LayerId], selected: bool) -> Style {
+    let color = if children
+        .iter()
+        .any(|id| modes.has(RenderMode::Braille, *id))
+    {
+        mode_color(RenderMode::Braille)
+    } else if children.iter().any(|id| modes.has(RenderMode::Color, *id)) {
+        mode_color(RenderMode::Color)
+    } else if children.iter().any(|id| modes.has(RenderMode::Text, *id)) {
+        mode_color(RenderMode::Text)
+    } else {
+        Color::DarkGray
+    };
+    let s = Style::default().fg(color);
+    if selected {
+        s.add_modifier(Modifier::BOLD)
+    } else {
+        s
+    }
+}
+
+/// Style for an active option in the right panel (bold = active, unlike the
+/// main list where bold = selected).
+fn option_mode_style(key: &str) -> Style {
+    let mode = match key {
+        "braille" => RenderMode::Braille,
+        "color" => RenderMode::Color,
+        _ => RenderMode::Text,
+    };
+    Style::default()
+        .fg(mode_color(mode))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Apply `Modifier::DIM` to every span in a list of lines.
+/// Used to passively show the layer panel when it loses focus.
+/// DIM is defined by the terminal (~50 % brightness) — no colours hardcoded.
+fn apply_dim(lines: Vec<TextLine<'static>>) -> Vec<TextLine<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            TextLine::from(
+                line.spans
+                    .into_iter()
+                    .map(|s| Span::styled(s.content, s.style.add_modifier(Modifier::DIM)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let expanded = app.layers.expanded_group();
+    let focused = app.layer_panel_focused;
     let modes = app.layers.mode_state();
     let dim = Style::default().fg(Color::DarkGray);
-    let active = Style::default()
-        .fg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD);
 
-    let mut left_lines = vec![TextLine::from(Span::styled(
-        "Layers",
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    // ── Main (left) panel ─────────────────────────────────────────────
+    // Always rendered. When not focused: no selection indicators, whole panel dimmed.
+    let mut left_lines: Vec<TextLine<'static>> = Vec::new();
     for (i, item) in LayerRegistry::MAIN_ORDER.iter().enumerate() {
-        let show_cursor = i == app.layers.selected_main_index() && !app.layers.is_expanded();
-        let cursor = if show_cursor { ">" } else { " " };
+        // BOLD + UNDERLINED = cursor. Only when panel is focused.
+        let selected =
+            focused && i == app.layers.selected_main_index() && !app.layers.is_in_options();
+        let label_style = if selected {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        };
 
         let line: TextLine<'static> = match item {
+            MainItem::Header(label) => TextLine::from(Span::styled(
+                label.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
+
             MainItem::Single(id) => {
                 let status = app.layers.get_state(*id).map(|s| &s.status);
                 let err_ch = match status {
                     Some(LayerStatus::Error(_)) => " !",
                     _ => "",
                 };
-
                 if id.is_geographic() {
                     let enabled = app.layers.enabled(*id);
-                    let mark = if enabled { "[x]" } else { "[ ]" };
-                    TextLine::from(format!("{cursor} {mark} {}{err_ch}", item.label()))
+                    let locked = app.layers.get_state(*id).is_some_and(|s| s.locked);
+                    if locked {
+                        let style = Style::default().fg(Color::Rgb(100, 100, 100));
+                        let mark = if enabled { "●" } else { "○" };
+                        TextLine::from(vec![
+                            Span::styled(mark, style),
+                            Span::raw(" "),
+                            Span::styled(format!("{}{err_ch}", id.label()), style),
+                        ])
+                    } else {
+                        let color = geo_layer_color(*id);
+                        let mark_style = {
+                            let s =
+                                Style::default().fg(if enabled { color } else { Color::DarkGray });
+                            if selected {
+                                s.add_modifier(Modifier::BOLD)
+                            } else {
+                                s
+                            }
+                        };
+                        let mark = if enabled { "●" } else { "○" };
+                        TextLine::from(vec![
+                            Span::styled(mark, mark_style),
+                            Span::raw(" "),
+                            Span::styled(format!("{}{err_ch}", id.label()), label_style),
+                        ])
+                    }
                 } else {
-                    let b_style = if modes.has(RenderMode::Braille, *id) {
-                        active
-                    } else {
-                        dim
-                    };
-                    let c_style = if modes.has(RenderMode::Color, *id) {
-                        active
-                    } else {
-                        dim
-                    };
-                    let l_style = if modes.has(RenderMode::Text, *id) {
-                        active
-                    } else {
-                        dim
-                    };
+                    let mark_style = primary_mode_style(modes, *id, selected);
+                    let mark = if modes.has_any(*id) { "●" } else { "○" };
                     TextLine::from(vec![
-                        Span::raw(format!("{cursor} ")),
-                        Span::styled("b", b_style),
+                        Span::styled(mark, mark_style),
                         Span::raw(" "),
-                        Span::styled("c", c_style),
-                        Span::raw(" "),
-                        Span::styled("l", l_style),
-                        Span::raw(format!(" {}{err_ch}", item.label())),
+                        Span::styled(format!("{}{err_ch}", id.label()), label_style),
                     ])
                 }
             }
+
             MainItem::Group(g) => {
-                let is_expanded = expanded == Some(*g);
-                let arrow = if is_expanded { "▼" } else { "▶" };
-
-                let has_b = g
-                    .children()
-                    .iter()
-                    .any(|id| modes.has(RenderMode::Braille, *id));
-                let has_c = g
-                    .children()
-                    .iter()
-                    .any(|id| modes.has(RenderMode::Color, *id));
-                let has_l = g
-                    .children()
-                    .iter()
-                    .any(|id| modes.has(RenderMode::Text, *id));
-
-                let b_style = if has_b { active } else { dim };
-                let c_style = if has_c { active } else { dim };
-                let l_style = if has_l { active } else { dim };
-
+                let children = g.children();
+                let mark_style = group_mode_style(modes, &children, selected);
+                let any_active = children.iter().any(|id| modes.has_any(*id));
+                let mark = if any_active { "▶" } else { "▷" };
                 TextLine::from(vec![
-                    Span::raw(format!("{cursor} ")),
-                    Span::styled("b", b_style),
+                    Span::styled(mark, mark_style),
                     Span::raw(" "),
-                    Span::styled("c", c_style),
-                    Span::raw(" "),
-                    Span::styled("l", l_style),
-                    Span::raw(format!(" {arrow} {}", item.label())),
+                    Span::styled(item.label().to_string(), label_style),
                 ])
             }
         };
         left_lines.push(line);
     }
 
-    // Clear and draw left panel in its fixed area
+    // Dim main list when the panel is defocused OR when focus is in the options panel.
+    let main_dimmed = !focused || app.layers.is_in_options();
+    let left_lines = if main_dimmed {
+        apply_dim(left_lines)
+    } else {
+        left_lines
+    };
+
     let main_area = layer_area(area);
-    frame.render_widget(Clear, main_area);
-    frame.render_widget(Paragraph::new(left_lines), main_area);
-
-    // Right panel: sub-layers of expanded group
-    if let Some(g) = expanded {
-        let sub_area = sub_layer_area(area, main_area);
-        frame.render_widget(Clear, sub_area);
-
-        let mut right_lines: Vec<TextLine<'static>> = Vec::new();
-
-        // Header
-        right_lines.push(TextLine::from(Span::styled(
-            g.label().to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-
-        let sub_cursor = app.layers.sub_cursor();
-        // Back button at cursor index 0
-        {
-            let show_cursor = sub_cursor == 0;
-            let cursor = if show_cursor { ">" } else { " " };
-            right_lines.push(TextLine::from(format!("{cursor}  ← Back")));
+    // Compute max content width for sub-panel positioning, then clear and
+    // render each line at its own width so the map shows through on trailing
+    // cells that have no text.
+    let content_w = left_lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    let tight_main = Rect {
+        width: content_w.min(main_area.width),
+        ..main_area
+    };
+    for (i, line) in left_lines.into_iter().enumerate() {
+        let y = main_area.y + i as u16;
+        if y >= main_area.y + main_area.height {
+            break;
         }
-        // Sub-layer items start at cursor index 1
-        for (i, id) in g.children().iter().enumerate() {
-            let show_cursor = (i + 1) == sub_cursor;
-            let cursor = if show_cursor { ">" } else { " " };
-            let status = app.layers.get_state(*id).map(|s| &s.status);
-            let err_ch = match status {
-                Some(LayerStatus::Error(_)) => " !",
-                _ => "",
-            };
-
-            let b_style = if modes.has(RenderMode::Braille, *id) {
-                active
-            } else {
-                dim
-            };
-            let c_style = if modes.has(RenderMode::Color, *id) {
-                active
-            } else {
-                dim
-            };
-            let l_style = if modes.has(RenderMode::Text, *id) {
-                active
-            } else {
-                dim
-            };
-
-            let text = TextLine::from(vec![
-                Span::raw(format!("{cursor} ")),
-                Span::styled("b", b_style),
-                Span::raw(" "),
-                Span::styled("c", c_style),
-                Span::raw(" "),
-                Span::styled("l", l_style),
-                Span::raw(format!(" {}{err_ch}", id.label())),
-            ]);
-            right_lines.push(text);
+        let line_w = line
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>() as u16;
+        let line_rect = Rect {
+            x: main_area.x,
+            y,
+            width: line_w.min(main_area.width),
+            height: 1,
+        };
+        if line_rect.width > 0 {
+            frame.render_widget(Clear, line_rect);
+            frame.render_widget(Paragraph::new(vec![line]), line_rect);
         }
+    }
 
-        frame.render_widget(Paragraph::new(right_lines), sub_area);
+    // ── Options (right) panel ──────────────────────────────────────────
+    // Only shown when the panel is focused (defocused = submenus hidden).
+    if !focused {
+        return;
+    }
+    let selected_item = LayerRegistry::MAIN_ORDER[app.layers.selected_main_index()];
+    let options = app.layers.options_for_item(selected_item);
+    if options.is_empty() {
+        return;
+    }
+
+    // options_cursor() returns Some(i) when the options panel has focus.
+    let opt_cursor = app.layers.options_cursor();
+    let n_lines = 1 + options.len() as u16; // header + options
+
+    let sub_area = options_panel_area(area, tight_main, n_lines);
+    if sub_area.width == 0 || sub_area.height == 0 {
+        return;
+    }
+
+    let mut panel_lines: Vec<TextLine<'static>> = vec![TextLine::from(Span::styled(
+        selected_item.label().to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    for (i, (key, opt)) in options.iter().enumerate() {
+        let cursor_here = opt_cursor.is_some_and(|sc| i == sc);
+        // Bold = cursor in the options panel (mirrors main list convention).
+        let opt_label_style = if cursor_here {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        };
+        let mode_active_style = option_mode_style(key);
+
+        let line = match opt {
+            LayerOption::Toggle {
+                label,
+                value,
+                has_error,
+            } => {
+                let mark_style = if *value { mode_active_style } else { dim };
+                let mark = if *value { "●" } else { "○" };
+                let err_ch = if *has_error { " !" } else { "" };
+                TextLine::from(vec![
+                    Span::styled(mark, mark_style),
+                    Span::raw(" "),
+                    Span::styled(format!("{label}{err_ch}"), opt_label_style),
+                ])
+            }
+            LayerOption::Choice {
+                label,
+                value,
+                options: choices,
+            } => {
+                let choice_label = choices.get(*value).copied().unwrap_or("");
+                TextLine::from(Span::styled(
+                    format!("{label}: {choice_label}"),
+                    opt_label_style,
+                ))
+            }
+        };
+        panel_lines.push(line);
+    }
+
+    // Dim options panel when focus is in the main list.
+    let panel_lines = if app.layers.is_in_options() {
+        panel_lines
+    } else {
+        apply_dim(panel_lines)
+    };
+
+    // Clear and render each line at its own width — same per-line approach as
+    // the main panel so the map shows through on empty trailing cells.
+    for (i, line) in panel_lines.into_iter().enumerate() {
+        let y = sub_area.y + i as u16;
+        if y >= sub_area.y + sub_area.height {
+            break;
+        }
+        let line_w = line
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>() as u16;
+        let line_rect = Rect {
+            x: sub_area.x,
+            y,
+            width: line_w.min(sub_area.width),
+            height: 1,
+        };
+        if line_rect.width > 0 {
+            frame.render_widget(Clear, line_rect);
+            frame.render_widget(Paragraph::new(vec![line]), line_rect);
+        }
     }
 }
 

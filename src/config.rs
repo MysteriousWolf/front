@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::write_atomic;
 use crate::geo::{EUROPE_LAT, EUROPE_LON, EUROPE_ZOOM};
-use crate::layers::LayerId;
+use crate::layers::{LayerId, RenderMode};
 
 /// Application-level configuration loaded from `~/.config/front/config.toml`.
 ///
@@ -152,6 +152,15 @@ fn default_surface_obs_endpoint() -> String {
 // Runtime state persisted as TOML  (replaces the old state.json)
 // ---------------------------------------------------------------------------
 
+/// A single render-mode assignment stored in `StateConfig`.
+/// Replaces the old per-mode scalar fields so new option types can be
+/// added as additional `Vec` entries without a schema change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerRenderMode {
+    pub layer: LayerId,
+    pub mode: RenderMode,
+}
+
 /// Mutable runtime state persisted between sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
@@ -160,8 +169,20 @@ pub struct StateConfig {
     pub zoom: f64,
     pub enabled_layers: Vec<LayerId>,
     pub selected_layer: LayerId,
+
+    /// Render-mode assignments (replaces the scalar braille/color/text fields).
+    /// Each entry records which layer owns which render mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub render_modes: Vec<LayerRenderMode>,
+
+    // Legacy scalar fields kept for loading old state.toml files.
+    // Absent from new files (skip_serializing_if = is_none).
+    // When `render_modes` is non-empty these are ignored on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub braille_layer: Option<LayerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_layer: Option<LayerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_layer: Option<LayerId>,
 }
 

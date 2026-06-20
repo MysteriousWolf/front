@@ -150,6 +150,42 @@ fn preferred_modes(id: LayerId) -> &'static [RenderMode] {
     }
 }
 
+/// A typed option value that the UI renders generically without knowing the
+/// layer type.  Each option is paired with a stable `key` string used to
+/// identify which option the user changed.
+#[derive(Debug, Clone)]
+pub enum LayerOption {
+    /// A boolean on/off toggle.
+    Toggle {
+        label: &'static str,
+        value: bool,
+        /// True when the underlying layer is in an error state.
+        has_error: bool,
+    },
+    /// A single value chosen from a static list of strings.
+    Choice {
+        label: &'static str,
+        value: usize,
+        options: &'static [&'static str],
+    },
+}
+
+impl LayerOption {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Toggle { label, .. } | Self::Choice { label, .. } => label,
+        }
+    }
+
+    /// True when this option represents an active / enabled state.
+    pub fn is_active(&self) -> bool {
+        match self {
+            Self::Toggle { value, .. } => *value,
+            Self::Choice { .. } => false,
+        }
+    }
+}
+
 /// Minimum world-coordinate width or height for a bounding box to be
 /// considered non-degenerate.  Segments smaller than this are treated as
 /// zero-area and will be ignored during spatial pre-filtering.
@@ -208,17 +244,20 @@ impl LayerGroup {
 
     pub fn label(&self) -> &'static str {
         match self {
-            LayerGroup::Observations => "Observations",
+            LayerGroup::Observations => "Measurements",
         }
     }
 }
 
-/// An entry in the top-level layer list — either a single togglable layer
-/// or a group header that can be expanded to reveal sub-layers on the right.
+/// An entry in the top-level layer list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MainItem {
+    /// Toggleable single layer.
     Single(LayerId),
+    /// Expandable group whose sub-layers appear in the options panel.
     Group(LayerGroup),
+    /// Non-interactive section divider (never selectable).
+    Header(&'static str),
 }
 
 impl MainItem {
@@ -226,6 +265,7 @@ impl MainItem {
         match self {
             MainItem::Single(id) => id.label(),
             MainItem::Group(g) => g.label(),
+            MainItem::Header(s) => s,
         }
     }
 
@@ -236,7 +276,7 @@ impl MainItem {
     pub fn single_id(&self) -> Option<LayerId> {
         match self {
             MainItem::Single(id) => Some(*id),
-            MainItem::Group(_) => None,
+            _ => None,
         }
     }
 }
@@ -316,13 +356,20 @@ pub enum LayerStatus {
     Error(String),
 }
 
+/// Which of the two panels holds keyboard focus.
+/// `Options(i)` = focus is in the right panel at option index `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelFocus {
+    Main,
+    Options(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct LayerRegistry {
     states: HashMap<LayerId, LayerState>,
     selected: LayerId,
     selected_main: usize,
-    expanded_group: Option<LayerGroup>,
-    sub_cursor: usize,
+    focus: PanelFocus,
     render_modes: RenderModeState,
 }
 
@@ -365,96 +412,225 @@ impl LayerRegistry {
             LayerId::MeteoAlarm,
             Self::layer_state(LayerId::MeteoAlarm, false, false),
         );
-        for id in [
+        // Temperature enabled by default: any_obs_enabled() must be true on
+        // fresh installs so observation fetches trigger immediately.
+        states.insert(
             LayerId::SurfTemp,
+            Self::layer_state(LayerId::SurfTemp, true, false),
+        );
+        for id in [
             LayerId::SurfWind,
             LayerId::SurfHumidity,
             LayerId::SurfPressure,
         ] {
             states.insert(id, Self::layer_state(id, false, false));
         }
+
         let mut render_modes = RenderModeState::new();
-        // Default: show temperature observations (text mode).
-        // Without this, any_obs_enabled() is false on fresh installs and
-        // observations never load until the user manually enables a layer.
+        render_modes.assign(RenderMode::Braille, LayerId::Radar);
         render_modes.assign(RenderMode::Text, LayerId::SurfTemp);
 
         Self {
             states,
-            selected: LayerId::MapBorders,
-            selected_main: 0,
-            expanded_group: None,
-            sub_cursor: 0,
+            selected: LayerId::Radar, // first selectable item in MAIN_ORDER
+            selected_main: 1,
+            focus: PanelFocus::Main,
             render_modes,
         }
     }
 
-    pub fn selected_layer(&self) -> LayerId {
-        if let Some(g) = self.expanded_group {
-            let children = g.children();
-            if self.sub_cursor > 0 && self.sub_cursor <= children.len() {
-                return children[self.sub_cursor - 1];
-            }
+    /// True when the main-list item at `index` can receive keyboard focus.
+    /// Headers are never selectable; locked single layers are not selectable.
+    pub fn is_main_selectable(&self, index: usize) -> bool {
+        match Self::MAIN_ORDER[index] {
+            MainItem::Header(_) => false,
+            MainItem::Single(id) => !self.states.get(&id).is_some_and(|s| s.locked),
+            MainItem::Group(_) => true,
         }
-        self.selected
     }
 
+    // ── Focus accessors ────────────────────────────────────────────────
+
+    pub fn focus(&self) -> PanelFocus {
+        self.focus
+    }
+
+    /// Returns the cursor position when the options panel has focus, or `None`
+    /// when focus is in the main list.
+    pub fn options_cursor(&self) -> Option<usize> {
+        match self.focus {
+            PanelFocus::Options(i) => Some(i),
+            PanelFocus::Main => None,
+        }
+    }
+
+    /// True when focus is in the options panel.
+    pub fn is_in_options(&self) -> bool {
+        matches!(self.focus, PanelFocus::Options(_))
+    }
+
+    /// When the options panel is focused and the current item is a group,
+    /// returns that group — None otherwise.
+    pub fn focused_group(&self) -> Option<LayerGroup> {
+        match (self.focus, Self::MAIN_ORDER[self.selected_main]) {
+            (PanelFocus::Options(_), MainItem::Group(g)) => Some(g),
+            _ => None,
+        }
+    }
+
+    /// Backward-compatible name: true when a group is open in the options panel.
+    pub fn is_expanded(&self) -> bool {
+        self.focused_group().is_some()
+    }
+
+    // ── Navigation ─────────────────────────────────────────────────────
+
+    /// Number of options for the current main item (avoids allocating a Vec).
+    fn current_option_count(&self) -> usize {
+        match Self::MAIN_ORDER[self.selected_main] {
+            MainItem::Header(_) => 0,
+            MainItem::Single(id) if id.is_geographic() => 0,
+            MainItem::Single(id) if id.is_observation() => 1,
+            MainItem::Single(_) => 3,
+            MainItem::Group(g) => g.children().len(),
+        }
+    }
+
+    /// Step `index` forward by 1, skipping non-selectable items, with wrap-around.
+    fn next_selectable(&self, from: usize) -> usize {
+        let len = Self::MAIN_ORDER.len();
+        let mut i = (from + 1) % len;
+        while !self.is_main_selectable(i) && i != from {
+            i = (i + 1) % len;
+        }
+        i
+    }
+
+    /// Step `index` backward by 1, skipping non-selectable items, with wrap-around.
+    fn prev_selectable(&self, from: usize) -> usize {
+        let len = Self::MAIN_ORDER.len();
+        let mut i = (from + len - 1) % len;
+        while !self.is_main_selectable(i) && i != from {
+            i = (i + len - 1) % len;
+        }
+        i
+    }
+
+    /// Move down — wraps at the end of whichever panel has focus,
+    /// skipping non-selectable items in the main list.
     pub fn select_next(&mut self) {
-        if let Some(g) = self.expanded_group {
-            let children = g.children();
-            // sub_cursor 0=back, 1..=children.len()=sub-layers
-            if self.sub_cursor < children.len() {
-                self.sub_cursor += 1;
-                return;
+        match self.focus {
+            PanelFocus::Options(i) => {
+                let n = self.current_option_count();
+                if n > 0 {
+                    self.focus = PanelFocus::Options((i + 1) % n);
+                }
             }
-            self.expanded_group = None;
-            self.sub_cursor = 0;
-            self.selected_main = (self.selected_main + 1) % Self::MAIN_ORDER.len();
-        } else {
-            self.selected_main = (self.selected_main + 1) % Self::MAIN_ORDER.len();
+            PanelFocus::Main => {
+                self.selected_main = self.next_selectable(self.selected_main);
+            }
         }
         self.sync_selected();
     }
 
+    /// Move up — wraps at the beginning of whichever panel has focus,
+    /// skipping non-selectable items in the main list.
     pub fn select_previous(&mut self) {
-        if self.expanded_group.is_some() {
-            if self.sub_cursor > 0 {
-                self.sub_cursor -= 1;
-                return;
+        match self.focus {
+            PanelFocus::Options(i) => {
+                let n = self.current_option_count();
+                if n > 0 {
+                    self.focus = PanelFocus::Options((i + n - 1) % n);
+                }
             }
-            self.expanded_group = None;
-            self.sub_cursor = 0;
-            let len = Self::MAIN_ORDER.len();
-            self.selected_main = (self.selected_main + len - 1) % len;
-        } else {
-            let len = Self::MAIN_ORDER.len();
-            self.selected_main = (self.selected_main + len - 1) % len;
+            PanelFocus::Main => {
+                self.selected_main = self.prev_selectable(self.selected_main);
+            }
         }
         self.sync_selected();
     }
 
-    pub fn handle_space(&mut self) -> Option<LayerId> {
-        if let Some(g) = self.expanded_group {
-            if self.sub_cursor == 0 {
-                self.expanded_group = None;
-                self.sub_cursor = 0;
-                return None;
-            }
-            let children = g.children();
-            let id = children[self.sub_cursor - 1];
-            self.activate(id);
-            return Some(id);
+    /// Enter the options panel for any item that has options.  No-op when
+    /// already in options or when the current item has no options.
+    /// Returns `true` when focus actually moved.
+    pub fn enter_options(&mut self) -> bool {
+        if self.is_in_options() || self.current_option_count() == 0 {
+            return false;
         }
-        let item = Self::MAIN_ORDER[self.selected_main];
+        self.focus = PanelFocus::Options(0);
+        self.sync_selected();
+        true
+    }
+
+    /// Return focus to the main list.  Returns `true` when focus moved.
+    pub fn exit_options(&mut self) -> bool {
+        if !self.is_in_options() {
+            return false;
+        }
+        self.focus = PanelFocus::Main;
+        self.sync_selected();
+        true
+    }
+
+    /// Toggle or activate the currently focused item.
+    ///
+    /// In the main list: toggle a single layer or enter a group.
+    /// In the options panel: apply the focused option.
+    /// Returns the affected `LayerId` when a layer's state changed.
+    pub fn handle_space(&mut self) -> Option<LayerId> {
+        match self.focus {
+            PanelFocus::Options(i) => {
+                let item = Self::MAIN_ORDER[self.selected_main];
+                self.apply_option_at(item, i)
+            }
+            PanelFocus::Main => {
+                let item = Self::MAIN_ORDER[self.selected_main];
+                match item {
+                    MainItem::Header(_) => None,
+                    MainItem::Group(_) => {
+                        self.enter_options();
+                        None
+                    }
+                    MainItem::Single(id) => {
+                        self.activate(id);
+                        Some(id)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply the option at `index` for `item`.  Shared by `handle_space` and
+    /// any future direct-click path.
+    fn apply_option_at(&mut self, item: MainItem, index: usize) -> Option<LayerId> {
         match item {
-            MainItem::Group(g) => {
-                self.expanded_group = Some(g);
-                self.sub_cursor = 0;
-                None
+            MainItem::Header(_) => None,
+            MainItem::Single(id) if id.is_observation() => {
+                if index == 0 {
+                    self.activate(id);
+                    Some(id)
+                } else {
+                    None
+                }
             }
             MainItem::Single(id) => {
-                self.activate(id);
+                let mode = match index {
+                    0 => RenderMode::Braille,
+                    1 => RenderMode::Color,
+                    _ => RenderMode::Text,
+                };
+                self.render_modes.toggle(mode, id);
                 Some(id)
+            }
+            MainItem::Group(g) => {
+                let children = g.children();
+                if index < children.len() {
+                    let id = children[index];
+                    self.activate(id);
+                    Some(id)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -494,30 +670,19 @@ impl LayerRegistry {
         self.selected_main
     }
 
-    pub fn is_expanded(&self) -> bool {
-        self.expanded_group.is_some()
-    }
-
-    pub fn expanded_group(&self) -> Option<LayerGroup> {
-        self.expanded_group
-    }
-
-    pub fn sub_cursor(&self) -> usize {
-        self.sub_cursor
+    pub fn selected_layer(&self) -> LayerId {
+        self.selected
     }
 
     fn sync_selected(&mut self) {
-        if let Some(g) = self.expanded_group {
-            let children = g.children();
-            if self.sub_cursor > 0 && self.sub_cursor <= children.len() {
-                self.selected = children[self.sub_cursor - 1];
-                return;
+        self.selected = match (self.focus, Self::MAIN_ORDER[self.selected_main]) {
+            (PanelFocus::Options(i), MainItem::Group(g)) => {
+                let children = g.children();
+                children.get(i).copied().unwrap_or(children[0])
             }
-        }
-        let item = Self::MAIN_ORDER[self.selected_main];
-        self.selected = match item {
-            MainItem::Single(id) => id,
-            MainItem::Group(g) => g.children()[0],
+            (_, MainItem::Single(id)) => id,
+            (_, MainItem::Group(g)) => g.children()[0],
+            (_, MainItem::Header(_)) => self.selected, // headers don't change the selection
         };
     }
 
@@ -561,21 +726,24 @@ impl LayerRegistry {
     }
 
     pub fn set_selected(&mut self, id: LayerId) {
-        self.selected = id;
         for (i, item) in Self::MAIN_ORDER.iter().enumerate() {
             match item {
                 MainItem::Single(lid) if *lid == id => {
-                    self.selected_main = i;
-                    self.expanded_group = None;
-                    self.sub_cursor = 0;
+                    // Only move selection to selectable items; locked layers
+                    // (e.g. Countries) keep the current selection instead.
+                    if self.is_main_selectable(i) {
+                        self.selected_main = i;
+                        self.focus = PanelFocus::Main;
+                        self.selected = id;
+                    }
                     return;
                 }
                 MainItem::Group(g) => {
                     let children = g.children();
                     if let Some(pos) = children.iter().position(|c| *c == id) {
                         self.selected_main = i;
-                        self.expanded_group = Some(*g);
-                        self.sub_cursor = pos + 1; // +1 for back button
+                        self.focus = PanelFocus::Options(pos);
+                        self.selected = id;
                         return;
                     }
                 }
@@ -601,13 +769,83 @@ impl LayerRegistry {
             .collect()
     }
 
-    pub const MAIN_ORDER: [MainItem; 6] = [
-        MainItem::Single(LayerId::MapBorders),
-        MainItem::Single(LayerId::RegionBorders),
-        MainItem::Single(LayerId::MajorRoads),
+    /// Returns the options for a given main-list item, each paired with a
+    /// stable key string.  Geographic layers have no options — they use
+    /// the `[x]/[ ]` toggle in the main list directly.  Rendered and
+    /// grouped layers expose their per-layer knobs through this method so
+    /// the UI can render them generically without switching on layer type.
+    pub fn options_for_item(&self, item: MainItem) -> Vec<(&'static str, LayerOption)> {
+        match item {
+            MainItem::Header(_) => vec![],
+            MainItem::Single(id) if id.is_geographic() => vec![],
+            MainItem::Single(id) if id.is_observation() => vec![(
+                "text",
+                LayerOption::Toggle {
+                    label: "Text",
+                    value: self.render_modes.has(RenderMode::Text, id),
+                    has_error: matches!(
+                        self.states.get(&id).map(|s| &s.status),
+                        Some(LayerStatus::Error(_))
+                    ),
+                },
+            )],
+            MainItem::Single(id) => vec![
+                (
+                    "braille",
+                    LayerOption::Toggle {
+                        label: "Braille",
+                        value: self.render_modes.has(RenderMode::Braille, id),
+                        has_error: false,
+                    },
+                ),
+                (
+                    "color",
+                    LayerOption::Toggle {
+                        label: "Color",
+                        value: self.render_modes.has(RenderMode::Color, id),
+                        has_error: false,
+                    },
+                ),
+                (
+                    "text",
+                    LayerOption::Toggle {
+                        label: "Text",
+                        value: self.render_modes.has(RenderMode::Text, id),
+                        has_error: false,
+                    },
+                ),
+            ],
+            MainItem::Group(g) => g
+                .children()
+                .iter()
+                .map(|&id| {
+                    (
+                        id.label(),
+                        LayerOption::Toggle {
+                            label: id.label(),
+                            value: self.render_modes.has(RenderMode::Text, id),
+                            has_error: matches!(
+                                self.states.get(&id).map(|s| &s.status),
+                                Some(LayerStatus::Error(_))
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub const MAIN_ORDER: [MainItem; 8] = [
+        // Weather layers first
+        MainItem::Header("Weather"),
         MainItem::Single(LayerId::Radar),
         MainItem::Group(LayerGroup::Observations),
         MainItem::Single(LayerId::MeteoAlarm),
+        // Geography layers below — Roads on top, Countries fixed at bottom
+        MainItem::Header("Geography"),
+        MainItem::Single(LayerId::MajorRoads),
+        MainItem::Single(LayerId::RegionBorders),
+        MainItem::Single(LayerId::MapBorders), // Countries — locked, not selectable
     ];
 
     pub const ORDER: [LayerId; 9] = [
