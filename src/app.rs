@@ -15,9 +15,9 @@ use crate::cli::Cli;
 use crate::config::{Config, StateConfig};
 use crate::geo::{world_to_lat_lon, GeoPoint, Viewport, WorldPoint};
 use crate::layers::{
-    BorderLayer, BorderLine, BorderLineKind, BorderResolution, LayerId, LayerRegistry,
-    LayerStatus, ObservationLayer, ObservationPoint, RadarFrame, RadarTile, RenderMode,
-    WarningLayer, resolution_distance,
+    resolution_distance, BorderLayer, BorderLine, BorderLineKind, BorderResolution, LayerId,
+    LayerRegistry, LayerStatus, ObservationLayer, ObservationPoint, RadarFrame, RadarTile,
+    RenderMode, WarningLayer,
 };
 use crate::providers::eumetnet::EumetnetProvider;
 use crate::providers::maps::NaturalEarthProvider;
@@ -177,8 +177,7 @@ impl App {
         // older than a day is dead weight on disk.
         dirs.prune_radar_cache(Duration::from_secs(24 * 3600));
         write_log(&log, "boot: loading config");
-        let config = Config::load(&dirs.config_dir.join("config.toml"))
-            .wrap_err("load config")?;
+        let config = Config::load(&dirs.config_dir.join("config.toml")).wrap_err("load config")?;
         write_log(&log, "boot: building HTTP client");
         let client = Client::builder()
             .user_agent("front/0.1.0")
@@ -188,8 +187,7 @@ impl App {
             .wrap_err("build HTTP client")?;
 
         write_log(&log, "boot: initial viewport");
-        let (viewport, location_label, location_marker) =
-            initial_viewport(cli, &log).await;
+        let (viewport, location_label, location_marker) = initial_viewport(cli, &log).await;
         let (refresh_tx, refresh_rx) = unbounded_channel();
         let (border_tx, border_rx) = unbounded_channel();
         let (obs_tx, obs_rx) = unbounded_channel();
@@ -198,8 +196,18 @@ impl App {
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
         write_log(&log, "boot: creating providers");
         let cancel = Arc::new(AtomicBool::new(false));
-        let meteogate = MeteoGateProvider::new(client.clone(), dirs.clone(), config.meteogate.clone(), cancel.clone());
-        let meteoalarm = MeteoAlarmProvider::new(client.clone(), dirs.clone(), config.meteoalarm.clone(), cancel.clone());
+        let meteogate = MeteoGateProvider::new(
+            client.clone(),
+            dirs.clone(),
+            config.meteogate.clone(),
+            cancel.clone(),
+        );
+        let meteoalarm = MeteoAlarmProvider::new(
+            client.clone(),
+            dirs.clone(),
+            config.meteoalarm.clone(),
+            cancel.clone(),
+        );
         let eumetnet = EumetnetProvider::new(client.clone(), dirs.clone(), config.eumetnet.clone());
         let maps = NaturalEarthProvider::new(client, dirs.clone(), cancel.clone());
         let mut app = Self {
@@ -272,10 +280,7 @@ impl App {
         // Launch border loading in background — never block boot on it.
         write_log(
             &log,
-            format!(
-                "boot: spawning border load for zoom {}",
-                app.viewport.zoom
-            ),
+            format!("boot: spawning border load for zoom {}", app.viewport.zoom),
         );
         app.request_border_refresh();
 
@@ -346,7 +351,10 @@ impl App {
         let zoom = self.viewport.zoom;
         self.layers.set_status(LayerId::Radar, LayerStatus::Loading);
 
-        write_log(&log, format!("meteogate: loading frame ts={ts} zoom={zoom:.1}"));
+        write_log(
+            &log,
+            format!("meteogate: loading frame ts={ts} zoom={zoom:.1}"),
+        );
 
         let frame_result = self.meteogate.frame(ts, bounds, zoom).await;
 
@@ -442,8 +450,7 @@ impl App {
                             tile_count += 1;
                             // Asymptotic fraction: each tile moves the bar
                             // closer to 95 %.  Assume ~30 tiles is typical.
-                            let fraction = (1.0 - 0.5f64.powi(tile_count as i32 / 3))
-                                .min(0.95);
+                            let fraction = (1.0 - 0.5f64.powi(tile_count as i32 / 3)).min(0.95);
                             let _ = task_tx2.send(TaskMsg::Progress {
                                 id: task_id,
                                 action: format!("{} tiles", tile_count),
@@ -453,7 +460,10 @@ impl App {
                         }
                         Err(_) => continue, // skip errored tiles
                     };
-                    let _ = tx2.send(RadarRefreshResult { id, result: payload });
+                    let _ = tx2.send(RadarRefreshResult {
+                        id,
+                        result: payload,
+                    });
                 }
             });
 
@@ -530,7 +540,10 @@ impl App {
         self.layers
             .set_status(LayerId::MapBorders, LayerStatus::Loading);
         self.border_task = Some(tokio::spawn(async move {
-            let result = match maps.borders_for_resolution(resolution, bounds, spawn_cancel).await {
+            let result = match maps
+                .borders_for_resolution(resolution, bounds, spawn_cancel)
+                .await
+            {
                 Ok(layer) => {
                     let _ = task_tx.send(TaskMsg::Complete { id: task_id });
                     let tile_task_id = next_task_id();
@@ -643,7 +656,10 @@ impl App {
                 action: format!("downloading {res_label} geo…"),
                 fraction: 0.3,
             });
-            let result = match maps.borders_for_resolution(desired, bounds, spawn_cancel).await {
+            let result = match maps
+                .borders_for_resolution(desired, bounds, spawn_cancel)
+                .await
+            {
                 Ok(layer) => {
                     let _ = task_tx.send(TaskMsg::Progress {
                         id: task_id,
@@ -706,7 +722,11 @@ impl App {
             self.border_layers.remove(&victim);
             write_log(
                 &self.dirs.log_path,
-                format!("evict: {} borders from cache ({} resolutions stored)", victim.label(), self.border_layers.len()),
+                format!(
+                    "evict: {} borders from cache ({} resolutions stored)",
+                    victim.label(),
+                    self.border_layers.len()
+                ),
             );
         }
     }
@@ -846,7 +866,7 @@ impl App {
                         tokio::select! {
                             Some(pt) = prx.recv() => {
                                 n += 1;
-                                if n % 5 == 0 {
+                                if n.is_multiple_of(5) {
                                     let frac = (1.0 - 0.5f64.powi(n as i32 / 10)).min(0.90);
                                     let _ = task_tx_fwd.send(TaskMsg::Progress {
                                         id: task_id,
@@ -872,7 +892,10 @@ impl App {
             );
             match fetch_result {
                 Ok(()) => {
-                    let _ = tx.send(ObsRefreshResult { id, result: ObsRefreshPayload::Ready });
+                    let _ = tx.send(ObsRefreshResult {
+                        id,
+                        result: ObsRefreshPayload::Ready,
+                    });
                 }
                 Err(error) => {
                     write_log(&log, format!("obs: {error}"));
@@ -935,7 +958,10 @@ impl App {
             let task_tx2 = task_tx.clone();
             let preload_cancel = maps.cancel.clone();
             self.preload_tasks.push(tokio::spawn(async move {
-                let result = match maps.borders_for_resolution(res, bounds, preload_cancel).await {
+                let result = match maps
+                    .borders_for_resolution(res, bounds, preload_cancel)
+                    .await
+                {
                     Ok(layer) => {
                         let tile_task_id = next_task_id();
                         spawn_tile_gen(
@@ -1136,7 +1162,10 @@ impl App {
                 format!("frame_list: got {n} timestamps"),
             );
             if self.layers.enabled(LayerId::Radar) {
-                write_log(&self.dirs.log_path, "frame_list: spawning first radar refresh");
+                write_log(
+                    &self.dirs.log_path,
+                    "frame_list: spawning first radar refresh",
+                );
                 self.request_meteogate_refresh(self.map_width, self.map_height);
             }
         }
@@ -1188,7 +1217,11 @@ impl App {
                         });
                     }
                 }
-                TaskMsg::Progress { id, action, fraction } => {
+                TaskMsg::Progress {
+                    id,
+                    action,
+                    fraction,
+                } => {
                     if let Some(task) = self.active_tasks.iter_mut().find(|t| t.id == id) {
                         task.action = action;
                         if (fraction - task.fraction).abs() > 0.001 {
@@ -1229,8 +1262,7 @@ impl App {
                 task.anim_t = (task.anim_t + dt * 4.0).min(1.0); // 0.25 s max
                 let t = task.anim_t;
                 let eased = t * t * (3.0 - 2.0 * t); // smoothstep
-                task.display_fraction = task.anim_from
-                    + (task.fraction - task.anim_from) * eased;
+                task.display_fraction = task.anim_from + (task.fraction - task.anim_from) * eased;
                 changed = true;
             }
         }
@@ -1292,7 +1324,8 @@ impl App {
                     // progressive results (capitals → cities → full viewport).
                     // Accumulates across phases: obs_partial grows with each commit.
                     if self.obs_incoming_id == result.id && !self.obs_incoming.is_empty() {
-                        self.obs_partial.extend(std::mem::take(&mut self.obs_incoming));
+                        self.obs_partial
+                            .extend(std::mem::take(&mut self.obs_incoming));
                         self.obs_cache = Some(ObservationLayer {
                             points: self.obs_partial.clone(),
                             updated_at: Some(Utc::now().timestamp()),
@@ -1304,7 +1337,8 @@ impl App {
                     // Final commit: fold any remaining incoming into the partial
                     // accumulator and replace obs_cache with the complete set.
                     if self.obs_incoming_id == result.id {
-                        self.obs_partial.extend(std::mem::take(&mut self.obs_incoming));
+                        self.obs_partial
+                            .extend(std::mem::take(&mut self.obs_incoming));
                         if !self.obs_partial.is_empty() {
                             self.obs_cache = Some(ObservationLayer {
                                 points: std::mem::take(&mut self.obs_partial),
@@ -1323,7 +1357,9 @@ impl App {
                     // If nothing was cached (empty result / failure), clear
                     // obs_last_attempt so staleness retries on the next tick
                     // instead of waiting the full refresh interval.
-                    if self.obs_cache.is_none() || self.obs_cache.as_ref().is_some_and(|c| c.points.is_empty()) {
+                    if self.obs_cache.is_none()
+                        || self.obs_cache.as_ref().is_some_and(|c| c.points.is_empty())
+                    {
                         self.obs_last_attempt = None;
                     }
                 }
@@ -1403,18 +1439,30 @@ impl App {
         // text mode on a non-obs layer (e.g. Radar), which would leave
         // any_surface_enabled() returning false forever.
         if !self.any_obs_enabled() {
-            self.layers.mode_state_mut().assign(RenderMode::Text, LayerId::SurfTemp);
+            self.layers
+                .mode_state_mut()
+                .assign(RenderMode::Text, LayerId::SurfTemp);
         }
     }
 
     pub fn any_obs_enabled(&self) -> bool {
-        [LayerId::SurfTemp, LayerId::SurfWind, LayerId::SurfHumidity, LayerId::SurfPressure]
-            .iter()
-            .any(|id| self.layers.enabled(*id))
+        [
+            LayerId::SurfTemp,
+            LayerId::SurfWind,
+            LayerId::SurfHumidity,
+            LayerId::SurfPressure,
+        ]
+        .iter()
+        .any(|id| self.layers.enabled(*id))
     }
 
     pub fn set_obs_status(&mut self, status: LayerStatus) {
-        for id in [LayerId::SurfTemp, LayerId::SurfWind, LayerId::SurfHumidity, LayerId::SurfPressure] {
+        for id in [
+            LayerId::SurfTemp,
+            LayerId::SurfWind,
+            LayerId::SurfHumidity,
+            LayerId::SurfPressure,
+        ] {
             self.layers.set_status(id, status.clone());
         }
     }
@@ -1521,7 +1569,6 @@ async fn initial_viewport(cli: &Cli, log_path: &Path) -> (Viewport, String, Opti
     )
 }
 
-
 // ── Background task queue ───────────────────────────────────────────
 
 use std::sync::atomic::AtomicU64;
@@ -1566,10 +1613,23 @@ impl TaskKind {
 /// A task progress message sent from background tasks to the UI.
 #[derive(Debug)]
 pub enum TaskMsg {
-    Start { id: u64, label: String, kind: TaskKind },
-    Progress { id: u64, action: String, fraction: f64 },
-    Complete { id: u64 },
-    Error { id: u64, error: String },
+    Start {
+        id: u64,
+        label: String,
+        kind: TaskKind,
+    },
+    Progress {
+        id: u64,
+        action: String,
+        fraction: f64,
+    },
+    Complete {
+        id: u64,
+    },
+    Error {
+        id: u64,
+        error: String,
+    },
 }
 
 /// Current state of a background task as known by the UI.
@@ -1610,6 +1670,7 @@ pub fn next_task_id() -> u64 {
 /// Spawn a background tile-generation task.  Generates all cached tiles for
 /// `res` from `lines`, sends `TilesBuilt` on `tx` when done, and completes
 /// `tile_task_id` on `task_tx`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_tile_gen(
     maps: NaturalEarthProvider,
     res: BorderResolution,
@@ -1628,14 +1689,21 @@ fn spawn_tile_gen(
         if gen_ok {
             write_log(
                 &log_path,
-                format!("tile_gen: {} tiles built in {:?}", res.label(), gen_start.elapsed()),
+                format!(
+                    "tile_gen: {} tiles built in {:?}",
+                    res.label(),
+                    gen_start.elapsed()
+                ),
             );
             let _ = tx.send(BorderRefreshResult {
                 id: result_id,
                 result: BorderRefreshPayload::TilesBuilt(res),
             });
         } else {
-            write_log(&log_path, format!("tile_gen: {} generation failed", res.label()));
+            write_log(
+                &log_path,
+                format!("tile_gen: {} generation failed", res.label()),
+            );
         }
         let _ = task_tx.send(TaskMsg::Complete { id: tile_task_id });
     });

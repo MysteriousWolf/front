@@ -11,7 +11,7 @@ use tokio::task;
 
 use crate::cache::{read_if_exists, write_atomic, write_log, FrontDirs};
 use crate::config::MeteoAlarmConfig;
-use crate::geo::{WorldPoint, lat_lon_to_world};
+use crate::geo::{lat_lon_to_world, WorldPoint};
 use crate::layers::{WarningFeature, WarningLayer};
 
 // Location filter used by MeteoAlarm API. The API supports per-region
@@ -28,8 +28,18 @@ pub struct MeteoAlarmProvider {
 }
 
 impl MeteoAlarmProvider {
-    pub fn new(client: Client, dirs: FrontDirs, config: MeteoAlarmConfig, cancel: Arc<AtomicBool>) -> Self {
-        Self { client, dirs, config, cancel }
+    pub fn new(
+        client: Client,
+        dirs: FrontDirs,
+        config: MeteoAlarmConfig,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            client,
+            dirs,
+            config,
+            cancel,
+        }
     }
 
     /// Fetch and decode active MeteoAlarm warnings for the configured area.
@@ -59,7 +69,10 @@ impl MeteoAlarmProvider {
 
         // Cache miss or stale: fetch from API
         let location = LOCATION_ID_ALL;
-        let mut url = format!("{}/collections/warnings/locations/{}", self.config.api_endpoint, location);
+        let mut url = format!(
+            "{}/collections/warnings/locations/{}",
+            self.config.api_endpoint, location
+        );
         if !self.config.token.is_empty() {
             url.push_str(&format!("?token={}", self.config.token));
         }
@@ -74,16 +87,16 @@ impl MeteoAlarmProvider {
             .wrap_err_with(|| format!("download MeteoAlarm: {url}"))?
             .error_for_status()
             .wrap_err_with(|| format!("MeteoAlarm response: {url}"))?;
-        let json: Value = resp
-            .json()
-            .await
-            .wrap_err("read MeteoAlarm JSON")?;
+        let json: Value = resp.json().await.wrap_err("read MeteoAlarm JSON")?;
 
         // Decode GeoJSON.FeatureCollection in a blocking thread to keep
         // the async runtime responsive during CPU-heavy parsing
         let (out_features, now) = {
             let json_for_parse = json;
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             let cancel = self.cancel.clone();
             let handle = task::spawn_blocking(move || {
                 if cancel.load(Ordering::Relaxed) {
@@ -99,7 +112,9 @@ impl MeteoAlarmProvider {
                 for feat in features {
                     // Geometry
                     let geometry = feat.get("geometry");
-                    let geom_type = geometry.and_then(|g| g.get("type").and_then(|t| t.as_str())).unwrap_or("");
+                    let geom_type = geometry
+                        .and_then(|g| g.get("type").and_then(|t| t.as_str()))
+                        .unwrap_or("");
                     if geom_type != "Polygon" {
                         continue;
                     }
@@ -132,7 +147,11 @@ impl MeteoAlarmProvider {
                         .get("properties")
                         .and_then(|p| p.as_object())
                         .unwrap_or(&empty_props);
-                    let country_code = props.get("countryCode").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let country_code = props
+                        .get("countryCode")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let awareness_level = props
                         .get("awareness_level")
                         .and_then(|v| v.as_str())
@@ -210,7 +229,10 @@ impl MeteoAlarmProvider {
             let _ = write_atomic(&path, &bytes);
         }
 
-        Ok(WarningLayer { features: out_features, updated_at: Some(now) })
+        Ok(WarningLayer {
+            features: out_features,
+            updated_at: Some(now),
+        })
     }
 }
 
@@ -246,5 +268,8 @@ fn deserialize_cached_warning_layer(bytes: &[u8]) -> Result<WarningLayer> {
             expires: sf.expires,
         })
         .collect();
-    Ok(WarningLayer { features, updated_at: cached.updated_at })
+    Ok(WarningLayer {
+        features,
+        updated_at: cached.updated_at,
+    })
 }

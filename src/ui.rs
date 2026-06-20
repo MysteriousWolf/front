@@ -22,13 +22,12 @@ use ratatui::Terminal;
 use crate::app::{App, BorderMask, BorderMaskPoint, BorderMaskStamp, TaskState};
 use crate::cache::write_log;
 use crate::geo::{
-    lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, WorldPoint,
-    CITY_MATCH_KM, EUROPEAN_CAPITAL_NAMES, EUROPEAN_CAPITALS, EUROPEAN_MAJOR_CITIES,
+    lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, WorldPoint, CITY_MATCH_KM,
+    EUROPEAN_CAPITALS, EUROPEAN_CAPITAL_NAMES, EUROPEAN_MAJOR_CITIES,
 };
 use crate::layers::{
-    BorderLine, BorderLineKind, BorderResolution, LayerId, LayerRegistry,
-    LayerStatus, MainItem, ObservationPoint, ObservationProperty, RadarFrame,
-    RenderMode, RenderModeState, Rgb8,
+    BorderLine, BorderLineKind, BorderResolution, LayerId, LayerRegistry, LayerStatus, MainItem,
+    ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
 };
 
 const INTERACTION_REFRESH_DEBOUNCE_MS: u64 = 60;
@@ -56,10 +55,15 @@ const MAJOR_CITIES_ZOOM_CUTOFF: f64 = 5.0;
 /// Capital-adjacent stations use a much smaller fixed radius (2) so they
 /// are never pushed out by nearby non-capital stations.
 fn declutter_radius(zoom: f64) -> usize {
-    if zoom < 4.0 { 6 }
-    else if zoom < 5.0 { 5 }
-    else if zoom < 6.0 { 4 }
-    else { 3 }
+    if zoom < 4.0 {
+        6
+    } else if zoom < 5.0 {
+        5
+    } else if zoom < 6.0 {
+        4
+    } else {
+        3
+    }
 }
 /// At/above this zoom every station in view is eligible; the render-side
 /// declutter keeps them readable.
@@ -134,17 +138,24 @@ fn is_capital_station(lat: f64, lon: f64) -> bool {
 /// within `CITY_MATCH_KM` and map it to the hardcoded capital name.  Only that
 /// station gets a name label, and the label shows the capital name (not the
 /// obscure station name returned by the API).
-fn capital_name_labels(points: &[crate::layers::ObservationPoint]) -> std::collections::HashMap<usize, &'static str> {
+fn capital_name_labels(
+    points: &[crate::layers::ObservationPoint],
+) -> std::collections::HashMap<usize, &'static str> {
     let threshold_sq = (CITY_MATCH_KM / 111.0_f64).powi(2);
-    let mut labels: std::collections::HashMap<usize, &'static str> = std::collections::HashMap::new();
+    let mut labels: std::collections::HashMap<usize, &'static str> =
+        std::collections::HashMap::new();
     for (&(clat, clon), &name) in CAPITALS.iter().zip(EUROPEAN_CAPITAL_NAMES.iter()) {
         let cos_lat = clat.to_radians().cos();
-        let best = points.iter().enumerate().filter_map(|(idx, pt)| {
-            let dlat = pt.point.lat - clat;
-            let dlon = (pt.point.lon - clon) * cos_lat;
-            let d2 = dlat * dlat + dlon * dlon;
-            (d2 < threshold_sq).then_some((idx, d2))
-        }).min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let best = points
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, pt)| {
+                let dlat = pt.point.lat - clat;
+                let dlon = (pt.point.lon - clon) * cos_lat;
+                let d2 = dlat * dlat + dlon * dlon;
+                (d2 < threshold_sq).then_some((idx, d2))
+            })
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if let Some((idx, _)) = best {
             labels.entry(idx).or_insert(name);
         }
@@ -442,9 +453,8 @@ async fn run_loop(
                     // aborting in-flight tile tasks on every scroll tick.
                     app.request_border_refresh();
                     pending_zoom_refresh = true;
-                    next_zoom_refresh = Some(
-                        Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS),
-                    );
+                    next_zoom_refresh =
+                        Some(Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS));
                     dirty = true;
                 }
                 MouseEventKind::ScrollDown => {
@@ -463,9 +473,8 @@ async fn run_loop(
                     }
                     app.request_border_refresh();
                     pending_zoom_refresh = true;
-                    next_zoom_refresh = Some(
-                        Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS),
-                    );
+                    next_zoom_refresh =
+                        Some(Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS));
                     dirty = true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -543,9 +552,15 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
 fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let content = vec![
-        TextLine::from(Span::styled("  Help & About", Style::default().add_modifier(Modifier::BOLD))),
+        TextLine::from(Span::styled(
+            "  Help & About",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         TextLine::from(""),
-        TextLine::from(Span::styled("  Keyboard", Style::default().add_modifier(Modifier::UNDERLINED))),
+        TextLine::from(Span::styled(
+            "  Keyboard",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         TextLine::from("    q / Esc    Quit"),
         TextLine::from("    ?          Toggle this help"),
         TextLine::from("    arrows     Pan map"),
@@ -556,17 +571,26 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         TextLine::from("    ⇧↑ / ⇧↓   Select previous / next layer"),
         TextLine::from("    m          Refetch map data (clear cache)"),
         TextLine::from(""),
-        TextLine::from(Span::styled("  Files", Style::default().add_modifier(Modifier::UNDERLINED))),
+        TextLine::from(Span::styled(
+            "  Files",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         TextLine::from("    config     ~/.config/front/config.toml"),
         TextLine::from("    state      ~/.config/front/state.toml"),
         TextLine::from("    map cache  ~/.cache/front/maps/"),
         TextLine::from("    logs       ~/.cache/front/front.log"),
         TextLine::from(""),
-        TextLine::from(Span::styled("  Mouse", Style::default().add_modifier(Modifier::UNDERLINED))),
+        TextLine::from(Span::styled(
+            "  Mouse",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         TextLine::from("    scroll     Zoom in / out"),
         TextLine::from("    drag       Pan map"),
         TextLine::from(""),
-        TextLine::from(Span::styled("  Data Sources", Style::default().add_modifier(Modifier::UNDERLINED))),
+        TextLine::from(Span::styled(
+            "  Data Sources",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         TextLine::from("    Country borders: Natural Earth Data (public domain)"),
         TextLine::from("    Region borders:  Natural Earth Data (public domain)"),
         TextLine::from("    Roads:           Natural Earth Data (public domain)"),
@@ -658,7 +682,13 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     // If pan exceeded 50 % of the viewport, invalidate so the next
     // call to `get_or_compute_border_mask` does a full recompute.
     if let Some((_, mask)) = app.border_mask_cache.as_ref() {
-        let (dx_sub, dy_sub) = subcell_offset(app.viewport.center, mask.center, &bounds, sub_width, sub_height);
+        let (dx_sub, dy_sub) = subcell_offset(
+            app.viewport.center,
+            mask.center,
+            &bounds,
+            sub_width,
+            sub_height,
+        );
         let max_dx = (sub_width as f64 * 0.5) as i32;
         let max_dy = (sub_height as f64 * 0.5) as i32;
         if dx_sub.abs() > max_dx || dy_sub.abs() > max_dy {
@@ -695,12 +725,28 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
     // Offset from whatever mask is now in the cache to the current
     // viewport centre — marks get shifted by this during rasterisation.
-    let offset = app.border_mask_cache
+    let offset = app
+        .border_mask_cache
         .as_ref()
-        .map(|(_, mask)| subcell_offset(app.viewport.center, mask.center, &bounds, sub_width, sub_height))
+        .map(|(_, mask)| {
+            subcell_offset(
+                app.viewport.center,
+                mask.center,
+                &bounds,
+                sub_width,
+                sub_height,
+            )
+        })
         .unwrap_or((0, 0));
     let mut braille_frame = std::mem::take(&mut app.braille_frame);
-    let rows = raster_map_rows(app, bounds, area.width, area.height, offset, &mut braille_frame);
+    let rows = raster_map_rows(
+        app,
+        bounds,
+        area.width,
+        area.height,
+        offset,
+        &mut braille_frame,
+    );
     app.braille_frame = braille_frame;
     frame.render_widget(Paragraph::new(rows), area);
     render_layer_list(frame, area, app);
@@ -738,7 +784,8 @@ fn get_or_compute_border_mask(
             // `values().next()` might pick Low110m which has no region
             // or road data, causing them to disappear.
             use BorderResolution::*;
-            [Regional10m, High10m, Medium50m, Low110m].into_iter()
+            [Regional10m, High10m, Medium50m, Low110m]
+                .into_iter()
                 .find(|r| app.border_layers.contains_key(r))
                 .and_then(|r| app.border_layers.get(&r))
         })
@@ -799,7 +846,14 @@ fn compute_mask_cells(
                 seen.resize(needed, 0);
                 grid.lines_for_bounds(bounds, candidates, seen);
                 for &id in candidates.iter() {
-                    rasterize_line(&mut mask, &borders.lines[id as usize], bounds, sub_width, sub_height, stamp);
+                    rasterize_line(
+                        &mut mask,
+                        &borders.lines[id as usize],
+                        bounds,
+                        sub_width,
+                        sub_height,
+                        stamp,
+                    );
                 }
             });
         });
@@ -846,10 +900,11 @@ fn rasterize_line(
         let Some((x1, y1, x2, y2)) = clipped_segment(bounds, a.x, a.y, b.x, b.y) else {
             continue;
         };
-        mark_border_segment(mask, bounds, sub_width, sub_height, x1, y1, x2, y2, line.kind);
+        mark_border_segment(
+            mask, bounds, sub_width, sub_height, x1, y1, x2, y2, line.kind,
+        );
     }
 }
-
 
 #[derive(Debug, Default)]
 pub struct BrailleFrame {
@@ -930,10 +985,9 @@ fn handle_layer_enable(app: &mut App, id: LayerId, refresh: &mut bool) {
         LayerId::MeteoAlarm => {
             app.pending_warning_refresh = app.layers.enabled(id);
         }
-        id if (id.is_observation())
-            && app.layers.enabled(id) => {
-                app.request_obs_refresh();
-            }
+        id if (id.is_observation()) && app.layers.enabled(id) => {
+            app.request_obs_refresh();
+        }
         _ => {}
     }
 }
@@ -956,21 +1010,18 @@ fn raster_map_rows(
     // coincident road or region line.
     if let Some((_, mask)) = &app.border_mask_cache {
         let (dx, dy) = mask_offset;
-        for kind in [BorderLineKind::Region, BorderLineKind::Road, BorderLineKind::Country] {
+        for kind in [
+            BorderLineKind::Region,
+            BorderLineKind::Road,
+            BorderLineKind::Country,
+        ] {
             for mark in &mask.marks {
                 if mark.kind != kind {
                     continue;
                 }
                 let sx = (mark.sx as i32 + dx).max(0) as u32;
                 let sy = (mark.sy as i32 + dy).max(0) as u32;
-                set_subcell(
-                    cells,
-                    width,
-                    sx,
-                    sy,
-                    border_line_color(mark.kind),
-                    1,
-                );
+                set_subcell(cells, width, sx, sy, border_line_color(mark.kind), 1);
             }
         }
     }
@@ -1020,8 +1071,7 @@ fn desired_border_resolution(app: &App) -> BorderResolution {
 fn show_regions(app: &App) -> bool {
     // Regions are too noisy at continent zoom — gated by
     // includes_regions() which kicks in at High10m (zoom ≥ 5.5).
-    desired_border_resolution(app).includes_regions()
-        && app.layers.enabled(LayerId::RegionBorders)
+    desired_border_resolution(app).includes_regions() && app.layers.enabled(LayerId::RegionBorders)
 }
 
 fn show_roads(app: &App) -> bool {
@@ -1061,29 +1111,25 @@ fn raster_radar(
         for (row_index, runs) in tile.rows.iter().enumerate() {
             let world_y_start =
                 tb.min_y + row_index as f64 / f64::from(tile.size) * tile_world_height;
-            let world_y_end = tb.min_y
-                + (row_index + 1) as f64 / f64::from(tile.size) * tile_world_height;
-            let start_sy = world_to_subcell_start(
-                world_y_start, bounds.min_y, bounds.height(), sub_height,
-            );
-            let end_sy = world_to_subcell_end(
-                world_y_end, bounds.min_y, bounds.height(), sub_height,
-            );
+            let world_y_end =
+                tb.min_y + (row_index + 1) as f64 / f64::from(tile.size) * tile_world_height;
+            let start_sy =
+                world_to_subcell_start(world_y_start, bounds.min_y, bounds.height(), sub_height);
+            let end_sy =
+                world_to_subcell_end(world_y_end, bounds.min_y, bounds.height(), sub_height);
             if start_sy >= end_sy {
                 continue;
             }
 
             for run in runs {
-                let world_x_start = tb.min_x
-                    + f64::from(run.start_x) / f64::from(tile.size) * tile_world_width;
-                let world_x_end = tb.min_x
-                    + f64::from(run.end_x) / f64::from(tile.size) * tile_world_width;
-                let start_sx = world_to_subcell_start(
-                    world_x_start, bounds.min_x, bounds.width(), sub_width,
-                );
-                let end_sx = world_to_subcell_end(
-                    world_x_end, bounds.min_x, bounds.width(), sub_width,
-                );
+                let world_x_start =
+                    tb.min_x + f64::from(run.start_x) / f64::from(tile.size) * tile_world_width;
+                let world_x_end =
+                    tb.min_x + f64::from(run.end_x) / f64::from(tile.size) * tile_world_width;
+                let start_sx =
+                    world_to_subcell_start(world_x_start, bounds.min_x, bounds.width(), sub_width);
+                let end_sx =
+                    world_to_subcell_end(world_x_end, bounds.min_x, bounds.width(), sub_width);
                 if start_sx >= end_sx {
                     continue;
                 }
@@ -1117,13 +1163,7 @@ fn radar_glyph(intensity: u8) -> char {
     }
 }
 
-fn raster_warnings(
-    cells: &mut [RasterCell],
-    app: &App,
-    bounds: Bounds,
-    width: u16,
-    height: u16,
-) {
+fn raster_warnings(cells: &mut [RasterCell], app: &App, bounds: Bounds, width: u16, height: u16) {
     let warning_layer = match &app.warning_layer {
         Some(w) => w,
         None => return,
@@ -1154,8 +1194,10 @@ fn raster_warnings(
         let sub_poly: Vec<(i32, i32)> = poly
             .iter()
             .filter_map(|p| {
-                if p.x < bounds.min_x || p.x > bounds.max_x
-                    || p.y < bounds.min_y || p.y > bounds.max_y
+                if p.x < bounds.min_x
+                    || p.x > bounds.max_x
+                    || p.y < bounds.min_y
+                    || p.y > bounds.max_y
                 {
                     None
                 } else {
@@ -1232,19 +1274,21 @@ fn raster_obs_placeholders(
             continue;
         }
         let world = lat_lon_to_world(lat, lon);
-        if world.x < bounds.min_x || world.x > bounds.max_x
-            || world.y < bounds.min_y || world.y > bounds.max_y
+        if world.x < bounds.min_x
+            || world.x > bounds.max_x
+            || world.y < bounds.min_y
+            || world.y > bounds.max_y
         {
             continue;
         }
         let sx = ((world.x - bounds.min_x) / bounds.width().max(f64::EPSILON)
             * f64::from(sub_width))
-            .floor()
-            .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
+        .floor()
+        .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
         let sy = ((world.y - bounds.min_y) / bounds.height().max(f64::EPSILON)
             * f64::from(sub_height))
-            .floor()
-            .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
+        .floor()
+        .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
         write_obs_str(cells, width, sx, sy, "·", DIM, false);
     }
 }
@@ -1258,10 +1302,9 @@ fn raster_observations(
 ) {
     let modes = app.layers.mode_state();
 
-    let obs_layer_active = crate::layers::LayerRegistry::ORDER.iter().any(|id| {
-        (id.is_observation())
-            && modes.has(RenderMode::Text, *id)
-    });
+    let obs_layer_active = crate::layers::LayerRegistry::ORDER
+        .iter()
+        .any(|id| (id.is_observation()) && modes.has(RenderMode::Text, *id));
 
     if app.obs_cache.is_none() {
         if obs_layer_active && app.has_obs_task() {
@@ -1311,16 +1354,23 @@ fn raster_observations(
                 }
 
                 let world = point.world;
-                if world.x < bounds.min_x || world.x > bounds.max_x
-                    || world.y < bounds.min_y || world.y > bounds.max_y
-                { continue; }
+                if world.x < bounds.min_x
+                    || world.x > bounds.max_x
+                    || world.y < bounds.min_y
+                    || world.y > bounds.max_y
+                {
+                    continue;
+                }
 
                 let sx = ((world.x - bounds.min_x) / bounds.width().max(f64::EPSILON)
-                    * f64::from(sub_width)).floor()
-                    .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
+                    * f64::from(sub_width))
+                .floor()
+                .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
                 let sy = ((world.y - bounds.min_y) / bounds.height().max(f64::EPSILON)
-                    * f64::from(sub_height)).floor()
-                    .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
+                    * f64::from(sub_height))
+                .floor()
+                .clamp(0.0, f64::from(sub_height.saturating_sub(1)))
+                    as u32;
 
                 // 2-D proximity guard: skip this label if any existing glyph
                 // occupies the rectangle ±radius cols × ±1 row around it.
@@ -1329,16 +1379,19 @@ fn raster_observations(
                 // stations (second pass) use the zoom-adaptive radius.
                 let cell_x = (sx / 2) as usize;
                 let cell_y = (sy / 4) as usize;
-                let r = if capitals_first { 2 } else { declutter_radius(app.viewport.zoom) };
+                let r = if capitals_first {
+                    2
+                } else {
+                    declutter_radius(app.viewport.zoom)
+                };
                 let col_start = cell_x.saturating_sub(r);
                 let col_end = (cell_x + r + 1).min(usize::from(width));
                 let row_start = cell_y.saturating_sub(1);
                 let row_end = (cell_y + 2).min(usize::from(height));
                 if (row_start..row_end).any(|ry| {
                     let rb = ry * usize::from(width);
-                    (col_start..col_end).any(|cx| {
-                        cells.get(rb + cx).is_some_and(|c| c.glyph.is_some())
-                    })
+                    (col_start..col_end)
+                        .any(|cx| cells.get(rb + cx).is_some_and(|c| c.glyph.is_some()))
                 }) {
                     continue;
                 }
@@ -1355,7 +1408,9 @@ fn raster_observations(
                     let name_row_base = name_cell_y * usize::from(width);
                     let name_end = (name_cell_x + cap_name.len()).min(usize::from(width));
                     let cells_free = (name_cell_x..name_end).all(|cx| {
-                        cells.get(name_row_base + cx).is_some_and(|c| c.glyph.is_none())
+                        cells
+                            .get(name_row_base + cx)
+                            .is_some_and(|c| c.glyph.is_none())
                     });
                     if cells_free {
                         write_obs_str(cells, width, sx, name_sy, cap_name, NAME_COLOR, false);
@@ -1371,17 +1426,21 @@ fn raster_observations(
     const CAPITAL_NO_DATA: Rgb8 = Rgb8::new(75, 75, 75);
     for &(clat, clon) in CAPITALS {
         let world = lat_lon_to_world(clat, clon);
-        if world.x < bounds.min_x || world.x > bounds.max_x
-            || world.y < bounds.min_y || world.y > bounds.max_y
+        if world.x < bounds.min_x
+            || world.x > bounds.max_x
+            || world.y < bounds.min_y
+            || world.y > bounds.max_y
         {
             continue;
         }
         let sx = ((world.x - bounds.min_x) / bounds.width().max(f64::EPSILON)
-            * f64::from(sub_width)).floor()
-            .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
+            * f64::from(sub_width))
+        .floor()
+        .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
         let sy = ((world.y - bounds.min_y) / bounds.height().max(f64::EPSILON)
-            * f64::from(sub_height)).floor()
-            .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
+            * f64::from(sub_height))
+        .floor()
+        .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
         let idx = (sy / 4) as usize * usize::from(width) + (sx / 2) as usize;
         if cells.get(idx).is_some_and(|c| c.glyph.is_none()) {
             write_obs_str(cells, width, sx, sy, "·", CAPITAL_NO_DATA, false);
@@ -1394,38 +1453,65 @@ fn obs_color(property: ObservationProperty, value: Option<f64>) -> Rgb8 {
         // Temperature: cold blue → teal → yellow-green → amber → hot orange
         // Follows standard synoptic weather-map convention.
         (ObservationProperty::Temperature, Some(t)) => {
-            if t < -20.0      { Rgb8::new(80,  110, 210) }
-            else if t < -10.0 { Rgb8::new(110, 155, 235) }
-            else if t < 0.0   { Rgb8::new(140, 195, 240) }
-            else if t < 10.0  { Rgb8::new(100, 205, 185) }
-            else if t < 20.0  { Rgb8::new(165, 215, 120) }
-            else if t < 30.0  { Rgb8::new(235, 185, 65)  }
-            else              { Rgb8::new(230, 100, 60)   }
+            if t < -20.0 {
+                Rgb8::new(80, 110, 210)
+            } else if t < -10.0 {
+                Rgb8::new(110, 155, 235)
+            } else if t < 0.0 {
+                Rgb8::new(140, 195, 240)
+            } else if t < 10.0 {
+                Rgb8::new(100, 205, 185)
+            } else if t < 20.0 {
+                Rgb8::new(165, 215, 120)
+            } else if t < 30.0 {
+                Rgb8::new(235, 185, 65)
+            } else {
+                Rgb8::new(230, 100, 60)
+            }
         }
         // Wind: Beaufort-inspired calm-gray → light-blue → green → yellow → orange → red
         (ObservationProperty::WindSpeed, Some(w)) => {
-            if w < 1.0        { Rgb8::new(165, 185, 195) }
-            else if w < 3.0   { Rgb8::new(130, 190, 235) }
-            else if w < 8.0   { Rgb8::new(110, 210, 150) }
-            else if w < 14.0  { Rgb8::new(220, 205, 80)  }
-            else if w < 20.0  { Rgb8::new(230, 140, 60)  }
-            else              { Rgb8::new(215, 80,  80)   }
+            if w < 1.0 {
+                Rgb8::new(165, 185, 195)
+            } else if w < 3.0 {
+                Rgb8::new(130, 190, 235)
+            } else if w < 8.0 {
+                Rgb8::new(110, 210, 150)
+            } else if w < 14.0 {
+                Rgb8::new(220, 205, 80)
+            } else if w < 20.0 {
+                Rgb8::new(230, 140, 60)
+            } else {
+                Rgb8::new(215, 80, 80)
+            }
         }
         // Humidity: dry amber → comfortable green → moist blue
         (ObservationProperty::Humidity, Some(h)) => {
-            if h < 30.0       { Rgb8::new(205, 170, 75)  }
-            else if h < 50.0  { Rgb8::new(195, 210, 120) }
-            else if h < 70.0  { Rgb8::new(130, 200, 155) }
-            else if h < 85.0  { Rgb8::new(100, 175, 220) }
-            else              { Rgb8::new(70,  130, 215)  }
+            if h < 30.0 {
+                Rgb8::new(205, 170, 75)
+            } else if h < 50.0 {
+                Rgb8::new(195, 210, 120)
+            } else if h < 70.0 {
+                Rgb8::new(130, 200, 155)
+            } else if h < 85.0 {
+                Rgb8::new(100, 175, 220)
+            } else {
+                Rgb8::new(70, 130, 215)
+            }
         }
         // Pressure: low = stormy red, normal = neutral, high = fair-weather blue
         (ObservationProperty::Pressure, Some(p)) => {
-            if p < 980.0      { Rgb8::new(215, 85,  85)  }
-            else if p < 1000.0{ Rgb8::new(200, 145, 130) }
-            else if p < 1015.0{ Rgb8::new(165, 185, 205) }
-            else if p < 1030.0{ Rgb8::new(110, 170, 220) }
-            else              { Rgb8::new(70,  135, 215)  }
+            if p < 980.0 {
+                Rgb8::new(215, 85, 85)
+            } else if p < 1000.0 {
+                Rgb8::new(200, 145, 130)
+            } else if p < 1015.0 {
+                Rgb8::new(165, 185, 205)
+            } else if p < 1030.0 {
+                Rgb8::new(110, 170, 220)
+            } else {
+                Rgb8::new(70, 135, 215)
+            }
         }
         _ => Rgb8::GRAY,
     }
@@ -1455,7 +1541,14 @@ fn set_subcell_bg(cells: &mut [RasterCell], width: u16, sx: u32, sy: u32, color:
     cell.bg = Some(color);
 }
 
-fn set_subcell_glyph(cells: &mut [RasterCell], width: u16, sx: u32, sy: u32, glyph: char, color: Rgb8) {
+fn set_subcell_glyph(
+    cells: &mut [RasterCell],
+    width: u16,
+    sx: u32,
+    sy: u32,
+    glyph: char,
+    color: Rgb8,
+) {
     let cell_x = sx / 2;
     let cell_y = sy / 4;
     let index = cell_y as usize * usize::from(width) + cell_x as usize;
@@ -1486,7 +1579,9 @@ fn write_obs_str(
     let base = cell_y * usize::from(width) + cell_x;
     for (i, ch) in text.chars().enumerate() {
         let idx = base + i;
-        let Some(cell) = cells.get_mut(idx) else { break };
+        let Some(cell) = cells.get_mut(idx) else {
+            break;
+        };
         cell.glyph = Some(ch);
         cell.color = Some(color);
         if italic {
@@ -1515,9 +1610,7 @@ fn obs_display_text(property: ObservationProperty, point: &ObservationPoint) -> 
                     (format!("{arrow}{spd}"), obs_color(property, Some(s)))
                 }
                 // Direction known, speed missing.
-                (Some(d), None) => {
-                    (format!("{}·", wind_arrow(d)), PLACEHOLDER)
-                }
+                (Some(d), None) => (format!("{}·", wind_arrow(d)), PLACEHOLDER),
                 // Speed known, direction missing (variable/unrecorded).
                 (None, Some(s)) => {
                     let spd = s.round() as u32;
@@ -1527,15 +1620,15 @@ fn obs_display_text(property: ObservationProperty, point: &ObservationPoint) -> 
         }
         ObservationProperty::Temperature => match point.temperature {
             Some(t) => (format!("{:.0}°", t), obs_color(property, Some(t))),
-            None    => ("·".to_string(), PLACEHOLDER),
+            None => ("·".to_string(), PLACEHOLDER),
         },
         ObservationProperty::Humidity => match point.humidity {
             Some(h) => (format!("{:.0}%", h), obs_color(property, Some(h))),
-            None    => ("·".to_string(), PLACEHOLDER),
+            None => ("·".to_string(), PLACEHOLDER),
         },
         ObservationProperty::Pressure => match point.pressure {
             Some(p) => (format!("{:.0}", p), obs_color(property, Some(p))),
-            None    => ("·".to_string(), PLACEHOLDER),
+            None => ("·".to_string(), PLACEHOLDER),
         },
     }
 }
@@ -1651,9 +1744,7 @@ fn should_draw_border_line(kind: BorderLineKind, stamp: BorderMaskStamp) -> bool
 /// Bresenham-like subcell coordinates along the segment (x1,y1)→(x2,y2).
 /// Produces the same sequence of subcell addresses that
 /// `mark_border_segment` would write to, without writing anywhere.
-fn bresenham_cells(
-    x1: i32, y1: i32, x2: i32, y2: i32,
-) -> impl Iterator<Item = (i32, i32)> {
+fn bresenham_cells(x1: i32, y1: i32, x2: i32, y2: i32) -> impl Iterator<Item = (i32, i32)> {
     let steps = (x2 - x1).abs().max((y2 - y1).abs()).max(1);
     (0..=steps).map(move |step| {
         let t = step as f64 / steps as f64;
@@ -1707,7 +1798,13 @@ fn stronger_border_kind(
 /// Subcell-space offset between the mask's stored center and the
 /// current viewport center.  Used to shift existing mask marks rather
 /// than recomputing the full mask on every pan.
-fn subcell_offset(center: WorldPoint, mask_center: WorldPoint, bounds: &Bounds, sub_width: u32, sub_height: u32) -> (i32, i32) {
+fn subcell_offset(
+    center: WorldPoint,
+    mask_center: WorldPoint,
+    bounds: &Bounds,
+    sub_width: u32,
+    sub_height: u32,
+) -> (i32, i32) {
     let dx_world = center.x - mask_center.x;
     let dy_world = center.y - mask_center.y;
     let dx_sub = (-dx_world / bounds.width().max(f64::EPSILON) * sub_width as f64).round() as i32;
@@ -1801,7 +1898,11 @@ fn layer_area(area: Rect) -> Rect {
 fn sub_layer_area(total_area: Rect, main_area: Rect) -> Rect {
     let sub_height = 6u16; // header + back + 4 children
     let sub_height = sub_height.min(total_area.height.saturating_sub(1));
-    let sub_width = 22u16.min(total_area.width.saturating_sub(main_area.x + main_area.width + 2));
+    let sub_width = 22u16.min(
+        total_area
+            .width
+            .saturating_sub(main_area.x + main_area.width + 2),
+    );
     let x = main_area.x + main_area.width + 1;
     let y = total_area.y + total_area.height.saturating_sub(1 + sub_height);
     Rect {
@@ -1830,14 +1931,22 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let x = area.x + area.width.saturating_sub(panel_w + 1);
     let y = area.y;
-    let q_area = Rect { x, y, width: panel_w, height: n as u16 };
+    let q_area = Rect {
+        x,
+        y,
+        width: panel_w,
+        height: n as u16,
+    };
 
     let mut lines: Vec<TextLine<'static>> = Vec::with_capacity(n);
     for task in &app.active_tasks[..n] {
         let color = task.kind.color();
 
         let kind = format!("{:>kw$}", task.kind.label(), kw = kind_w);
-        let kind_sp = Span::styled(kind, Style::default().fg(color).add_modifier(Modifier::BOLD));
+        let kind_sp = Span::styled(
+            kind,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
 
         let label_raw = if task.label.len() > label_w {
             let mut s = String::with_capacity(label_w);
@@ -1855,10 +1964,7 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
         let bar_str = braille_bar(task.display_fraction, bar_chars);
         let pct_str = format!("{:>3.0}%", task.display_fraction * 100.0);
-        let bar_sp = Span::styled(
-            format!(" {bar_str}"),
-            Style::default().fg(color),
-        );
+        let bar_sp = Span::styled(format!(" {bar_str}"), Style::default().fg(color));
         let pct_sp = Span::styled(pct_str, Style::default().fg(color));
 
         let status_sp = match task.state {
@@ -1867,7 +1973,9 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             _ => Span::raw("  "),
         };
 
-        lines.push(TextLine::from(vec![kind_sp, label_sp, bar_sp, pct_sp, status_sp]));
+        lines.push(TextLine::from(vec![
+            kind_sp, label_sp, bar_sp, pct_sp, status_sp,
+        ]));
     }
 
     frame.render_widget(Clear, q_area);
@@ -1903,9 +2011,21 @@ fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     let mark = if enabled { "[x]" } else { "[ ]" };
                     TextLine::from(format!("{cursor} {mark} {}{err_ch}", item.label()))
                 } else {
-                    let b_style = if modes.has(RenderMode::Braille, *id) { active } else { dim };
-                    let c_style = if modes.has(RenderMode::Color, *id) { active } else { dim };
-                    let l_style = if modes.has(RenderMode::Text, *id) { active } else { dim };
+                    let b_style = if modes.has(RenderMode::Braille, *id) {
+                        active
+                    } else {
+                        dim
+                    };
+                    let c_style = if modes.has(RenderMode::Color, *id) {
+                        active
+                    } else {
+                        dim
+                    };
+                    let l_style = if modes.has(RenderMode::Text, *id) {
+                        active
+                    } else {
+                        dim
+                    };
                     TextLine::from(vec![
                         Span::raw(format!("{cursor} ")),
                         Span::styled("b", b_style),
@@ -1921,9 +2041,18 @@ fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 let is_expanded = expanded == Some(*g);
                 let arrow = if is_expanded { "▼" } else { "▶" };
 
-                let has_b = g.children().iter().any(|id| modes.has(RenderMode::Braille, *id));
-                let has_c = g.children().iter().any(|id| modes.has(RenderMode::Color, *id));
-                let has_l = g.children().iter().any(|id| modes.has(RenderMode::Text, *id));
+                let has_b = g
+                    .children()
+                    .iter()
+                    .any(|id| modes.has(RenderMode::Braille, *id));
+                let has_c = g
+                    .children()
+                    .iter()
+                    .any(|id| modes.has(RenderMode::Color, *id));
+                let has_l = g
+                    .children()
+                    .iter()
+                    .any(|id| modes.has(RenderMode::Text, *id));
 
                 let b_style = if has_b { active } else { dim };
                 let c_style = if has_c { active } else { dim };
@@ -1978,9 +2107,21 @@ fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 _ => "",
             };
 
-            let b_style = if modes.has(RenderMode::Braille, *id) { active } else { dim };
-            let c_style = if modes.has(RenderMode::Color, *id) { active } else { dim };
-            let l_style = if modes.has(RenderMode::Text, *id) { active } else { dim };
+            let b_style = if modes.has(RenderMode::Braille, *id) {
+                active
+            } else {
+                dim
+            };
+            let c_style = if modes.has(RenderMode::Color, *id) {
+                active
+            } else {
+                dim
+            };
+            let l_style = if modes.has(RenderMode::Text, *id) {
+                active
+            } else {
+                dim
+            };
 
             let text = TextLine::from(vec![
                 Span::raw(format!("{cursor} ")),
@@ -2022,8 +2163,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(hints), chunks[0]);
     frame.render_widget(
-        Paragraph::new(TextLine::from(scale))
-            .alignment(ratatui::layout::Alignment::Right),
+        Paragraph::new(TextLine::from(scale)).alignment(ratatui::layout::Alignment::Right),
         chunks[1],
     );
 }
@@ -2038,7 +2178,10 @@ fn km_per_char(app: &App) -> f64 {
 }
 
 /// Nice round interval: 1, 2, 5, 10, 20, 50, 100, …
-const NICE: [f64; 16] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0, 100000.0];
+const NICE: [f64; 16] = [
+    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
+    50000.0, 100000.0,
+];
 
 fn render_scale_bar(app: &App) -> String {
     const BAR_CHARS: usize = 20;
@@ -2129,7 +2272,6 @@ fn braille_bar(fraction: f64, width: usize) -> String {
         .map(|i| LEVELS[filled.saturating_sub(i * 8).min(8)])
         .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2298,7 +2440,12 @@ mod tests {
                 crate::geo::WorldPoint { x: 0.8, y: 0.8 },
                 crate::geo::WorldPoint { x: 0.9, y: 0.9 },
             ],
-            bbox: crate::geo::Bounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 0.0 },
+            bbox: crate::geo::Bounds {
+                min_x: 0.0,
+                max_x: 0.0,
+                min_y: 0.0,
+                max_y: 0.0,
+            },
         };
         off_screen.compute_bbox();
         // A line crossing the viewport — should be drawn.
@@ -2308,7 +2455,12 @@ mod tests {
                 crate::geo::WorldPoint { x: 0.0, y: 0.25 },
                 crate::geo::WorldPoint { x: 0.5, y: 0.25 },
             ],
-            bbox: crate::geo::Bounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 0.0 },
+            bbox: crate::geo::Bounds {
+                min_x: 0.0,
+                max_x: 0.0,
+                min_y: 0.0,
+                max_y: 0.0,
+            },
         };
         on_screen.compute_bbox();
         let borders = crate::layers::BorderLayer {
@@ -2349,7 +2501,12 @@ mod tests {
                 crate::geo::WorldPoint { x: 0.45, y: 0.45 },
                 crate::geo::WorldPoint { x: 0.55, y: 0.55 },
             ],
-            bbox: crate::geo::Bounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 0.0 },
+            bbox: crate::geo::Bounds {
+                min_x: 0.0,
+                max_x: 0.0,
+                min_y: 0.0,
+                max_y: 0.0,
+            },
         };
         let borders = crate::layers::BorderLayer {
             resolution: crate::layers::BorderResolution::Low110m,
@@ -2386,14 +2543,24 @@ mod tests {
     fn compute_mask_cells_returns_subcell_grid() {
         // Spot-check that compute_mask_cells produces a non-empty grid
         // with marks at expected positions for a single line.
-        let bounds = Bounds { min_x: 0.0, max_x: 1.0, min_y: 0.0, max_y: 1.0 };
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
         let mut line = crate::layers::BorderLine {
             kind: crate::layers::BorderLineKind::Country,
             points: vec![
                 crate::geo::WorldPoint { x: 0.5, y: 0.0 },
                 crate::geo::WorldPoint { x: 0.5, y: 1.0 },
             ],
-            bbox: crate::geo::Bounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 0.0 },
+            bbox: crate::geo::Bounds {
+                min_x: 0.0,
+                max_x: 0.0,
+                min_y: 0.0,
+                max_y: 0.0,
+            },
         };
         line.compute_bbox();
         let layer = crate::layers::BorderLayer {
@@ -2412,7 +2579,10 @@ mod tests {
         };
         let cells = compute_mask_cells(&layer, bounds, 20, 20, stamp);
         assert_eq!(cells.len(), 400);
-        assert!(cells.iter().any(|c| c.is_some()), "vertical line produces marks");
+        assert!(
+            cells.iter().any(|c| c.is_some()),
+            "vertical line produces marks"
+        );
     }
 
     #[test]
@@ -2432,5 +2602,4 @@ mod tests {
             assert!(!row.spans.is_empty());
         }
     }
-
 }

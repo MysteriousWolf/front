@@ -14,63 +14,100 @@ pub const CITY_MATCH_KM: f64 = 100.0;
 
 /// City names matching `EUROPEAN_CAPITALS` (same order).
 pub const EUROPEAN_CAPITAL_NAMES: &[&str] = &[
-    "Vienna", "Brussels", "Sofia", "Zagreb", "Nicosia", "Prague",
-    "Copenhagen", "Tallinn", "Helsinki", "Paris", "Berlin", "Athens",
-    "Budapest", "Reykjavik", "Dublin", "Rome", "Riga", "Vilnius",
-    "Luxembourg", "Valletta", "Amsterdam", "Oslo", "Warsaw", "Lisbon",
-    "Bucharest", "Bratislava", "Ljubljana", "Madrid", "Stockholm",
-    "Bern", "Ankara", "London", "Kyiv", "Belgrade", "Tirana",
-    "Sarajevo", "Podgorica", "Skopje", "Chisinau", "Minsk",
-    "Tbilisi", "Baku", "Yerevan", "Moscow", "Saint Petersburg",
+    "Vienna",
+    "Brussels",
+    "Sofia",
+    "Zagreb",
+    "Nicosia",
+    "Prague",
+    "Copenhagen",
+    "Tallinn",
+    "Helsinki",
+    "Paris",
+    "Berlin",
+    "Athens",
+    "Budapest",
+    "Reykjavik",
+    "Dublin",
+    "Rome",
+    "Riga",
+    "Vilnius",
+    "Luxembourg",
+    "Valletta",
+    "Amsterdam",
+    "Oslo",
+    "Warsaw",
+    "Lisbon",
+    "Bucharest",
+    "Bratislava",
+    "Ljubljana",
+    "Madrid",
+    "Stockholm",
+    "Bern",
+    "Ankara",
+    "London",
+    "Kyiv",
+    "Belgrade",
+    "Tirana",
+    "Sarajevo",
+    "Podgorica",
+    "Skopje",
+    "Chisinau",
+    "Minsk",
+    "Tbilisi",
+    "Baku",
+    "Yerevan",
+    "Moscow",
+    "Saint Petersburg",
 ];
 
 /// European capitals (lat, lon).
 pub const EUROPEAN_CAPITALS: &[(f64, f64)] = &[
-    (48.21, 16.37), // Vienna, AT
-    (50.85,  4.35), // Brussels, BE
-    (42.70, 23.32), // Sofia, BG
-    (45.81, 15.98), // Zagreb, HR
-    (35.17, 33.37), // Nicosia, CY
-    (50.08, 14.44), // Prague, CZ
-    (55.68, 12.57), // Copenhagen, DK
-    (59.44, 24.75), // Tallinn, EE
-    (60.17, 24.94), // Helsinki, FI
-    (48.86,  2.35), // Paris, FR
-    (52.52, 13.40), // Berlin, DE
-    (37.98, 23.73), // Athens, GR
-    (47.50, 19.04), // Budapest, HU
-    (64.14,-21.90), // Reykjavik, IS
-    (53.33, -6.25), // Dublin, IE
-    (41.90, 12.50), // Rome, IT
-    (56.95, 24.11), // Riga, LV
-    (54.69, 25.28), // Vilnius, LT
-    (49.61,  6.13), // Luxembourg, LU
-    (35.90, 14.51), // Valletta, MT
-    (52.37,  4.90), // Amsterdam, NL
-    (59.91, 10.75), // Oslo, NO
-    (52.23, 21.01), // Warsaw, PL
-    (38.72, -9.14), // Lisbon, PT
-    (44.43, 26.10), // Bucharest, RO
-    (48.15, 17.11), // Bratislava, SK
-    (46.05, 14.51), // Ljubljana, SI
-    (40.42, -3.70), // Madrid, ES
-    (59.33, 18.07), // Stockholm, SE
-    (46.95,  7.45), // Bern, CH
-    (39.93, 32.85), // Ankara, TR
-    (51.51, -0.13), // London, GB
-    (50.45, 30.52), // Kyiv, UA
-    (44.82, 20.46), // Belgrade, RS
-    (41.33, 19.82), // Tirana, AL
-    (43.85, 18.42), // Sarajevo, BA
-    (42.44, 19.27), // Podgorica, ME
-    (42.00, 21.43), // Skopje, MK
-    (47.00, 28.86), // Chisinau, MD
-    (53.90, 27.57), // Minsk, BY
-    (41.69, 44.83), // Tbilisi, GE
-    (40.41, 49.87), // Baku, AZ
-    (40.18, 44.51), // Yerevan, AM
-    (55.75, 37.62), // Moscow, RU
-    (59.95, 30.32), // Saint Petersburg, RU
+    (48.21, 16.37),  // Vienna, AT
+    (50.85, 4.35),   // Brussels, BE
+    (42.70, 23.32),  // Sofia, BG
+    (45.81, 15.98),  // Zagreb, HR
+    (35.17, 33.37),  // Nicosia, CY
+    (50.08, 14.44),  // Prague, CZ
+    (55.68, 12.57),  // Copenhagen, DK
+    (59.44, 24.75),  // Tallinn, EE
+    (60.17, 24.94),  // Helsinki, FI
+    (48.86, 2.35),   // Paris, FR
+    (52.52, 13.40),  // Berlin, DE
+    (37.98, 23.73),  // Athens, GR
+    (47.50, 19.04),  // Budapest, HU
+    (64.14, -21.90), // Reykjavik, IS
+    (53.33, -6.25),  // Dublin, IE
+    (41.90, 12.50),  // Rome, IT
+    (56.95, 24.11),  // Riga, LV
+    (54.69, 25.28),  // Vilnius, LT
+    (49.61, 6.13),   // Luxembourg, LU
+    (35.90, 14.51),  // Valletta, MT
+    (52.37, 4.90),   // Amsterdam, NL
+    (59.91, 10.75),  // Oslo, NO
+    (52.23, 21.01),  // Warsaw, PL
+    (38.72, -9.14),  // Lisbon, PT
+    (44.43, 26.10),  // Bucharest, RO
+    (48.15, 17.11),  // Bratislava, SK
+    (46.05, 14.51),  // Ljubljana, SI
+    (40.42, -3.70),  // Madrid, ES
+    (59.33, 18.07),  // Stockholm, SE
+    (46.95, 7.45),   // Bern, CH
+    (39.93, 32.85),  // Ankara, TR
+    (51.51, -0.13),  // London, GB
+    (50.45, 30.52),  // Kyiv, UA
+    (44.82, 20.46),  // Belgrade, RS
+    (41.33, 19.82),  // Tirana, AL
+    (43.85, 18.42),  // Sarajevo, BA
+    (42.44, 19.27),  // Podgorica, ME
+    (42.00, 21.43),  // Skopje, MK
+    (47.00, 28.86),  // Chisinau, MD
+    (53.90, 27.57),  // Minsk, BY
+    (41.69, 44.83),  // Tbilisi, GE
+    (40.41, 49.87),  // Baku, AZ
+    (40.18, 44.51),  // Yerevan, AM
+    (55.75, 37.62),  // Moscow, RU
+    (59.95, 30.32),  // Saint Petersburg, RU
 ];
 
 /// Additional major European cities (lat, lon).  Shown at medium zoom
@@ -78,29 +115,29 @@ pub const EUROPEAN_CAPITALS: &[(f64, f64)] = &[
 pub const EUROPEAN_MAJOR_CITIES: &[(f64, f64)] = &[
     (48.14, 11.58), // Munich, DE
     (53.57, 10.02), // Hamburg, DE
-    (51.22,  6.78), // Dusseldorf, DE
-    (50.94,  6.96), // Cologne, DE
-    (50.11,  8.68), // Frankfurt, DE
-    (48.78,  9.18), // Stuttgart, DE
+    (51.22, 6.78),  // Dusseldorf, DE
+    (50.94, 6.96),  // Cologne, DE
+    (50.11, 8.68),  // Frankfurt, DE
+    (48.78, 9.18),  // Stuttgart, DE
     (51.34, 12.38), // Leipzig, DE
     (51.03, 13.73), // Dresden, DE
     (49.45, 11.08), // Nuremberg, DE
-    (53.08,  8.81), // Bremen, DE
-    (52.37,  9.73), // Hannover, DE
-    (51.51,  7.46), // Dortmund, DE
-    (41.39,  2.16), // Barcelona, ES
+    (53.08, 8.81),  // Bremen, DE
+    (52.37, 9.73),  // Hannover, DE
+    (51.51, 7.46),  // Dortmund, DE
+    (41.39, 2.16),  // Barcelona, ES
     (39.47, -0.38), // Valencia, ES
     (37.39, -5.99), // Seville, ES
     (41.66, -0.88), // Zaragoza, ES
-    (45.47,  9.19), // Milan, IT
+    (45.47, 9.19),  // Milan, IT
     (40.84, 14.25), // Naples, IT
-    (45.07,  7.69), // Turin, IT
-    (43.85,  7.31), // Nice, FR
-    (45.75,  4.84), // Lyon, FR
-    (43.30,  5.37), // Marseille, FR
+    (45.07, 7.69),  // Turin, IT
+    (43.85, 7.31),  // Nice, FR
+    (45.75, 4.84),  // Lyon, FR
+    (43.30, 5.37),  // Marseille, FR
     (47.22, -1.55), // Nantes, FR
     (44.84, -0.58), // Bordeaux, FR
-    (50.63,  3.06), // Lille, FR
+    (50.63, 3.06),  // Lille, FR
     (50.06, 19.94), // Krakow, PL
     (51.11, 17.04), // Wroclaw, PL
     (52.41, 16.93), // Poznan, PL
@@ -114,16 +151,16 @@ pub const EUROPEAN_MAJOR_CITIES: &[(f64, f64)] = &[
     (40.77, 29.92), // Bursa, TR
     (36.89, 30.69), // Antalya, TR
     (37.00, 35.32), // Adana, TR
-    (51.92,  4.48), // Rotterdam, NL
-    (51.22,  4.40), // Antwerp, BE
+    (51.92, 4.48),  // Rotterdam, NL
+    (51.22, 4.40),  // Antwerp, BE
     (55.86, -4.25), // Glasgow, GB
     (53.48, -2.24), // Manchester, GB
     (52.49, -1.89), // Birmingham, GB
     (53.80, -1.55), // Leeds, GB
     (55.95, -3.19), // Edinburgh, GB
     (51.46, -2.60), // Bristol, GB
-    (47.38,  8.54), // Zurich, CH
-    (46.21,  6.14), // Geneva, CH
+    (47.38, 8.54),  // Zurich, CH
+    (46.21, 6.14),  // Geneva, CH
     (47.07, 15.43), // Graz, AT
     (47.80, 13.04), // Salzburg, AT
     (57.71, 11.97), // Gothenburg, SE
@@ -239,8 +276,16 @@ impl Viewport {
         let span_x = 1.8 / zoom.exp2();
         let span_y = span_x * (h / w) * 2.0;
 
-        let (min_cx, max_cx) = if span_x < 0.5 { (span_x, 1.0 - span_x) } else { (0.0, 1.0) };
-        let (min_cy, max_cy) = if span_y < 0.5 { (span_y, 1.0 - span_y) } else { (0.0, 1.0) };
+        let (min_cx, max_cx) = if span_x < 0.5 {
+            (span_x, 1.0 - span_x)
+        } else {
+            (0.0, 1.0)
+        };
+        let (min_cy, max_cy) = if span_y < 0.5 {
+            (span_y, 1.0 - span_y)
+        } else {
+            (0.0, 1.0)
+        };
         ((min_cx, max_cx), (min_cy, max_cy))
     }
 
@@ -448,7 +493,11 @@ pub fn tiles_spiral_from(bounds: Bounds, z: u8, center: WorldPoint) -> Vec<TileC
 
     // Centre tile first
     if cx >= min_tx && cx <= max_tx && cy >= min_ty && cy <= max_ty {
-        tiles.push(TileCoord { z, x: cx as u32, y: cy as u32 });
+        tiles.push(TileCoord {
+            z,
+            x: cx as u32,
+            y: cy as u32,
+        });
     }
 
     for ring in 1..=max_ring {
@@ -462,7 +511,11 @@ pub fn tiles_spiral_from(bounds: Bounds, z: u8, center: WorldPoint) -> Vec<TileC
             let x0 = left.max(min_tx);
             let x1 = right.min(max_tx);
             for x in x0..=x1 {
-                tiles.push(TileCoord { z, x: x as u32, y: top as u32 });
+                tiles.push(TileCoord {
+                    z,
+                    x: x as u32,
+                    y: top as u32,
+                });
             }
         }
 
@@ -471,7 +524,11 @@ pub fn tiles_spiral_from(bounds: Bounds, z: u8, center: WorldPoint) -> Vec<TileC
             let y0 = (top + 1).max(min_ty);
             let y1 = bottom.min(max_ty);
             for y in y0..=y1 {
-                tiles.push(TileCoord { z, x: right as u32, y: y as u32 });
+                tiles.push(TileCoord {
+                    z,
+                    x: right as u32,
+                    y: y as u32,
+                });
             }
         }
 
@@ -480,7 +537,11 @@ pub fn tiles_spiral_from(bounds: Bounds, z: u8, center: WorldPoint) -> Vec<TileC
             let x0 = left.max(min_tx);
             let x1 = (right - 1).min(max_tx);
             for x in (x0..=x1).rev() {
-                tiles.push(TileCoord { z, x: x as u32, y: bottom as u32 });
+                tiles.push(TileCoord {
+                    z,
+                    x: x as u32,
+                    y: bottom as u32,
+                });
             }
         }
 
@@ -489,7 +550,11 @@ pub fn tiles_spiral_from(bounds: Bounds, z: u8, center: WorldPoint) -> Vec<TileC
             let y0 = (top + 1).max(min_ty);
             let y1 = (bottom - 1).min(max_ty);
             for y in (y0..=y1).rev() {
-                tiles.push(TileCoord { z, x: left as u32, y: y as u32 });
+                tiles.push(TileCoord {
+                    z,
+                    x: left as u32,
+                    y: y as u32,
+                });
             }
         }
     }
@@ -529,7 +594,12 @@ mod tests {
     #[test]
     fn tiles_spiral_center_first() {
         // A 3×3 tile set at zoom 3, centre at (1, 1).
-        let bounds = Bounds { min_x: 0.0, max_x: 0.3, min_y: 0.0, max_y: 0.3 };
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 0.3,
+            min_y: 0.0,
+            max_y: 0.3,
+        };
         let center = WorldPoint { x: 0.15, y: 0.15 };
         let tiles = super::tiles_spiral_from(bounds, 3, center);
         assert!(!tiles.is_empty(), "should produce tile coords");
@@ -545,7 +615,12 @@ mod tests {
 
     #[test]
     fn tiles_spiral_single_tile() {
-        let bounds = Bounds { min_x: 0.0, max_x: 0.05, min_y: 0.0, max_y: 0.05 };
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 0.05,
+            min_y: 0.0,
+            max_y: 0.05,
+        };
         let center = WorldPoint { x: 0.025, y: 0.025 };
         let tiles = super::tiles_spiral_from(bounds, 3, center);
         assert_eq!(tiles.len(), 1, "single tile at zoom 3 for tiny bounds");
@@ -563,25 +638,61 @@ mod tests {
 
     #[test]
     fn bounds_intersects_detects_overlap_and_disjoint() {
-        let a = Bounds { min_x: 0.0, max_x: 0.5, min_y: 0.0, max_y: 0.5 };
-        let b = Bounds { min_x: 0.4, max_x: 0.9, min_y: 0.4, max_y: 0.9 };
-        let c = Bounds { min_x: 0.6, max_x: 1.0, min_y: 0.6, max_y: 1.0 };
+        let a = Bounds {
+            min_x: 0.0,
+            max_x: 0.5,
+            min_y: 0.0,
+            max_y: 0.5,
+        };
+        let b = Bounds {
+            min_x: 0.4,
+            max_x: 0.9,
+            min_y: 0.4,
+            max_y: 0.9,
+        };
+        let c = Bounds {
+            min_x: 0.6,
+            max_x: 1.0,
+            min_y: 0.6,
+            max_y: 1.0,
+        };
         assert!(a.intersects(b), "touching edges should overlap");
         assert!(!a.intersects(c), "diagonal gap should be disjoint");
-        assert!(!a.intersects(Bounds { min_x: 0.6, max_x: 1.0, min_y: 0.0, max_y: 0.4 }), "x-gap disjoint");
+        assert!(
+            !a.intersects(Bounds {
+                min_x: 0.6,
+                max_x: 1.0,
+                min_y: 0.0,
+                max_y: 0.4
+            }),
+            "x-gap disjoint"
+        );
     }
 
     #[test]
     fn bounds_expanded_grows_centred() {
-        let b = Bounds { min_x: 0.4, max_x: 0.6, min_y: 0.4, max_y: 0.6 };
+        let b = Bounds {
+            min_x: 0.4,
+            max_x: 0.6,
+            min_y: 0.4,
+            max_y: 0.6,
+        };
         let e = b.expanded(1.0);
         assert!((e.width() - 0.4).abs() < 0.0001, "doubles width");
-        assert!(((e.min_x + e.max_x) / 2.0 - 0.5).abs() < 0.0001, "stays centred");
+        assert!(
+            ((e.min_x + e.max_x) / 2.0 - 0.5).abs() < 0.0001,
+            "stays centred"
+        );
     }
 
     #[test]
     fn bounds_expanded_clamps_to_unit() {
-        let b = Bounds { min_x: 0.0, max_x: 0.1, min_y: 0.0, max_y: 0.1 };
+        let b = Bounds {
+            min_x: 0.0,
+            max_x: 0.1,
+            min_y: 0.0,
+            max_y: 0.1,
+        };
         // fraction=20 → expand by 10× width (5 on each side), saturating [0,1]²
         let e = b.expanded(20.0);
         assert_eq!(e.min_x, 0.0);

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,8 +10,8 @@ use serde_json::{self, Value};
 use crate::cache::{read_if_exists, write_atomic, write_log, FrontDirs};
 use crate::config::EumetnetConfig;
 use crate::geo::{
-    lat_lon_to_world, world_to_lat_lon, Bounds, GeoPoint, WorldPoint,
-    EUROPEAN_CAPITALS, EUROPEAN_MAJOR_CITIES,
+    lat_lon_to_world, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, EUROPEAN_CAPITALS,
+    EUROPEAN_MAJOR_CITIES,
 };
 use crate::layers::{ObservationLayer, ObservationPoint};
 
@@ -115,6 +114,8 @@ const CAPITAL_DATA_TTL: Duration = Duration::from_secs(5 * 60);
 /// an exceeded budget with HTTP 429 and an HTML page.  When that happens the
 /// fetch aborts and `rate_limited_until` is set, so subsequent refreshes skip
 /// the query until the budget recovers instead of re-exhausting it.
+type ObsCache = Arc<tokio::sync::Mutex<HashMap<(u64, u64), (Vec<ObservationPoint>, Instant)>>>;
+
 #[derive(Debug, Clone)]
 pub struct EumetnetProvider {
     client: Client,
@@ -127,9 +128,9 @@ pub struct EumetnetProvider {
     rate_limited_until: Arc<tokio::sync::Mutex<Option<Instant>>>,
     /// Per-capital observation cache.  Key: (lat.to_bits(), lon.to_bits()).
     /// Value: points from that location's bbox query + the fetch instant.
-    capital_cache: Arc<tokio::sync::Mutex<HashMap<(u64, u64), (Vec<ObservationPoint>, Instant)>>>,
+    capital_cache: ObsCache,
     /// Same structure for major-city bbox queries (Phase 2a).
-    city_cache: Arc<tokio::sync::Mutex<HashMap<(u64, u64), (Vec<ObservationPoint>, Instant)>>>,
+    city_cache: ObsCache,
 }
 
 #[derive(Debug, Clone)]
@@ -184,10 +185,11 @@ impl EumetnetProvider {
     // Core fetch logic
     // ------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_observations(
         &self,
-        cache_path: &PathBuf,
-        stations_cache_path: &PathBuf,
+        cache_path: &Path,
+        stations_cache_path: &Path,
         endpoint: &str,
         collection_id: &str,
         zoom: f64,
@@ -199,17 +201,30 @@ impl EumetnetProvider {
         let t_total = Instant::now();
 
         // Station names (24 h disk cache).
-        let all_stations = self.fetch_station_list(stations_cache_path, endpoint, collection_id, log).await;
-        let names: HashMap<String, String> = all_stations.into_iter().map(|s| (s.wigos_id, s.name)).collect();
+        let all_stations = self
+            .fetch_station_list(stations_cache_path, endpoint, collection_id, log)
+            .await;
+        let names: HashMap<String, String> = all_stations
+            .into_iter()
+            .map(|s| (s.wigos_id, s.name))
+            .collect();
 
         // `seen_wigos` deduplicates stations across all three phases.
         let mut seen_wigos: HashSet<String> = HashSet::new();
 
         // ── Phase 1: all European capitals (always, per-capital 5-min cache) ──
         self.fetch_location_batch(
-            endpoint, collection_id, EUROPEAN_CAPITALS, "capitals",
-            &names, log, &point_tx, &self.capital_cache, &mut seen_wigos,
-        ).await;
+            endpoint,
+            collection_id,
+            EUROPEAN_CAPITALS,
+            "capitals",
+            &names,
+            log,
+            &point_tx,
+            &self.capital_cache,
+            &mut seen_wigos,
+        )
+        .await;
         // Commit Phase 1 to the UI immediately so capitals appear fast.
         let _ = flush_tx.send(());
 
@@ -217,9 +232,17 @@ impl EumetnetProvider {
         // Provides more uniform station coverage across all zoom levels without
         // the slowness of a full continent-wide area query.
         self.fetch_location_batch(
-            endpoint, collection_id, EUROPEAN_MAJOR_CITIES, "cities",
-            &names, log, &point_tx, &self.city_cache, &mut seen_wigos,
-        ).await;
+            endpoint,
+            collection_id,
+            EUROPEAN_MAJOR_CITIES,
+            "cities",
+            &names,
+            log,
+            &point_tx,
+            &self.city_cache,
+            &mut seen_wigos,
+        )
+        .await;
         // Commit Phase 2a so cities appear before the full viewport loads.
         let _ = flush_tx.send(());
 
@@ -230,37 +253,75 @@ impl EumetnetProvider {
             let cache_hit = {
                 let cache = self.mem_cache.lock().await;
                 cache.get(collection_id).and_then(|e| {
-                    if e.fetched_at.elapsed() < MEM_CACHE_TTL && bounds_covered(e.bounds, expanded_bounds) {
+                    if e.fetched_at.elapsed() < MEM_CACHE_TTL
+                        && bounds_covered(e.bounds, expanded_bounds)
+                    {
                         Some(e.layer.points.clone())
-                    } else { None }
+                    } else {
+                        None
+                    }
                 })
             };
 
             let viewport_points = if let Some(pts) = cache_hit {
-                write_log(log, format!("eumetnet: viewport mem cache hit ({} pts)", pts.len()));
+                write_log(
+                    log,
+                    format!("eumetnet: viewport mem cache hit ({} pts)", pts.len()),
+                );
                 pts
             } else {
-                let disk_hit = Self::load_disk_cache::<DiskCacheEntry>(cache_path, MEM_CACHE_TTL.as_secs())
-                    .and_then(|e| if bounds_covered(e.bounds, expanded_bounds) { Some(e.layer.points) } else { None });
+                let disk_hit =
+                    Self::load_disk_cache::<DiskCacheEntry>(cache_path, MEM_CACHE_TTL.as_secs())
+                        .and_then(|e| {
+                            if bounds_covered(e.bounds, expanded_bounds) {
+                                Some(e.layer.points)
+                            } else {
+                                None
+                            }
+                        });
                 if let Some(pts) = disk_hit {
-                    write_log(log, format!("eumetnet: viewport disk cache hit ({} pts)", pts.len()));
+                    write_log(
+                        log,
+                        format!("eumetnet: viewport disk cache hit ({} pts)", pts.len()),
+                    );
                     pts
                 } else {
                     let polygon = bounds_polygon(expanded_bounds);
                     let pts = Self::fetch_area_points(
-                        &self.client, endpoint, collection_id, &polygon, &names,
-                        Arc::clone(&self.rate_limited_until), log,
-                    ).await;
+                        &self.client,
+                        endpoint,
+                        collection_id,
+                        &polygon,
+                        &names,
+                        Arc::clone(&self.rate_limited_until),
+                        log,
+                    )
+                    .await;
                     if !pts.is_empty() {
                         let layer = ObservationLayer {
                             points: pts.clone(),
-                            updated_at: Some(SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)),
+                            updated_at: Some(
+                                SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0),
+                            ),
                         };
-                        if let Ok(json) = serde_json::to_vec(&DiskCacheEntry { bounds: expanded_bounds, layer: layer.clone() }) {
+                        if let Ok(json) = serde_json::to_vec(&DiskCacheEntry {
+                            bounds: expanded_bounds,
+                            layer: layer.clone(),
+                        }) {
                             let _ = write_atomic(cache_path, &json);
                         }
                         let mut cache = self.mem_cache.lock().await;
-                        cache.insert(collection_id.to_string(), MemCacheEntry { fetched_at: Instant::now(), bounds: expanded_bounds, layer });
+                        cache.insert(
+                            collection_id.to_string(),
+                            MemCacheEntry {
+                                fetched_at: Instant::now(),
+                                bounds: expanded_bounds,
+                                layer,
+                            },
+                        );
                     }
                     pts
                 }
@@ -273,7 +334,13 @@ impl EumetnetProvider {
             }
         }
 
-        write_log(log, format!("eumetnet: done ({collection_id}, zoom={zoom:.1}, {:.2}s)", t_total.elapsed().as_secs_f64()));
+        write_log(
+            log,
+            format!(
+                "eumetnet: done ({collection_id}, zoom={zoom:.1}, {:.2}s)",
+                t_total.elapsed().as_secs_f64()
+            ),
+        );
         Ok(())
     }
 
@@ -282,6 +349,7 @@ impl EumetnetProvider {
     /// served from `cache` immediately; stale ones are queried concurrently via
     /// individual small bbox area requests.  Results are streamed to `point_tx`
     /// and deduplicated against `seen_wigos`.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_location_batch(
         &self,
         endpoint: &str,
@@ -291,7 +359,7 @@ impl EumetnetProvider {
         names: &HashMap<String, String>,
         log: &Path,
         point_tx: &tokio::sync::mpsc::UnboundedSender<ObservationPoint>,
-        cache: &Arc<tokio::sync::Mutex<HashMap<(u64, u64), (Vec<ObservationPoint>, Instant)>>>,
+        cache: &ObsCache,
         seen_wigos: &mut HashSet<String>,
     ) {
         // Rate-limit pre-check: serve stale cache rather than hammering the API.
@@ -299,7 +367,10 @@ impl EumetnetProvider {
             let until = self.rate_limited_until.lock().await;
             if let Some(t) = *until {
                 if Instant::now() < t {
-                    write_log(log, format!("eumetnet: {label} — rate-limited, serving cached"));
+                    write_log(
+                        log,
+                        format!("eumetnet: {label} — rate-limited, serving cached"),
+                    );
                     let cache = cache.lock().await;
                     for &(lat, lon) in locations {
                         let key = (lat.to_bits(), lon.to_bits());
@@ -341,7 +412,14 @@ impl EumetnetProvider {
             return;
         }
 
-        write_log(log, format!("eumetnet: {label} — fetching {}/{} stale", stale.len(), locations.len()));
+        write_log(
+            log,
+            format!(
+                "eumetnet: {label} — fetching {}/{} stale",
+                stale.len(),
+                locations.len()
+            ),
+        );
 
         let now_utc = Utc::now();
         let datetime = format!(
@@ -369,9 +447,13 @@ impl EumetnetProvider {
                 let key = (clat.to_bits(), clon.to_bits());
                 match fetch {
                     AreaFetch::Ok(stations) => {
-                        let pts: Vec<ObservationPoint> = stations.into_iter()
+                        let pts: Vec<ObservationPoint> = stations
+                            .into_iter()
                             .map(|s| ObservationPoint {
-                                station_id: names.get(&s.wigos_id).cloned().unwrap_or_else(|| s.wigos_id.clone()),
+                                station_id: names
+                                    .get(&s.wigos_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| s.wigos_id.clone()),
                                 point: GeoPoint::new(s.lon, s.lat),
                                 world: lat_lon_to_world(s.lat, s.lon),
                                 temperature: s.values.get("air_temperature").copied(),
@@ -392,7 +474,10 @@ impl EumetnetProvider {
                         cache.insert(key, (Vec::new(), fetch_instant));
                     }
                     AreaFetch::RateLimited(reset) => {
-                        let cooldown = reset.map(Duration::from_secs).unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN).min(RATE_LIMIT_MAX_COOLDOWN);
+                        let cooldown = reset
+                            .map(Duration::from_secs)
+                            .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
+                            .min(RATE_LIMIT_MAX_COOLDOWN);
                         rate_limit_cooldown = Some(cooldown);
                     }
                 }
@@ -400,7 +485,13 @@ impl EumetnetProvider {
         }
 
         if let Some(cooldown) = rate_limit_cooldown {
-            write_log(log, format!("eumetnet: rate limited on {label} — backing off {}s", cooldown.as_secs()));
+            write_log(
+                log,
+                format!(
+                    "eumetnet: rate limited on {label} — backing off {}s",
+                    cooldown.as_secs()
+                ),
+            );
             let mut until = self.rate_limited_until.lock().await;
             *until = Some(Instant::now() + cooldown);
         }
@@ -415,7 +506,7 @@ impl EumetnetProvider {
     /// viewport filtering is done client-side in `fetch_observations`.
     async fn fetch_station_list(
         &self,
-        stations_cache_path: &PathBuf,
+        stations_cache_path: &Path,
         endpoint: &str,
         collection_id: &str,
         log: &Path,
@@ -427,9 +518,18 @@ impl EumetnetProvider {
                 .map(|e| e.stations);
 
         // Cache hit: any non-empty entry saved with bounds = None is global.
-        if let Some(entry) = Self::load_disk_cache::<StationListEntry>(stations_cache_path, STATION_LIST_TTL.as_secs()) {
+        if let Some(entry) = Self::load_disk_cache::<StationListEntry>(
+            stations_cache_path,
+            STATION_LIST_TTL.as_secs(),
+        ) {
             if !entry.stations.is_empty() && entry.bounds.is_none() {
-                write_log(log, format!("eumetnet: station list cache hit ({} stations)", entry.stations.len()));
+                write_log(
+                    log,
+                    format!(
+                        "eumetnet: station list cache hit ({} stations)",
+                        entry.stations.len()
+                    ),
+                );
                 return entry.stations;
             }
         }
@@ -460,22 +560,44 @@ impl EumetnetProvider {
             }
         };
 
-        write_log(log, format!("eumetnet: station list fetched in {:.2}s ({} bytes)", t.elapsed().as_secs_f64(), text.len()));
+        write_log(
+            log,
+            format!(
+                "eumetnet: station list fetched in {:.2}s ({} bytes)",
+                t.elapsed().as_secs_f64(),
+                text.len()
+            ),
+        );
 
         let stations = match Self::parse_locations(&text, log) {
             Some(s) if !s.is_empty() => s,
             Some(_) => {
-                write_log(log, format!("eumetnet: parse_locations returned 0 stations (body prefix: {})", &text[..text.len().min(200)]));
+                write_log(
+                    log,
+                    format!(
+                        "eumetnet: parse_locations returned 0 stations (body prefix: {})",
+                        &text[..text.len().min(200)]
+                    ),
+                );
                 return stale_cache.unwrap_or_default();
             }
             None => {
-                write_log(log, format!("eumetnet: parse_locations failed (body prefix: {})", &text[..text.len().min(200)]));
+                write_log(
+                    log,
+                    format!(
+                        "eumetnet: parse_locations failed (body prefix: {})",
+                        &text[..text.len().min(200)]
+                    ),
+                );
                 return stale_cache.unwrap_or_default();
             }
         };
 
         // Persist with bounds = None — valid for any viewport.
-        if let Ok(json) = serde_json::to_vec(&StationListEntry { bounds: None, stations: stations.clone() }) {
+        if let Ok(json) = serde_json::to_vec(&StationListEntry {
+            bounds: None,
+            stations: stations.clone(),
+        }) {
             let _ = write_atomic(stations_cache_path, &json);
         }
 
@@ -486,9 +608,13 @@ impl EumetnetProvider {
     // Disk cache helper
     // ------------------------------------------------------------------
 
-    fn load_disk_cache<T: serde::de::DeserializeOwned>(path: &Path, max_age_secs: u64) -> Option<T> {
+    fn load_disk_cache<T: serde::de::DeserializeOwned>(
+        path: &Path,
+        max_age_secs: u64,
+    ) -> Option<T> {
         let bytes = read_if_exists(path).ok()??;
-        let age = std::fs::metadata(path).ok()
+        let age = std::fs::metadata(path)
+            .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| SystemTime::now().duration_since(t).ok())?;
         if age.as_secs() >= max_age_secs {
@@ -512,12 +638,26 @@ impl EumetnetProvider {
         }
         let v: Value = serde_json::from_str(text).ok()?;
 
-        if let Some(first) = v.get("features").and_then(|f| f.as_array()).and_then(|a| a.first()) {
-            write_log(log, format!("eumetnet: location feature keys: {:?}",
-                first.as_object().map(|o| o.keys().collect::<Vec<_>>())));
+        if let Some(first) = v
+            .get("features")
+            .and_then(|f| f.as_array())
+            .and_then(|a| a.first())
+        {
+            write_log(
+                log,
+                format!(
+                    "eumetnet: location feature keys: {:?}",
+                    first.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                ),
+            );
             if let Some(props) = first.get("properties").and_then(|p| p.as_object()) {
-                write_log(log, format!("eumetnet: location properties keys: {:?}",
-                    props.keys().collect::<Vec<_>>()));
+                write_log(
+                    log,
+                    format!(
+                        "eumetnet: location properties keys: {:?}",
+                        props.keys().collect::<Vec<_>>()
+                    ),
+                );
             }
         }
 
@@ -528,21 +668,34 @@ impl EumetnetProvider {
             let props = feat.get("properties").and_then(|p| p.as_object());
 
             // wigos_id: prefer top-level "id", fall back to properties.platform
-            let wigos_id = feat.get("id").and_then(|v| v.as_str())
-                .or_else(|| props.and_then(|p| p.get("platform")).and_then(|v| v.as_str()));
-            let wigos_id = match wigos_id { Some(s) => s, None => continue };
+            let wigos_id = feat.get("id").and_then(|v| v.as_str()).or_else(|| {
+                props
+                    .and_then(|p| p.get("platform"))
+                    .and_then(|v| v.as_str())
+            });
+            let wigos_id = match wigos_id {
+                Some(s) => s,
+                None => continue,
+            };
 
             // Human-readable name: "name" key (MeteoGate /locations), then
             // "title" and "platform_name" as fallbacks.
-            let name = props.and_then(|p| {
-                p.get("name")
-                    .or_else(|| p.get("title"))
-                    .or_else(|| p.get("platform_name"))
-                    .and_then(|v| v.as_str())
-            }).unwrap_or(wigos_id);
+            let name = props
+                .and_then(|p| {
+                    p.get("name")
+                        .or_else(|| p.get("title"))
+                        .or_else(|| p.get("platform_name"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or(wigos_id);
 
-            let geom = match feat.get("geometry") { Some(g) => g, None => continue };
-            if geom.get("type").and_then(|t| t.as_str()) != Some("Point") { continue; }
+            let geom = match feat.get("geometry") {
+                Some(g) => g,
+                None => continue,
+            };
+            if geom.get("type").and_then(|t| t.as_str()) != Some("Point") {
+                continue;
+            }
             let coords = match geom.get("coordinates").and_then(|c| c.as_array()) {
                 Some(c) if c.len() >= 2 => c,
                 _ => continue,
@@ -583,10 +736,13 @@ impl EumetnetProvider {
             if let Some(t) = *until {
                 let now = Instant::now();
                 if now < t {
-                    write_log(log, format!(
-                        "eumetnet: skipping area query — rate-limited for {}s more",
-                        (t - now).as_secs(),
-                    ));
+                    write_log(
+                        log,
+                        format!(
+                            "eumetnet: skipping area query — rate-limited for {}s more",
+                            (t - now).as_secs(),
+                        ),
+                    );
                     return Vec::new();
                 }
             }
@@ -610,23 +766,29 @@ impl EumetnetProvider {
             (now - ChronoDuration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ"),
             now.format("%Y-%m-%dT%H:%M:%SZ"),
         );
-        let stations = match Self::fetch_area_values(client, endpoint, collection_id, &datetime, polygon, log).await {
-            AreaFetch::Ok(stations) => stations,
-            AreaFetch::Empty => Vec::new(),
-            AreaFetch::RateLimited(reset) => {
-                let cooldown = reset
-                    .map(Duration::from_secs)
-                    .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
-                    .min(RATE_LIMIT_MAX_COOLDOWN);
-                write_log(log, format!(
-                    "eumetnet: rate limited (HTTP 429) — backing off {}s",
-                    cooldown.as_secs(),
-                ));
-                let mut until = rate_limited_until.lock().await;
-                *until = Some(Instant::now() + cooldown);
-                return Vec::new();
-            }
-        };
+        let stations =
+            match Self::fetch_area_values(client, endpoint, collection_id, &datetime, polygon, log)
+                .await
+            {
+                AreaFetch::Ok(stations) => stations,
+                AreaFetch::Empty => Vec::new(),
+                AreaFetch::RateLimited(reset) => {
+                    let cooldown = reset
+                        .map(Duration::from_secs)
+                        .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
+                        .min(RATE_LIMIT_MAX_COOLDOWN);
+                    write_log(
+                        log,
+                        format!(
+                            "eumetnet: rate limited (HTTP 429) — backing off {}s",
+                            cooldown.as_secs(),
+                        ),
+                    );
+                    let mut until = rate_limited_until.lock().await;
+                    *until = Some(Instant::now() + cooldown);
+                    return Vec::new();
+                }
+            };
 
         stations
             .into_iter()
@@ -673,10 +835,17 @@ impl EumetnetProvider {
             let text = r.text().await.map_err(|e| e.to_string())?;
             Ok::<_, String>((status, reset, text))
         };
-        let (status, reset, text) = match tokio::time::timeout(Duration::from_secs(90), fetch).await {
+        let (status, reset, text) = match tokio::time::timeout(Duration::from_secs(90), fetch).await
+        {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => { write_log(log, format!("eumetnet: area request error: {e}")); return AreaFetch::Empty; }
-            Err(_) => { write_log(log, "eumetnet: area request timed out".to_string()); return AreaFetch::Empty; }
+            Ok(Err(e)) => {
+                write_log(log, format!("eumetnet: area request error: {e}"));
+                return AreaFetch::Empty;
+            }
+            Err(_) => {
+                write_log(log, "eumetnet: area request timed out".to_string());
+                return AreaFetch::Empty;
+            }
         };
         // The gateway answers an exceeded budget with an HTML rate-limit page,
         // not JSON.  Detect it explicitly so we back off instead of misreporting
@@ -685,12 +854,22 @@ impl EumetnetProvider {
             return AreaFetch::RateLimited(reset);
         }
         if !status.is_success() {
-            write_log(log, format!("eumetnet: area HTTP {} (body: {})", status, &text[..text.len().min(200)]));
+            write_log(
+                log,
+                format!(
+                    "eumetnet: area HTTP {} (body: {})",
+                    status,
+                    &text[..text.len().min(200)]
+                ),
+            );
             return AreaFetch::Empty;
         }
         let data: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(e) => { write_log(log, format!("eumetnet: area parse error: {e}")); return AreaFetch::Empty; }
+            Err(e) => {
+                write_log(log, format!("eumetnet: area parse error: {e}"));
+                return AreaFetch::Empty;
+            }
         };
         AreaFetch::Ok(parse_area_values(&data))
     }
@@ -711,20 +890,37 @@ fn parse_area_values(data: &Value) -> Vec<AreaStation> {
         return out;
     };
     for cov in coverages {
-        let Some(id) = cov.get("metocean:wigosId").and_then(|v| v.as_str()) else { continue };
+        let Some(id) = cov.get("metocean:wigosId").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let axes = cov.get("domain").and_then(|d| d.get("axes"));
         let lon = axes
-            .and_then(|a| a.get("x")).and_then(|x| x.get("values"))
-            .and_then(|v| v.as_array()).and_then(|v| v.first()).and_then(|v| v.as_f64());
+            .and_then(|a| a.get("x"))
+            .and_then(|x| x.get("values"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
+            .and_then(|v| v.as_f64());
         let lat = axes
-            .and_then(|a| a.get("y")).and_then(|y| y.get("values"))
-            .and_then(|v| v.as_array()).and_then(|v| v.first()).and_then(|v| v.as_f64());
-        let (Some(lon), Some(lat)) = (lon, lat) else { continue };
-        let Some(ranges) = cov.get("ranges").and_then(|r| r.as_object()) else { continue };
+            .and_then(|a| a.get("y"))
+            .and_then(|y| y.get("values"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
+            .and_then(|v| v.as_f64());
+        let (Some(lon), Some(lat)) = (lon, lat) else {
+            continue;
+        };
+        let Some(ranges) = cov.get("ranges").and_then(|r| r.as_object()) else {
+            continue;
+        };
         let mut values = HashMap::new();
         extract_param_values(ranges, &mut values);
         if !values.is_empty() {
-            out.push(AreaStation { wigos_id: id.to_string(), lon, lat, values });
+            out.push(AreaStation {
+                wigos_id: id.to_string(),
+                lon,
+                lat,
+                values,
+            });
         }
     }
     out
@@ -738,8 +934,14 @@ fn bounds_polygon(bounds: Option<Bounds>) -> String {
         return "POLYGON((-30 30,45 30,45 72,-30 72,-30 30))".to_string();
     };
     // World y increases southward, so min_y is the northern edge.
-    let nw = world_to_lat_lon(WorldPoint { x: b.min_x, y: b.min_y });
-    let se = world_to_lat_lon(WorldPoint { x: b.max_x, y: b.max_y });
+    let nw = world_to_lat_lon(WorldPoint {
+        x: b.min_x,
+        y: b.min_y,
+    });
+    let se = world_to_lat_lon(WorldPoint {
+        x: b.max_x,
+        y: b.max_y,
+    });
     let (lon_min, lon_max) = (nw.lon, se.lon);
     let (lat_min, lat_max) = (se.lat, nw.lat);
     format!(

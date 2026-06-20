@@ -189,9 +189,8 @@ impl Config {
                 ))
             }
         };
-        let config: Config = toml::from_str(&content).map_err(|e| {
-            color_eyre::eyre::eyre!("parse config {}: {e}", path.display())
-        })?;
+        let config: Config = toml::from_str(&content)
+            .map_err(|e| color_eyre::eyre::eyre!("parse config {}: {e}", path.display()))?;
         Ok(config)
     }
 
@@ -243,8 +242,9 @@ surface_endpoint = "{eu_surface}"
             eu_surface = self.eumetnet.surface_endpoint,
         );
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| color_eyre::eyre::eyre!("create config dir {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                color_eyre::eyre::eyre!("create config dir {}: {e}", parent.display())
+            })?;
         }
         std::fs::write(path, raw)
             .map_err(|e| color_eyre::eyre::eyre!("write config {}: {e}", path.display()))?;

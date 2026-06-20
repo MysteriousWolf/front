@@ -42,7 +42,11 @@ impl Default for RenderModeState {
 
 impl RenderModeState {
     pub fn new() -> Self {
-        Self { braille: None, color: None, text: None }
+        Self {
+            braille: None,
+            color: None,
+            text: None,
+        }
     }
 
     /// Returns the layer assigned to `mode`, if any.
@@ -61,24 +65,27 @@ impl RenderModeState {
 
     /// Returns `true` when `layer` owns at least one mode.
     pub fn has_any(&self, layer: LayerId) -> bool {
-        self.braille == Some(layer)
-            || self.color == Some(layer)
-            || self.text == Some(layer)
+        self.braille == Some(layer) || self.color == Some(layer) || self.text == Some(layer)
     }
 
     /// Returns all modes currently owned by `layer`.
     pub fn modes_for(&self, layer: LayerId) -> Vec<RenderMode> {
         let mut out = Vec::with_capacity(3);
-        if self.braille == Some(layer) { out.push(RenderMode::Braille); }
-        if self.color == Some(layer) { out.push(RenderMode::Color); }
-        if self.text == Some(layer) { out.push(RenderMode::Text); }
+        if self.braille == Some(layer) {
+            out.push(RenderMode::Braille);
+        }
+        if self.color == Some(layer) {
+            out.push(RenderMode::Color);
+        }
+        if self.text == Some(layer) {
+            out.push(RenderMode::Text);
+        }
         out
     }
 
     /// Assign `mode` to `layer`, removing it from any previous owner.
     /// Returns the previous owner, if any.
     pub fn assign(&mut self, mode: RenderMode, layer: LayerId) -> Option<LayerId> {
-        
         match mode {
             RenderMode::Braille => self.braille.replace(layer),
             RenderMode::Color => self.color.replace(layer),
@@ -109,9 +116,15 @@ impl RenderModeState {
 
     /// Remove all render modes from `layer`.
     pub fn remove_all(&mut self, layer: LayerId) {
-        if self.braille == Some(layer) { self.braille = None; }
-        if self.color == Some(layer) { self.color = None; }
-        if self.text == Some(layer) { self.text = None; }
+        if self.braille == Some(layer) {
+            self.braille = None;
+        }
+        if self.color == Some(layer) {
+            self.color = None;
+        }
+        if self.text == Some(layer) {
+            self.text = None;
+        }
     }
 
     /// Try to find the "best" (highest-information) mode for `layer`
@@ -132,9 +145,7 @@ fn preferred_modes(id: LayerId) -> &'static [RenderMode] {
     match id {
         LayerId::Radar => &[RenderMode::Braille, RenderMode::Color, RenderMode::Text],
         LayerId::MeteoAlarm => &[RenderMode::Color, RenderMode::Braille, RenderMode::Text],
-        id if id.is_observation() => {
-            &[RenderMode::Text, RenderMode::Braille, RenderMode::Color]
-        }
+        id if id.is_observation() => &[RenderMode::Text, RenderMode::Braille, RenderMode::Color],
         _ => &[],
     }
 }
@@ -655,14 +666,9 @@ impl LayerRegistry {
                 return format!("{}: refreshing…", id.label());
             }
         }
-        let obs_loading = self
-            .states
-            .iter()
-            .any(|(id, s)| {
-                matches!(s.status, LayerStatus::Loading)
-                    && s.enabled
-                    && id.is_observation()
-            });
+        let obs_loading = self.states.iter().any(|(id, s)| {
+            matches!(s.status, LayerStatus::Loading) && s.enabled && id.is_observation()
+        });
         if obs_loading {
             return "Observations: refreshing…".to_string();
         }
@@ -1114,7 +1120,10 @@ mod tests {
         let b = frame(100, 4, vec![tile(4, 5, 5), tile(4, 6, 6)]);
         a.merge_tiles(b);
         let zooms: Vec<u8> = a.tiles.iter().map(|t| t.coord.z).collect();
-        assert!(zooms.iter().all(|&z| z == 4), "stale zoom-3 tiles must be evicted");
+        assert!(
+            zooms.iter().all(|&z| z == 4),
+            "stale zoom-3 tiles must be evicted"
+        );
         assert_eq!(a.tiles.len(), 2);
         assert_eq!(a.target_zoom, 4);
     }
@@ -1146,7 +1155,12 @@ mod tests {
         let grid = SpatialGrid::build(&[]);
         let mut out = Vec::new();
         let mut seen = vec![0u8; 1];
-        let bounds = Bounds { min_x: 0.0, max_x: 1.0, min_y: 0.0, max_y: 1.0 };
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
         grid.lines_for_bounds(bounds, &mut out, &mut seen);
         assert!(out.is_empty(), "no lines → no candidates");
     }
@@ -1158,8 +1172,14 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = vec![0u8; 1];
         grid.lines_for_bounds(
-            Bounds { min_x: 0.0, max_x: 0.5, min_y: 0.0, max_y: 0.5 },
-            &mut out, &mut seen,
+            Bounds {
+                min_x: 0.0,
+                max_x: 0.5,
+                min_y: 0.0,
+                max_y: 0.5,
+            },
+            &mut out,
+            &mut seen,
         );
         assert_eq!(out, vec![0], "line inside bounds must be found");
     }
@@ -1171,8 +1191,14 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = vec![0u8; 1];
         grid.lines_for_bounds(
-            Bounds { min_x: 0.0, max_x: 0.5, min_y: 0.0, max_y: 0.5 },
-            &mut out, &mut seen,
+            Bounds {
+                min_x: 0.0,
+                max_x: 0.5,
+                min_y: 0.0,
+                max_y: 0.5,
+            },
+            &mut out,
+            &mut seen,
         );
         assert!(out.is_empty(), "line outside bounds must be skipped");
     }
@@ -1186,8 +1212,14 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = vec![0u8; 1];
         grid.lines_for_bounds(
-            Bounds { min_x: 0.0, max_x: 1.0, min_y: 0.0, max_y: 1.0 },
-            &mut out, &mut seen,
+            Bounds {
+                min_x: 0.0,
+                max_x: 1.0,
+                min_y: 0.0,
+                max_y: 1.0,
+            },
+            &mut out,
+            &mut seen,
         );
         assert_eq!(out, vec![0], "line crossing cells must be deduped");
     }
@@ -1203,8 +1235,14 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = vec![0u8; 1];
         grid.lines_for_bounds(
-            Bounds { min_x: 0.15, max_x: 0.7, min_y: 0.15, max_y: 0.7 },
-            &mut out, &mut seen,
+            Bounds {
+                min_x: 0.15,
+                max_x: 0.7,
+                min_y: 0.15,
+                max_y: 0.7,
+            },
+            &mut out,
+            &mut seen,
         );
         // Line 0 ends at 0.2 → partial overlap with query (0.15-0.7).
         // Line 1 is in 0.8-0.9 → no overlap.
@@ -1222,15 +1260,30 @@ mod tests {
         let mut seen = vec![0u8; 1];
 
         grid.lines_for_bounds(
-            Bounds { min_x: 0.0, max_x: 0.5, min_y: 0.0, max_y: 0.5 },
-            &mut out, &mut seen,
+            Bounds {
+                min_x: 0.0,
+                max_x: 0.5,
+                min_y: 0.0,
+                max_y: 0.5,
+            },
+            &mut out,
+            &mut seen,
         );
         assert_eq!(out, vec![0], "first call finds line 0");
 
         grid.lines_for_bounds(
-            Bounds { min_x: 0.6, max_x: 1.0, min_y: 0.6, max_y: 1.0 },
-            &mut out, &mut seen,
+            Bounds {
+                min_x: 0.6,
+                max_x: 1.0,
+                min_y: 0.6,
+                max_y: 1.0,
+            },
+            &mut out,
+            &mut seen,
         );
-        assert!(out.is_empty(), "second call with disjoint bounds must return empty");
+        assert!(
+            out.is_empty(),
+            "second call with disjoint bounds must return empty"
+        );
     }
 }

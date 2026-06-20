@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use chrono::Datelike;
 use color_eyre::eyre::{Context, Result};
 use reqwest::Client;
-use tiff::decoder::{ifd, DecodingResult, Decoder};
+use tiff::decoder::{ifd, Decoder, DecodingResult};
 use tiff::tags::Tag;
 use tokio::sync::Semaphore;
 
@@ -77,7 +77,12 @@ pub struct MeteoGateProvider {
 }
 
 impl MeteoGateProvider {
-    pub fn new(client: Client, dirs: FrontDirs, config: MeteoGateConfig, cancel: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        client: Client,
+        dirs: FrontDirs,
+        config: MeteoGateConfig,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             client,
             dirs,
@@ -92,7 +97,9 @@ impl MeteoGateProvider {
         let dt = time_to_datetime(timestamp);
         format!(
             "{:04}/{:02}/{:02}/{S3_PREFIX}/OPERA@{datetime}@0@{PRODUCT}.tiff",
-            dt.year, dt.month, dt.day,
+            dt.year,
+            dt.month,
+            dt.day,
             datetime = dt.str,
         )
     }
@@ -117,12 +124,7 @@ impl MeteoGateProvider {
         Ok(compute_frame_list())
     }
 
-    pub async fn frame(
-        &self,
-        timestamp: i64,
-        bounds: Bounds,
-        zoom: f64,
-    ) -> Result<RadarFrame> {
+    pub async fn frame(&self, timestamp: i64, bounds: Bounds, zoom: f64) -> Result<RadarFrame> {
         let metadata = self.frame_impl(timestamp, bounds, zoom, None).await?;
         Ok(RadarFrame {
             time: metadata.time,
@@ -147,7 +149,10 @@ impl MeteoGateProvider {
         }
         write_log(log, format!("meteogate: fetching geotiff ts={timestamp}"));
         let bytes = self.fetch_geotiff(timestamp).await?;
-        write_log(log, format!("meteogate: got {} bytes, parsing", bytes.len()));
+        write_log(
+            log,
+            format!("meteogate: got {} bytes, parsing", bytes.len()),
+        );
         let g = Arc::new(parse_geotiff(&bytes)?);
         write_log(log, "meteogate: grid parsed OK");
         *cache = Some((timestamp, Arc::clone(&g)));
@@ -169,7 +174,9 @@ impl MeteoGateProvider {
         zoom: f64,
         tile_tx: tokio::sync::mpsc::UnboundedSender<Result<RadarTile>>,
     ) -> Result<RadarFrame> {
-        let mut metadata = self.frame_impl(timestamp, bounds, zoom, Some(tile_tx)).await?;
+        let mut metadata = self
+            .frame_impl(timestamp, bounds, zoom, Some(tile_tx))
+            .await?;
         let missing = std::mem::take(&mut metadata.missing_tiles);
         Ok(RadarFrame {
             time: metadata.time,
@@ -206,7 +213,13 @@ impl MeteoGateProvider {
             y: bounds.min_y + bounds.height() / 2.0,
         };
         let tiles = crate::geo::tiles_spiral_from(bounds, z, center);
-        write_log(log, format!("meteogate: frame_impl building {} tiles at zoom {z}", tiles.len()));
+        write_log(
+            log,
+            format!(
+                "meteogate: frame_impl building {} tiles at zoom {z}",
+                tiles.len()
+            ),
+        );
 
         if let Some(tx) = tile_tx {
             // Streaming path: build tiles concurrently (up to 8) via
@@ -298,10 +311,7 @@ impl MeteoGateProvider {
     /// as "not found" so the outer retry loop moves on quickly.
     async fn head_geotiff(&self, timestamp: i64) -> Result<bool> {
         let url = self.s3_url(timestamp);
-        write_log(
-            &self.dirs.log_path,
-            format!("meteogate: HEAD {url}"),
-        );
+        write_log(&self.dirs.log_path, format!("meteogate: HEAD {url}"));
         match tokio::time::timeout(Duration::from_secs(3), self.client.head(&url).send()).await {
             Ok(Ok(resp)) => {
                 let ok = resp.status().is_success();
@@ -339,9 +349,7 @@ impl MeteoGateProvider {
             let cache = self.probe_cache.lock().await;
             match cache.get(&ts) {
                 Some(ProbeResult::Exists) => return Ok(true),
-                Some(ProbeResult::Missing(at)) if at.elapsed() < MISSING_RETRY => {
-                    return Ok(false)
-                }
+                Some(ProbeResult::Missing(at)) if at.elapsed() < MISSING_RETRY => return Ok(false),
                 _ => {}
             }
         }
@@ -376,7 +384,9 @@ impl MeteoGateProvider {
         }
         write_log(
             log,
-            format!("meteogate: no GeoTIFF found for ts={timestamp} or any 5-min slot within 30 min"),
+            format!(
+                "meteogate: no GeoTIFF found for ts={timestamp} or any 5-min slot within 30 min"
+            ),
         );
         color_eyre::eyre::bail!(
             "no GeoTIFF available for {timestamp} or any 5‑min slot within the past 30 min"
@@ -477,29 +487,31 @@ fn parse_geotiff(bytes: &[u8]) -> Result<RadarGrid> {
     // Read geotransform: ModelTiepointTag and ModelPixelScaleTag
     let tie_x;
     let tie_y;
-    match decoder.get_tag(Tag::ModelTiepointTag).wrap_err("read ModelTiepointTag")? {
+    match decoder
+        .get_tag(Tag::ModelTiepointTag)
+        .wrap_err("read ModelTiepointTag")?
+    {
         ifd::Value::List(ref vals) if vals.len() >= 6 => {
             tie_x = extract_f64(&vals[3]);
             tie_y = extract_f64(&vals[4]);
         }
         other => {
-            color_eyre::eyre::bail!(
-                "unexpected ModelTiepointTag value: {other:?}"
-            );
+            color_eyre::eyre::bail!("unexpected ModelTiepointTag value: {other:?}");
         }
     }
 
     let scale_x;
     let scale_y;
-    match decoder.get_tag(Tag::ModelPixelScaleTag).wrap_err("read ModelPixelScaleTag")? {
+    match decoder
+        .get_tag(Tag::ModelPixelScaleTag)
+        .wrap_err("read ModelPixelScaleTag")?
+    {
         ifd::Value::List(ref vals) if vals.len() >= 2 => {
             scale_x = extract_f64(&vals[0]).abs();
             scale_y = extract_f64(&vals[1]).abs();
         }
         other => {
-            color_eyre::eyre::bail!(
-                "unexpected ModelPixelScaleTag value: {other:?}"
-            );
+            color_eyre::eyre::bail!("unexpected ModelPixelScaleTag value: {other:?}");
         }
     }
 
@@ -510,7 +522,7 @@ fn parse_geotiff(bytes: &[u8]) -> Result<RadarGrid> {
         DecodingResult::F64(buf) => buf.iter().map(|&v| v as f32).collect(),
         DecodingResult::U16(buf) => buf.iter().map(|&v| v as f32).collect(),
         DecodingResult::I16(buf) => buf.iter().map(|&v| v as f32).collect(),
-            _ => color_eyre::eyre::bail!("unsupported TIFF data type for radar grid"),
+        _ => color_eyre::eyre::bail!("unsupported TIFF data type for radar grid"),
     };
 
     let npixels = (width as usize) * (height as usize);
@@ -779,7 +791,6 @@ mod tests {
         Ok(())
     }
 
-
     /// Verify that `lat_lon_to_uv` maps the LAEA origin (55°N, 10°E) to the
     /// centre of the grid (~pixel 1950, 2100) when accounting for false
     /// easting/northing.
@@ -790,8 +801,8 @@ mod tests {
             data: vec![0.0f32; 3800 * 4400],
             width: 3800,
             height: 4400,
-            tie_x: -500.0,   // CRS easting of pixel (0,0)
-            tie_y: 500.0,    // CRS northing of pixel (0,0)
+            tie_x: -500.0, // CRS easting of pixel (0,0)
+            tie_y: 500.0,  // CRS northing of pixel (0,0)
             scale_x: 1000.0,
             scale_y: 1000.0,
         };

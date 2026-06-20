@@ -96,7 +96,7 @@ impl NaturalEarthProvider {
                 if cancel.load(Ordering::Relaxed) || sc.load(Ordering::Relaxed) {
                     return Ok(Vec::new());
                 }
-                parse_country_lines(resolution, &country_bytes, &*cancel)
+                parse_country_lines(resolution, &country_bytes, &cancel)
             })
             .await
             .map_err(|e| color_eyre::eyre::eyre!("spawn_blocking: {e}"))??
@@ -113,13 +113,14 @@ impl NaturalEarthProvider {
                 if cancel.load(Ordering::Relaxed) || sc.load(Ordering::Relaxed) {
                     return Ok(Vec::new());
                 }
-                let mut lines = parse_lines(BorderLineKind::Region, &bytes, &*cancel)?;
+                let mut lines = parse_lines(BorderLineKind::Region, &bytes, &cancel)?;
                 if cancel.load(Ordering::Relaxed) || sc.load(Ordering::Relaxed) {
                     return Ok(lines);
                 }
                 if let Some(eps) = eps {
                     for line in &mut lines {
-                        line.points = simplify_points(std::mem::take(&mut line.points), eps, &*cancel);
+                        line.points =
+                            simplify_points(std::mem::take(&mut line.points), eps, &cancel);
                         line.compute_bbox();
                     }
                 }
@@ -141,13 +142,14 @@ impl NaturalEarthProvider {
                 if cancel.load(Ordering::Relaxed) || sc.load(Ordering::Relaxed) {
                     return Ok(Vec::new());
                 }
-                let mut lines = parse_lines(BorderLineKind::Road, &bytes, &*cancel)?;
+                let mut lines = parse_lines(BorderLineKind::Road, &bytes, &cancel)?;
                 if cancel.load(Ordering::Relaxed) || sc.load(Ordering::Relaxed) {
                     return Ok(lines);
                 }
                 if let Some(eps) = eps {
                     for line in &mut lines {
-                        line.points = simplify_points(std::mem::take(&mut line.points), eps, &*cancel);
+                        line.points =
+                            simplify_points(std::mem::take(&mut line.points), eps, &cancel);
                         line.compute_bbox();
                     }
                 }
@@ -337,7 +339,9 @@ impl NaturalEarthProvider {
             &log_path,
             format!("borders: {res_label} — parsing source (tile gen deferred)"),
         );
-        let all_lines = self.all_source_lines(resolution, spawn_cancel.clone()).await?;
+        let all_lines = self
+            .all_source_lines(resolution, spawn_cancel.clone())
+            .await?;
         let grid = SpatialGrid::build(&all_lines);
         write_log(
             &log_path,
@@ -424,7 +428,11 @@ fn detail_urls(file: &str) -> Vec<String> {
 
 /// Parse country boundary lines from GeoJSON and simplify using
 /// Ramer-Douglas-Peucker.  Returns raw lines without a SpatialGrid.
-fn parse_country_lines(resolution: BorderResolution, bytes: &[u8], cancel: &AtomicBool) -> Result<Vec<BorderLine>> {
+fn parse_country_lines(
+    resolution: BorderResolution,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<Vec<BorderLine>> {
     let mut lines = parse_lines(BorderLineKind::Country, bytes, cancel)?;
     if cancel.load(Ordering::Relaxed) {
         return Ok(lines);
@@ -588,7 +596,12 @@ fn parse_lines(kind: BorderLineKind, bytes: &[u8], cancel: &AtomicBool) -> Resul
     Ok(lines)
 }
 
-fn extract_polygon(kind: BorderLineKind, value: &Value, lines: &mut Vec<BorderLine>, cancel: &AtomicBool) {
+fn extract_polygon(
+    kind: BorderLineKind,
+    value: &Value,
+    lines: &mut Vec<BorderLine>,
+    cancel: &AtomicBool,
+) {
     let Some(rings) = value.as_array() else {
         return;
     };
@@ -613,14 +626,28 @@ fn extract_polygon(kind: BorderLineKind, value: &Value, lines: &mut Vec<BorderLi
             line.push(GeoPoint::new(lon, lat).to_world());
         }
         if line.len() > 1 {
-            let mut bl = BorderLine { kind, points: line, bbox: Bounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 0.0 } };
+            let mut bl = BorderLine {
+                kind,
+                points: line,
+                bbox: Bounds {
+                    min_x: 0.0,
+                    max_x: 0.0,
+                    min_y: 0.0,
+                    max_y: 0.0,
+                },
+            };
             bl.compute_bbox();
             lines.push(bl);
         }
     }
 }
 
-fn extract_line_string(kind: BorderLineKind, value: &Value, lines: &mut Vec<BorderLine>, cancel: &AtomicBool) {
+fn extract_line_string(
+    kind: BorderLineKind,
+    value: &Value,
+    lines: &mut Vec<BorderLine>,
+    cancel: &AtomicBool,
+) {
     if cancel.load(Ordering::Relaxed) {
         return;
     }
@@ -641,7 +668,16 @@ fn extract_line_string(kind: BorderLineKind, value: &Value, lines: &mut Vec<Bord
         line.push(GeoPoint::new(lon, lat).to_world());
     }
     if line.len() > 1 {
-        let mut bl = BorderLine { kind, points: line, bbox: Bounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 0.0 } };
+        let mut bl = BorderLine {
+            kind,
+            points: line,
+            bbox: Bounds {
+                min_x: 0.0,
+                max_x: 0.0,
+                min_y: 0.0,
+                max_y: 0.0,
+            },
+        };
         bl.compute_bbox();
         lines.push(bl);
     }
