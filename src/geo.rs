@@ -567,6 +567,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_lat_lon_to_world_world_to_lat_lon_roundtrip() {
+        for (lat, lon) in [(46.05, 14.51), (0.0, 0.0), (-33.9, 151.2), (51.5, -0.1)] {
+            let w = lat_lon_to_world(lat, lon);
+            let g = world_to_lat_lon(w);
+            assert!((g.lat - lat).abs() < 0.001, "lat roundtrip {lat}");
+            assert!((g.lon - lon).abs() < 0.001, "lon roundtrip {lon}");
+        }
+    }
+
+    #[test]
+    fn test_lat_lon_to_world_clamps_beyond_max_lat() {
+        let p = lat_lon_to_world(MAX_LAT + 10.0, 0.0);
+        assert_eq!(p.y, 0.0, "north pole clamps to y=0");
+        let p2 = lat_lon_to_world(-(MAX_LAT + 10.0), 0.0);
+        assert_eq!(p2.y, 1.0, "south pole clamps to y=1");
+    }
+
+    #[test]
+    fn test_geopoint_new_clamps_lat_and_lon() {
+        let g = GeoPoint::new(200.0, 100.0);
+        assert_eq!(g.lon, 180.0);
+        assert_eq!(g.lat, MAX_LAT);
+        let g2 = GeoPoint::new(-200.0, -100.0);
+        assert_eq!(g2.lon, -180.0);
+        assert_eq!(g2.lat, -MAX_LAT);
+    }
+
+    #[test]
+    fn test_near_european_capital_true_for_ljubljana() {
+        // Ljubljana (46.05, 14.51) is in EUROPEAN_CAPITALS — must be near itself.
+        assert!(near_european_capital(46.05, 14.51));
+    }
+
+    #[test]
+    fn test_near_european_capital_false_for_remote_point() {
+        // Mid-Atlantic, far from any capital.
+        assert!(!near_european_capital(40.0, -40.0));
+    }
+
+    #[test]
+    fn test_bounds_contains_subset() {
+        let outer = Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
+        let inner = Bounds {
+            min_x: 0.1,
+            max_x: 0.9,
+            min_y: 0.1,
+            max_y: 0.9,
+        };
+        assert!(outer.contains(inner));
+        assert!(!inner.contains(outer));
+    }
+
+    #[test]
+    fn test_bounds_contains_equal() {
+        let b = Bounds {
+            min_x: 0.2,
+            max_x: 0.8,
+            min_y: 0.2,
+            max_y: 0.8,
+        };
+        assert!(b.contains(b));
+    }
+
+    #[test]
+    fn test_tile_bounds_at_z1_covers_quadrant() {
+        // At z=1 there are 4 tiles: (0,0), (1,0), (0,1), (1,1).
+        // Tile (0,0) should cover [0,0.5]×[0,0.5].
+        let b = tile_bounds(TileCoord { z: 1, x: 0, y: 0 });
+        assert!((b.min_x - 0.0).abs() < 1e-9);
+        assert!((b.max_x - 0.5).abs() < 1e-9);
+        assert!((b.min_y - 0.0).abs() < 1e-9);
+        assert!((b.max_y - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_tile_pixel_to_world_and_world_to_tile_pixel_roundtrip() {
+        let tc = TileCoord { z: 4, x: 5, y: 3 };
+        let size = 256u32;
+        let px = 64u32;
+        let py = 128u32;
+        let world = tile_pixel_to_world(tc, px, py, size);
+        let (rx, ry) = world_to_tile_pixel(world, tc, size);
+        assert!((rx - px as f64).abs() < 1e-6, "pixel x roundtrip");
+        assert!((ry - py as f64).abs() < 1e-6, "pixel y roundtrip");
+    }
+
+    #[test]
+    fn test_world_span_at_zoom_halves_per_zoom_step() {
+        let s0 = world_span_at_zoom(0);
+        let s1 = world_span_at_zoom(1);
+        assert!((s0 / s1 - 2.0).abs() < 1e-9, "span halves per zoom step");
+    }
+
+    #[test]
+    fn test_viewport_pan_stays_in_bounds() {
+        let mut vp = Viewport::from_lat_lon(EUROPE_LAT, EUROPE_LON, 4.0);
+        for _ in 0..100 {
+            vp.pan(10.0, 0.0);
+        }
+        assert!(vp.center.x <= 1.0);
+        assert!(vp.center.x >= 0.0);
+    }
+
+    #[test]
+    fn test_viewport_zoom_by_clamps_to_limits() {
+        let mut vp = Viewport::from_lat_lon(0.0, 0.0, 4.0);
+        vp.zoom_by(100.0);
+        assert_eq!(vp.zoom, MAX_VIEW_ZOOM);
+        vp.zoom_by(-200.0);
+        assert_eq!(vp.zoom, MIN_VIEW_ZOOM);
+    }
+
+    #[test]
     fn projects_origin_to_world_center() {
         let point = lat_lon_to_world(0.0, 0.0);
         assert!((point.x - 0.5).abs() < 0.0001);

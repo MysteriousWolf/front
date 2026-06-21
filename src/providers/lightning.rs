@@ -153,7 +153,7 @@ pub async fn connect_and_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use super::*;
 
     #[test]
     fn decode_roundtrip_ascii() {
@@ -164,5 +164,45 @@ mod tests {
     #[test]
     fn decode_empty() {
         assert_eq!(decode(""), "");
+    }
+
+    #[test]
+    fn decode_single_char() {
+        assert_eq!(decode("x"), "x");
+    }
+
+    // Manually-constructed LZW test vector.
+    // Decode algorithm ported from https://github.com/akeamc/blitzortung (MIT).
+    // "ab" followed by U+0100 (code 256 → dict[0] = "ab") decodes to "abab".
+    #[test]
+    fn decode_with_dict_lookup_produces_repeated_pair() {
+        let encoded = "ab\u{0100}";
+        assert_eq!(decode(encoded), "abab");
+    }
+
+    // Second dict entry: "ab" + U+0100 (="ab") + U+0101 (dict[1]="ba") → "ababba"
+    #[test]
+    fn decode_with_two_dict_lookups() {
+        let encoded = "ab\u{0100}\u{0101}";
+        assert_eq!(decode(encoded), "ababba");
+    }
+
+    // A valid JSON strike payload that survives the decode identity pass.
+    #[test]
+    fn decode_strike_json_identity() {
+        let json = r#"{"lat":48.21,"lon":16.37,"pol":1}"#;
+        let decoded = decode(json);
+        let strike: RawStrike = serde_json::from_str(&decoded).unwrap();
+        assert!((strike.lat - 48.21).abs() < 0.001);
+        assert!((strike.lon - 16.37).abs() < 0.001);
+        assert_eq!(strike.pol, 1);
+    }
+
+    #[test]
+    fn decode_strike_json_negative_polarity() {
+        let json = r#"{"lat":0.0,"lon":0.0,"pol":-1}"#;
+        let decoded = decode(json);
+        let strike: RawStrike = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(strike.pol, -1);
     }
 }

@@ -1433,6 +1433,450 @@ impl WarningFeature {
 mod tests {
     use super::*;
 
+    // ── RenderModeState ────────────────────────────────────────────────
+
+    #[test]
+    fn test_render_mode_state_assign_and_get() {
+        let mut state = RenderModeState::new();
+        state.assign(RenderMode::Braille, LayerId::Radar);
+        assert_eq!(state.get(RenderMode::Braille), Some(LayerId::Radar));
+        assert_eq!(state.get(RenderMode::Color), None);
+    }
+
+    #[test]
+    fn test_render_mode_state_assign_replaces_previous_owner() {
+        let mut state = RenderModeState::new();
+        let prev = state.assign(RenderMode::Braille, LayerId::Radar);
+        assert_eq!(prev, None);
+        let prev2 = state.assign(RenderMode::Braille, LayerId::MeteoAlarm);
+        assert_eq!(prev2, Some(LayerId::Radar));
+        assert_eq!(state.get(RenderMode::Braille), Some(LayerId::MeteoAlarm));
+    }
+
+    #[test]
+    fn test_render_mode_state_toggle_on_then_off() {
+        let mut state = RenderModeState::new();
+        state.toggle(RenderMode::Color, LayerId::Radar);
+        assert!(state.has(RenderMode::Color, LayerId::Radar));
+        state.toggle(RenderMode::Color, LayerId::Radar);
+        assert!(!state.has(RenderMode::Color, LayerId::Radar));
+    }
+
+    #[test]
+    fn test_render_mode_state_remove_all_clears_all_modes() {
+        let mut state = RenderModeState::new();
+        state.assign(RenderMode::Braille, LayerId::Radar);
+        state.assign(RenderMode::Color, LayerId::Radar);
+        state.assign(RenderMode::Text, LayerId::Radar);
+        state.braille_overlay = Some(LayerId::Radar);
+        state.remove_all(LayerId::Radar);
+        assert!(!state.has_any(LayerId::Radar));
+    }
+
+    #[test]
+    fn test_render_mode_state_has_any_braille_overlay() {
+        let mut state = RenderModeState::new();
+        state.braille_overlay = Some(LayerId::Lightning);
+        assert!(state.has_any(LayerId::Lightning));
+        assert!(state.has(RenderMode::Braille, LayerId::Lightning));
+    }
+
+    #[test]
+    fn test_render_mode_state_toggle_braille_overlay_on_off() {
+        let mut state = RenderModeState::new();
+        state.toggle_braille_overlay(LayerId::Lightning);
+        assert_eq!(state.braille_overlay, Some(LayerId::Lightning));
+        state.toggle_braille_overlay(LayerId::Lightning);
+        assert_eq!(state.braille_overlay, None);
+    }
+
+    #[test]
+    fn test_render_mode_state_best_available_prefers_braille_for_radar() {
+        let state = RenderModeState::new();
+        assert_eq!(
+            state.best_available(LayerId::Radar),
+            Some(RenderMode::Braille)
+        );
+    }
+
+    #[test]
+    fn test_render_mode_state_best_available_skips_taken_mode() {
+        let mut state = RenderModeState::new();
+        state.assign(RenderMode::Braille, LayerId::MeteoAlarm);
+        // Radar prefers Braille first but it's taken by another layer — falls back to Color.
+        assert_eq!(
+            state.best_available(LayerId::Radar),
+            Some(RenderMode::Color)
+        );
+    }
+
+    #[test]
+    fn test_render_mode_state_modes_for_returns_owned_modes() {
+        let mut state = RenderModeState::new();
+        state.assign(RenderMode::Braille, LayerId::Radar);
+        state.assign(RenderMode::Color, LayerId::Radar);
+        let modes = state.modes_for(LayerId::Radar);
+        assert!(modes.contains(&RenderMode::Braille));
+        assert!(modes.contains(&RenderMode::Color));
+        assert!(!modes.contains(&RenderMode::Text));
+    }
+
+    // ── LayerRegistry ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_layer_registry_geographic_layer_enabled_by_state() {
+        let reg = LayerRegistry::new();
+        assert!(reg.enabled(LayerId::MapBorders), "MapBorders on by default");
+        assert!(
+            !reg.enabled(LayerId::MajorRoads),
+            "MajorRoads off by default"
+        );
+    }
+
+    #[test]
+    fn test_layer_registry_rendered_layer_enabled_via_render_mode() {
+        let reg = LayerRegistry::new();
+        // Radar is assigned Braille in new() → enabled returns true.
+        assert!(reg.enabled(LayerId::Radar));
+        // MeteoAlarm has no mode by default → disabled.
+        assert!(!reg.enabled(LayerId::MeteoAlarm));
+    }
+
+    #[test]
+    fn test_layer_registry_toggle_geographic_layer() {
+        let mut reg = LayerRegistry::new();
+        // RegionBorders starts enabled.
+        assert!(reg.get_state(LayerId::RegionBorders).unwrap().enabled);
+        reg.toggle(LayerId::RegionBorders);
+        assert!(!reg.get_state(LayerId::RegionBorders).unwrap().enabled);
+        reg.toggle(LayerId::RegionBorders);
+        assert!(reg.get_state(LayerId::RegionBorders).unwrap().enabled);
+    }
+
+    #[test]
+    fn test_layer_registry_toggle_locked_layer_is_noop() {
+        let mut reg = LayerRegistry::new();
+        let before = reg.get_state(LayerId::MapBorders).unwrap().enabled;
+        reg.toggle(LayerId::MapBorders);
+        assert_eq!(reg.get_state(LayerId::MapBorders).unwrap().enabled, before);
+    }
+
+    #[test]
+    fn test_layer_registry_lightning_trail_wraps_from_30_to_1() {
+        let mut reg = LayerRegistry::new();
+        reg.lightning_trail_minutes = 30;
+        // Activating Lightning option index 3 increments trail.
+        let item = LayerRegistry::MAIN_ORDER
+            .iter()
+            .find(|i| matches!(i, MainItem::Single(LayerId::Lightning)))
+            .copied()
+            .unwrap();
+        reg.apply_option_at(item, 3);
+        assert_eq!(reg.lightning_trail_minutes, 1, "30 wraps to 1");
+    }
+
+    #[test]
+    fn test_layer_registry_lightning_trail_increments() {
+        let mut reg = LayerRegistry::new();
+        let initial = reg.lightning_trail_minutes;
+        let item = LayerRegistry::MAIN_ORDER
+            .iter()
+            .find(|i| matches!(i, MainItem::Single(LayerId::Lightning)))
+            .copied()
+            .unwrap();
+        reg.apply_option_at(item, 3);
+        assert_eq!(reg.lightning_trail_minutes, initial + 1);
+    }
+
+    #[test]
+    fn test_layer_registry_navigate_skips_headers() {
+        let mut reg = LayerRegistry::new();
+        let start = reg.selected_main_index();
+        reg.select_next();
+        // We must not land on a Header item.
+        let cur = LayerRegistry::MAIN_ORDER[reg.selected_main_index()];
+        assert!(!matches!(cur, MainItem::Header(_)));
+        let _ = start; // suppress unused-variable warning
+    }
+
+    #[test]
+    fn test_layer_registry_enter_and_exit_options() {
+        let mut reg = LayerRegistry::new();
+        // Navigate to Radar (index 1) — it has 3 options.
+        while LayerRegistry::MAIN_ORDER[reg.selected_main_index()]
+            != MainItem::Single(LayerId::Radar)
+        {
+            reg.select_next();
+        }
+        assert!(reg.enter_options(), "entering options for Radar");
+        assert!(reg.is_in_options());
+        assert!(reg.exit_options(), "exiting options");
+        assert!(!reg.is_in_options());
+    }
+
+    #[test]
+    fn test_layer_registry_observation_only_one_active_at_a_time() {
+        let mut reg = LayerRegistry::new();
+        // SurfTemp starts with Text mode by default.
+        assert!(reg.mode_state().has(RenderMode::Text, LayerId::SurfTemp));
+        // Activating SurfWind via the group options (index 1 = SurfWind) should
+        // move Text from SurfTemp to SurfWind.
+        reg.apply_option_at(MainItem::Group(LayerGroup::Observations), 1);
+        assert!(!reg.mode_state().has(RenderMode::Text, LayerId::SurfTemp));
+        assert!(reg.mode_state().has(RenderMode::Text, LayerId::SurfWind));
+    }
+
+    // ── WarningFeature ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_warning_feature_color_by_severity() {
+        let make = |level: &str| WarningFeature {
+            polygon: vec![],
+            awareness_level: level.to_string(),
+            event: "storm".to_string(),
+            country_code: "SI".to_string(),
+            onset: None,
+            expires: None,
+        };
+        assert_eq!(make("red").color(), Rgb8::RED);
+        assert_eq!(make("4; red; Extreme").color(), Rgb8::RED);
+        assert_eq!(make("orange").color(), Rgb8::new(255, 165, 0));
+        assert_eq!(make("yellow").color(), Rgb8::AMBER);
+        assert_eq!(make("green").color(), Rgb8::GREEN);
+    }
+
+    #[test]
+    fn test_warning_feature_severity_label() {
+        let make = |level: &str| WarningFeature {
+            polygon: vec![],
+            awareness_level: level.to_string(),
+            event: "wind".to_string(),
+            country_code: "DE".to_string(),
+            onset: None,
+            expires: None,
+        };
+        assert_eq!(make("red").severity_label(), "Red");
+        assert_eq!(make("3; orange; Severe").severity_label(), "Orange");
+        assert_eq!(make("2; yellow; Moderate").severity_label(), "Yellow");
+        assert_eq!(make("green").severity_label(), "Green");
+    }
+
+    // ── BorderLine / BorderResolution ─────────────────────────────────
+
+    #[test]
+    fn test_border_line_compute_bbox_from_points() {
+        let mut line = BorderLine {
+            kind: BorderLineKind::Country,
+            points: vec![
+                WorldPoint { x: 0.1, y: 0.3 },
+                WorldPoint { x: 0.7, y: 0.2 },
+                WorldPoint { x: 0.4, y: 0.8 },
+            ],
+            bbox: Bounds::default(),
+        };
+        line.compute_bbox();
+        assert!((line.bbox.min_x - 0.1).abs() < 1e-9);
+        assert!((line.bbox.max_x - 0.7).abs() < 1e-9);
+        assert!((line.bbox.min_y - 0.2).abs() < 1e-9);
+        assert!((line.bbox.max_y - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_border_resolution_for_zoom_thresholds() {
+        assert_eq!(BorderResolution::for_zoom(3.0), BorderResolution::Low110m);
+        assert_eq!(BorderResolution::for_zoom(3.5), BorderResolution::Medium50m);
+        assert_eq!(BorderResolution::for_zoom(4.5), BorderResolution::High10m);
+        assert_eq!(
+            BorderResolution::for_zoom(7.0),
+            BorderResolution::Regional10m
+        );
+    }
+
+    // ── LayerRegistry: status_line / any_loading / saved_enabled ──────
+
+    #[test]
+    fn test_layer_registry_status_line_ready_by_default() {
+        let reg = LayerRegistry::new();
+        assert_eq!(reg.status_line(), "Ready");
+    }
+
+    #[test]
+    fn test_layer_registry_status_line_shows_loading_radar() {
+        let mut reg = LayerRegistry::new();
+        reg.set_status(LayerId::Radar, LayerStatus::Loading);
+        assert!(
+            reg.status_line().contains("Radar"),
+            "loading radar must appear in status line"
+        );
+    }
+
+    #[test]
+    fn test_layer_registry_status_line_shows_error() {
+        let mut reg = LayerRegistry::new();
+        reg.set_status(LayerId::MeteoAlarm, LayerStatus::Error("timeout".into()));
+        let line = reg.status_line();
+        assert!(
+            line.contains("timeout"),
+            "error message must appear in status line"
+        );
+    }
+
+    #[test]
+    fn test_layer_registry_any_loading_false_when_idle() {
+        let reg = LayerRegistry::new();
+        assert!(!reg.any_loading());
+    }
+
+    #[test]
+    fn test_layer_registry_any_loading_true_when_enabled_layer_loads() {
+        let mut reg = LayerRegistry::new();
+        // Radar is enabled by default (braille mode assigned).
+        reg.set_status(LayerId::Radar, LayerStatus::Loading);
+        assert!(reg.any_loading());
+    }
+
+    #[test]
+    fn test_layer_registry_saved_enabled_and_restore_roundtrip() {
+        let mut reg = LayerRegistry::new();
+        let saved = reg.saved_enabled();
+        // Disable everything we can, then restore.
+        reg.toggle(LayerId::RegionBorders);
+        assert!(!reg.get_state(LayerId::RegionBorders).unwrap().enabled);
+        reg.restore_enabled(&saved);
+        assert!(reg.get_state(LayerId::RegionBorders).unwrap().enabled);
+    }
+
+    // ── RadarFrame::covers_bounds ──────────────────────────────────────
+
+    #[test]
+    fn test_radar_frame_covers_bounds_true_when_all_tiles_present() {
+        use crate::geo::{Bounds, TileCoord};
+        // At z=1 the full world needs tiles (0,0), (1,0), (0,1), (1,1).
+        let mut frame = RadarFrame {
+            time: 0,
+            path: "test".into(),
+            tiles: vec![
+                RadarTile {
+                    coord: TileCoord { z: 1, x: 0, y: 0 },
+                    size: 256,
+                    rows: vec![],
+                },
+                RadarTile {
+                    coord: TileCoord { z: 1, x: 1, y: 0 },
+                    size: 256,
+                    rows: vec![],
+                },
+                RadarTile {
+                    coord: TileCoord { z: 1, x: 0, y: 1 },
+                    size: 256,
+                    rows: vec![],
+                },
+                RadarTile {
+                    coord: TileCoord { z: 1, x: 1, y: 1 },
+                    size: 256,
+                    rows: vec![],
+                },
+            ],
+            missing_tiles: 0,
+            target_zoom: 1,
+        };
+        let full = Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
+        assert!(frame.covers_bounds(full, 1));
+
+        // Remove one tile → no longer covers.
+        frame.tiles.pop();
+        assert!(!frame.covers_bounds(full, 1));
+    }
+
+    // ── resolution_distance ────────────────────────────────────────────
+
+    #[test]
+    fn test_resolution_distance_same_is_zero() {
+        assert_eq!(
+            resolution_distance(BorderResolution::Low110m, BorderResolution::Low110m),
+            0
+        );
+    }
+
+    #[test]
+    fn test_resolution_distance_increases_with_gap() {
+        let d_adj = resolution_distance(BorderResolution::Low110m, BorderResolution::Medium50m);
+        let d_far = resolution_distance(BorderResolution::Low110m, BorderResolution::Regional10m);
+        assert!(d_far > d_adj, "farther apart → larger distance");
+    }
+
+    // ── BorderLine::is_bbox_degenerate ────────────────────────────────
+
+    #[test]
+    fn test_border_line_is_bbox_degenerate_on_default() {
+        let line = BorderLine {
+            kind: BorderLineKind::Country,
+            points: vec![],
+            bbox: Bounds::default(),
+        };
+        assert!(
+            line.is_bbox_degenerate(),
+            "zero-area default bbox is degenerate"
+        );
+    }
+
+    #[test]
+    fn test_border_line_is_bbox_degenerate_false_after_compute() {
+        let mut line = BorderLine {
+            kind: BorderLineKind::Country,
+            points: vec![WorldPoint { x: 0.1, y: 0.2 }, WorldPoint { x: 0.5, y: 0.8 }],
+            bbox: Bounds::default(),
+        };
+        line.compute_bbox();
+        assert!(!line.is_bbox_degenerate());
+    }
+
+    // ── options_for_item ──────────────────────────────────────────────
+
+    #[test]
+    fn test_options_for_item_geographic_has_no_options() {
+        let reg = LayerRegistry::new();
+        let opts = reg.options_for_item(MainItem::Single(LayerId::MapBorders));
+        assert!(opts.is_empty(), "geographic layers have no options");
+    }
+
+    #[test]
+    fn test_options_for_item_radar_has_three_options() {
+        let reg = LayerRegistry::new();
+        let opts = reg.options_for_item(MainItem::Single(LayerId::Radar));
+        assert_eq!(opts.len(), 3, "Radar exposes Braille/Color/Text options");
+        let keys: Vec<&str> = opts.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"braille") && keys.contains(&"color") && keys.contains(&"text"));
+    }
+
+    #[test]
+    fn test_options_for_item_lightning_has_four_options() {
+        let reg = LayerRegistry::new();
+        let opts = reg.options_for_item(MainItem::Single(LayerId::Lightning));
+        assert_eq!(opts.len(), 4, "Lightning exposes Braille/Color/Text/Trail");
+        assert_eq!(opts[3].0, "trail");
+    }
+
+    #[test]
+    fn test_options_for_item_observation_has_one_option() {
+        let reg = LayerRegistry::new();
+        let opts = reg.options_for_item(MainItem::Single(LayerId::SurfTemp));
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].0, "text");
+    }
+
+    #[test]
+    fn test_options_for_item_group_has_four_children() {
+        let reg = LayerRegistry::new();
+        let opts = reg.options_for_item(MainItem::Group(LayerGroup::Observations));
+        assert_eq!(opts.len(), 4, "Observations group has 4 children");
+    }
+
     fn make_line(pts: &[(f64, f64)]) -> BorderLine {
         let points: Vec<WorldPoint> = pts.iter().map(|&(x, y)| WorldPoint { x, y }).collect();
         let mut line = BorderLine {

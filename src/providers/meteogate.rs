@@ -861,4 +861,56 @@ mod tests {
             "easting not symmetric: {e1} vs {e2}, diff={diff}"
         );
     }
+
+    #[test]
+    fn dbz_to_color_thresholds_map_to_expected_hues() {
+        // Very light rain: blue family
+        let (c, i) = dbz_to_color(2.0);
+        assert!(c.b > c.r && c.b > c.g, "< 5 dBZ should be blue-dominant");
+        assert!(i >= 1);
+
+        // Light rain: still blue but darker
+        let (c2, _) = dbz_to_color(10.0);
+        assert!(c2.b > c2.r);
+
+        // Moderate rain: green family
+        let (c3, _) = dbz_to_color(20.0);
+        assert!(c3.g > c3.r && c3.g > c3.b);
+
+        // Heavy rain: red family
+        let (c4, _) = dbz_to_color(52.0);
+        assert!(c4.r > c4.b);
+
+        // Extreme: white-ish (all channels ≥ 128)
+        let (c5, i5) = dbz_to_color(65.0);
+        assert!(c5.r >= 128 && c5.g >= 128 && c5.b >= 128);
+        assert_eq!(i5, 14, "intensity caps at 14");
+    }
+
+    #[test]
+    fn dbz_to_color_intensity_increases_with_dbz() {
+        let (_, i_low) = dbz_to_color(5.0);
+        let (_, i_high) = dbz_to_color(45.0);
+        assert!(i_high > i_low, "higher dBZ must give higher intensity");
+    }
+
+    #[test]
+    fn radar_zoom_clamps_and_rounds() {
+        assert_eq!(radar_zoom(0.0), 1, "below min clamps to 1");
+        assert_eq!(radar_zoom(8.0), 7, "above max clamps to 7");
+        assert_eq!(radar_zoom(4.4), 4, "rounds down");
+        assert_eq!(radar_zoom(4.6), 5, "rounds up");
+    }
+
+    #[test]
+    fn compute_frame_list_returns_12_descending_5min_steps() {
+        let frames = compute_frame_list();
+        assert_eq!(frames.len(), 12);
+        // Each frame is 300 s before the previous.
+        for w in frames.windows(2) {
+            assert_eq!(w[0] - w[1], 300, "frames must be 5 min apart");
+        }
+        // Most recent frame is a multiple of 300.
+        assert_eq!(frames[0] % 300, 0, "latest frame aligned to 5 min boundary");
+    }
 }

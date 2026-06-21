@@ -1014,3 +1014,306 @@ fn normalize_station_name(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── normalize_station_name ─────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_station_name_all_caps_to_title_case() {
+        assert_eq!(
+            normalize_station_name("BAD_TATZMANNSDORF"),
+            "Bad Tatzmannsdorf"
+        );
+    }
+
+    #[test]
+    fn test_normalize_station_name_mixed_case_unchanged() {
+        assert_eq!(normalize_station_name("Szombathely"), "Szombathely");
+    }
+
+    #[test]
+    fn test_normalize_station_name_underscores_replaced_when_mixed_case() {
+        assert_eq!(normalize_station_name("Wien_Hohe_Warte"), "Wien Hohe Warte");
+    }
+
+    #[test]
+    fn test_normalize_station_name_single_word_all_caps() {
+        assert_eq!(normalize_station_name("BERLIN"), "Berlin");
+    }
+
+    #[test]
+    fn test_normalize_station_name_empty() {
+        assert_eq!(normalize_station_name(""), "");
+    }
+
+    // ── bounds_covered ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_bounds_covered_none_have_always_true() {
+        // When we have no stored bounds (None = global), anything is covered.
+        let want = Some(Bounds {
+            min_x: 0.1,
+            max_x: 0.9,
+            min_y: 0.1,
+            max_y: 0.9,
+        });
+        assert!(bounds_covered(None, want));
+        assert!(bounds_covered(None, None));
+    }
+
+    #[test]
+    fn test_bounds_covered_have_subset_of_want_is_false() {
+        let have = Some(Bounds {
+            min_x: 0.2,
+            max_x: 0.8,
+            min_y: 0.2,
+            max_y: 0.8,
+        });
+        let want = Some(Bounds {
+            min_x: 0.1,
+            max_x: 0.9,
+            min_y: 0.1,
+            max_y: 0.9,
+        });
+        // `have` does not fully contain `want` → not covered.
+        assert!(!bounds_covered(have, want));
+    }
+
+    #[test]
+    fn test_bounds_covered_have_superset_of_want_is_true() {
+        let have = Some(Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        });
+        let want = Some(Bounds {
+            min_x: 0.2,
+            max_x: 0.8,
+            min_y: 0.2,
+            max_y: 0.8,
+        });
+        assert!(bounds_covered(have, want));
+    }
+
+    #[test]
+    fn test_bounds_covered_have_some_want_none_is_false() {
+        let have = Some(Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        });
+        // A bounded cache cannot satisfy a "no bounds = global" request.
+        assert!(!bounds_covered(have, None));
+    }
+
+    // ── bounds_polygon ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_bounds_polygon_none_returns_europe_fallback() {
+        let poly = bounds_polygon(None);
+        assert!(poly.starts_with("POLYGON"), "must be a WKT polygon");
+        assert!(poly.contains("-30"), "Europe fallback spans to -30°");
+    }
+
+    #[test]
+    fn test_bounds_polygon_some_bounds_contains_lon_lat() {
+        // World centre (0.5, 0.5) in world coords → (0°N, 0°E) in lat/lon.
+        let b = Bounds {
+            min_x: 0.4,
+            max_x: 0.6,
+            min_y: 0.4,
+            max_y: 0.6,
+        };
+        let poly = bounds_polygon(Some(b));
+        assert!(poly.starts_with("POLYGON"), "must be a WKT polygon");
+        // The polygon must close (last point == first point).
+        let inner = poly.trim_start_matches("POLYGON((").trim_end_matches("))");
+        let points: Vec<&str> = inner.split(',').collect();
+        assert_eq!(
+            points.first().unwrap().trim(),
+            points.last().unwrap().trim(),
+            "polygon must be closed"
+        );
+    }
+
+    // ── extract_param_values ───────────────────────────────────────────
+
+    #[test]
+    fn test_extract_param_values_picks_latest_value() {
+        let ranges = json!({
+            "air_temperature": { "values": [10.0, 12.0, 15.0] }
+        });
+        let mut out = HashMap::new();
+        extract_param_values(ranges.as_object().unwrap(), &mut out);
+        assert!((out["air_temperature"] - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_extract_param_values_wind_speed_prefers_mean() {
+        // Two wind_speed entries: one plain, one :mean: — the mean wins.
+        let ranges = json!({
+            "wind_speed:max:PT10M": { "values": [5.0] },
+            "wind_speed:mean:PT10M": { "values": [3.0] }
+        });
+        let mut out = HashMap::new();
+        extract_param_values(ranges.as_object().unwrap(), &mut out);
+        assert!((out["wind_speed"] - 3.0).abs() < 1e-9, "mean should win");
+    }
+
+    #[test]
+    fn test_extract_param_values_skips_null_values() {
+        let ranges = json!({
+            "air_temperature": { "values": [null] }
+        });
+        let mut out = HashMap::new();
+        extract_param_values(ranges.as_object().unwrap(), &mut out);
+        assert!(
+            !out.contains_key("air_temperature"),
+            "null value must be skipped"
+        );
+    }
+
+    // ── parse_area_values ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_area_values_basic_coverage() {
+        let data = json!({
+            "coverages": [{
+                "metocean:wigosId": "0-20000-0-11035",
+                "domain": {
+                    "axes": {
+                        "x": { "values": [14.51] },
+                        "y": { "values": [46.05] }
+                    }
+                },
+                "ranges": {
+                    "air_temperature": { "values": [22.5] }
+                }
+            }]
+        });
+        let result = parse_area_values(&data);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].wigos_id, "0-20000-0-11035");
+        assert!((result[0].lon - 14.51).abs() < 1e-9);
+        assert!((result[0].lat - 46.05).abs() < 1e-9);
+        assert!((result[0].values["air_temperature"] - 22.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_area_values_skips_coverage_without_id() {
+        let data = json!({
+            "coverages": [{
+                "domain": { "axes": { "x": { "values": [0.0] }, "y": { "values": [0.0] } } },
+                "ranges": { "air_temperature": { "values": [10.0] } }
+            }]
+        });
+        assert!(parse_area_values(&data).is_empty());
+    }
+
+    #[test]
+    fn test_parse_area_values_skips_empty_values() {
+        let data = json!({
+            "coverages": [{
+                "metocean:wigosId": "test",
+                "domain": { "axes": { "x": { "values": [1.0] }, "y": { "values": [2.0] } } },
+                "ranges": { "air_temperature": { "values": [] } }
+            }]
+        });
+        // Empty values → no usable params → station skipped.
+        assert!(parse_area_values(&data).is_empty());
+    }
+
+    #[test]
+    fn test_parse_area_values_no_coverages_key() {
+        let data = json!({ "type": "CoverageCollection" });
+        assert!(parse_area_values(&data).is_empty());
+    }
+
+    // ── parse_locations ────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_locations_empty_text_returns_empty_vec() {
+        let result = EumetnetProvider::parse_locations("", std::path::Path::new("/dev/null"));
+        assert!(result.is_some_and(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn test_parse_locations_basic_feature() {
+        let json = r#"{
+          "features": [{
+            "id": "0-20000-0-11035",
+            "geometry": { "type": "Point", "coordinates": [14.51, 46.05] },
+            "properties": { "name": "Ljubljana" }
+          }]
+        }"#;
+        let result =
+            EumetnetProvider::parse_locations(json, std::path::Path::new("/dev/null")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].wigos_id, "0-20000-0-11035");
+        assert_eq!(result[0].name, "Ljubljana");
+        assert!((result[0].lon - 14.51).abs() < 1e-9);
+        assert!((result[0].lat - 46.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_locations_falls_back_to_platform_id() {
+        let json = r#"{
+          "features": [{
+            "geometry": { "type": "Point", "coordinates": [0.0, 0.0] },
+            "properties": { "platform": "fallback-id", "name": "Test" }
+          }]
+        }"#;
+        let result =
+            EumetnetProvider::parse_locations(json, std::path::Path::new("/dev/null")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].wigos_id, "fallback-id");
+    }
+
+    #[test]
+    fn test_parse_locations_skips_non_point_geometry() {
+        let json = r#"{
+          "features": [{
+            "id": "poly-station",
+            "geometry": { "type": "Polygon", "coordinates": [] },
+            "properties": {}
+          }]
+        }"#;
+        let result =
+            EumetnetProvider::parse_locations(json, std::path::Path::new("/dev/null")).unwrap();
+        assert!(result.is_empty(), "non-Point geometry must be skipped");
+    }
+
+    #[test]
+    fn test_parse_locations_skips_feature_without_id() {
+        let json = r#"{
+          "features": [{
+            "geometry": { "type": "Point", "coordinates": [0.0, 0.0] },
+            "properties": {}
+          }]
+        }"#;
+        let result =
+            EumetnetProvider::parse_locations(json, std::path::Path::new("/dev/null")).unwrap();
+        assert!(result.is_empty(), "feature without id must be skipped");
+    }
+
+    #[test]
+    fn test_parse_locations_name_title_platform_name_fallback_chain() {
+        // No "name" key — should fall back to "title".
+        let json = r#"{
+          "features": [{
+            "id": "S1",
+            "geometry": { "type": "Point", "coordinates": [1.0, 2.0] },
+            "properties": { "title": "My Title" }
+          }]
+        }"#;
+        let result =
+            EumetnetProvider::parse_locations(json, std::path::Path::new("/dev/null")).unwrap();
+        assert_eq!(result[0].name, "My Title");
+    }
+}

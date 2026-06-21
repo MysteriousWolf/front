@@ -303,3 +303,78 @@ impl StateConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default_viewport_matches_constants() {
+        let cfg = Config::default();
+        assert_eq!(cfg.viewport.lat, EUROPE_LAT);
+        assert_eq!(cfg.viewport.lon, EUROPE_LON);
+        assert_eq!(cfg.viewport.zoom, EUROPE_ZOOM);
+    }
+
+    #[test]
+    fn test_state_config_toml_roundtrip() {
+        let original = StateConfig {
+            center_lat: 46.05,
+            center_lon: 14.51,
+            zoom: 5.0,
+            enabled_layers: vec![LayerId::Radar, LayerId::MapBorders],
+            selected_layer: LayerId::Radar,
+            render_modes: vec![LayerRenderMode {
+                layer: LayerId::Radar,
+                mode: RenderMode::Braille,
+            }],
+            braille_layer: None,
+            color_layer: None,
+            text_layer: None,
+            lightning_trail_minutes: Some(10),
+        };
+        let toml_str = toml::to_string_pretty(&original).expect("serialize");
+        let loaded: StateConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert!((loaded.center_lat - original.center_lat).abs() < 1e-9);
+        assert!((loaded.center_lon - original.center_lon).abs() < 1e-9);
+        assert_eq!(loaded.selected_layer, original.selected_layer);
+        assert_eq!(loaded.lightning_trail_minutes, Some(10));
+        assert_eq!(loaded.render_modes.len(), 1);
+        assert_eq!(loaded.render_modes[0].layer, LayerId::Radar);
+        assert_eq!(loaded.render_modes[0].mode, RenderMode::Braille);
+    }
+
+    #[test]
+    fn test_state_config_legacy_scalar_fields_roundtrip() {
+        let toml_str = r#"
+            center_lat = 50.0
+            center_lon = 10.0
+            zoom = 4.0
+            enabled_layers = ["Radar"]
+            selected_layer = "Radar"
+            braille_layer = "Radar"
+            color_layer = "MeteoAlarm"
+        "#;
+        let loaded: StateConfig = toml::from_str(toml_str).expect("legacy fields must parse");
+        assert_eq!(loaded.braille_layer, Some(LayerId::Radar));
+        assert_eq!(loaded.color_layer, Some(LayerId::MeteoAlarm));
+        assert_eq!(loaded.text_layer, None);
+        assert!(
+            loaded.render_modes.is_empty(),
+            "no render_modes in legacy TOML"
+        );
+    }
+
+    #[test]
+    fn test_state_config_lightning_trail_absent_deserializes_to_none() {
+        let toml_str = r#"
+            center_lat = 46.0
+            center_lon = 14.5
+            zoom = 4.0
+            enabled_layers = []
+            selected_layer = "Radar"
+        "#;
+        let loaded: StateConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(loaded.lightning_trail_minutes, None);
+    }
+}

@@ -736,4 +736,93 @@ mod tests {
         assert_eq!(lines[0].kind, BorderLineKind::Region);
         assert_eq!(lines[0].points.len(), 2);
     }
+
+    #[test]
+    fn parses_multi_line_string_geojson() {
+        let json = br#"{
+          "type":"FeatureCollection",
+          "features":[{"type":"Feature","geometry":{"type":"MultiLineString","coordinates":[[[0,0],[1,0]],[[2,0],[3,0]]]}}]
+        }"#;
+        let lines = parse_lines(BorderLineKind::Road, json, &AtomicBool::new(false)).unwrap();
+        assert_eq!(lines.len(), 2, "two line strings → two BorderLines");
+        assert!(lines.iter().all(|l| l.kind == BorderLineKind::Road));
+    }
+
+    #[test]
+    fn parses_multi_polygon_geojson() {
+        let json = br#"{
+          "type":"FeatureCollection",
+          "features":[{"type":"Feature","geometry":{"type":"MultiPolygon","coordinates":[[[[0,0],[9,0],[9,9],[0,0]]],[[[10,0],[19,0],[19,9],[10,0]]]]}}]
+        }"#;
+        let layer = parse_borders(BorderResolution::Low110m, json).unwrap();
+        assert_eq!(layer.lines.len(), 2, "two polygons → two BorderLines");
+    }
+
+    #[test]
+    fn simplification_epsilon_ordering() {
+        // Finer resolution → smaller epsilon (tighter fit).
+        let eps_low = simplification_epsilon(BorderResolution::Low110m).unwrap();
+        let eps_reg = simplification_epsilon(BorderResolution::Regional10m).unwrap();
+        assert!(
+            eps_reg < eps_low,
+            "regional must have smaller epsilon than low"
+        );
+    }
+
+    #[test]
+    fn simplify_collinear_removes_middle_point() {
+        // Three collinear points: middle is redundant at any ε > 0.
+        let pts = vec![
+            WorldPoint { x: 0.0, y: 0.0 },
+            WorldPoint { x: 0.5, y: 0.0 },
+            WorldPoint { x: 1.0, y: 0.0 },
+        ];
+        let cancel = AtomicBool::new(false);
+        let result = simplify_points(pts, 1e-9, &cancel);
+        assert_eq!(result.len(), 2, "collinear middle must be removed");
+    }
+
+    #[test]
+    fn simplify_two_points_unchanged() {
+        let pts = vec![WorldPoint { x: 0.0, y: 0.0 }, WorldPoint { x: 1.0, y: 1.0 }];
+        let cancel = AtomicBool::new(false);
+        let result = simplify_points(pts.clone(), 0.001, &cancel);
+        assert_eq!(result.len(), 2, "two-point line cannot be reduced");
+    }
+
+    #[test]
+    fn simplify_cancelled_returns_input_unchanged() {
+        let pts = vec![
+            WorldPoint { x: 0.0, y: 0.0 },
+            WorldPoint { x: 0.5, y: 0.5 },
+            WorldPoint { x: 1.0, y: 0.0 },
+        ];
+        let cancel = AtomicBool::new(true);
+        let result = simplify_points(pts.clone(), 1e-9, &cancel);
+        assert_eq!(
+            result.len(),
+            pts.len(),
+            "cancelled simplify returns full input"
+        );
+    }
+
+    #[test]
+    fn perpendicular_distance_sq_on_axis_point() {
+        // Point at (0, 1) against segment from (0,0) to (1,0): perp dist = 1.0.
+        let p = WorldPoint { x: 0.0, y: 1.0 };
+        let a = WorldPoint { x: 0.0, y: 0.0 };
+        let b = WorldPoint { x: 1.0, y: 0.0 };
+        let d2 = perpendicular_distance_sq(p, a, b);
+        assert!((d2 - 1.0).abs() < 1e-9, "expected d²=1.0, got {d2}");
+    }
+
+    #[test]
+    fn perpendicular_distance_sq_degenerate_segment() {
+        // Degenerate segment (a==b): returns distance² to a.
+        let p = WorldPoint { x: 3.0, y: 4.0 };
+        let a = WorldPoint { x: 0.0, y: 0.0 };
+        let b = WorldPoint { x: 0.0, y: 0.0 };
+        let d2 = perpendicular_distance_sq(p, a, b);
+        assert!((d2 - 25.0).abs() < 1e-9, "3-4-5 triangle: d²=25, got {d2}");
+    }
 }
