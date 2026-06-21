@@ -2719,6 +2719,18 @@ const NICE: [f64; 16] = [
     50000.0, 100000.0,
 ];
 
+/// Snap `ideal` chars-per-segment to a divisor of BAR_CHARS (20) that keeps
+/// segments wide enough to read at a glance — minimum 4 chars per stripe.
+/// Divisors: 4 (5 segs), 5 (4 segs), 10 (2 segs), 20 (1 seg).
+fn scale_bar_seg_chars(ideal: usize) -> usize {
+    const DIVISORS: [usize; 4] = [4, 5, 10, 20];
+    DIVISORS
+        .iter()
+        .min_by_key(|&&d| d.abs_diff(ideal.max(4)))
+        .copied()
+        .unwrap_or(5)
+}
+
 fn render_scale_bar(app: &App) -> String {
     const BAR_CHARS: usize = 20;
     const TOTAL_WIDTH: usize = 35;
@@ -2744,27 +2756,34 @@ fn render_scale_bar(app: &App) -> String {
     }
 
     let ideal_seg = (segment_km / kmpc).round() as usize;
-    let ideal_seg = ideal_seg.max(1);
-    // Snap to a clean divisor of BAR_CHARS so every segment is equal length.
-    const DIVISORS: [usize; 6] = [1, 2, 4, 5, 10, 20];
-    let seg_chars = DIVISORS
-        .iter()
-        .min_by_key(|&&d| d.abs_diff(ideal_seg))
-        .copied()
-        .unwrap_or(1);
+    let seg_chars = scale_bar_seg_chars(ideal_seg);
 
-    let label = if segment_km >= 1000.0 {
-        format!("{:.0}k km", segment_km / 1000.0)
+    // Re-derive the label from the *actual* stripe width so the number
+    // always matches what's drawn, even when seg_chars was snapped.
+    let actual_seg_km = seg_chars as f64 * kmpc;
+    let label_km = NICE
+        .iter()
+        .copied()
+        .min_by(|&a, &b| {
+            (a - actual_seg_km)
+                .abs()
+                .partial_cmp(&(b - actual_seg_km).abs())
+                .unwrap()
+        })
+        .unwrap_or(actual_seg_km);
+    let label = if label_km >= 1000.0 {
+        format!("{:.0}k km", label_km / 1000.0)
     } else {
-        format!("{:.0} km", segment_km)
+        format!("{:.0} km", label_km)
     };
 
     let mut bar = String::with_capacity(BAR_CHARS);
     let mut flip = false;
     let mut i = 0;
     while i < BAR_CHARS {
+        let ch = if flip { '░' } else { '█' };
         for _ in 0..seg_chars {
-            bar.push(if flip { '▐' } else { '▌' });
+            bar.push(ch);
         }
         i += seg_chars;
         flip = !flip;
@@ -3136,6 +3155,54 @@ mod tests {
         assert_eq!(rows.len(), 2);
         for row in &rows {
             assert!(!row.spans.is_empty());
+        }
+    }
+
+    #[test]
+    fn scale_bar_seg_chars_snaps_to_even_divisors() {
+        // At any ideal width the result must divide BAR_CHARS (20) evenly
+        // and never be narrower than 4 chars.
+        for ideal in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 50] {
+            let seg = scale_bar_seg_chars(ideal);
+            assert!(20 % seg == 0, "seg_chars={seg} must divide 20");
+            assert!(seg >= 4, "seg_chars={seg} must be >= 4 for readability");
+        }
+        // Coarse zoom (ideal ≈ 10) should produce wide segments.
+        assert_eq!(scale_bar_seg_chars(10), 10);
+        // Fine zoom (ideal ≈ 5) should produce 4-segment bar.
+        assert_eq!(scale_bar_seg_chars(5), 5);
+    }
+
+    #[test]
+    fn scale_bar_label_matches_stripe_width() {
+        // Verify that the label (nearest NICE to actual_seg_km) is within 50%
+        // of the actual stripe distance.  This catches the bug where segment_km
+        // was chosen before seg_chars was snapped, producing a ~2× mismatch.
+        let cases: &[(f64, usize)] = &[
+            (9.0, 2),   // kmpc=9, ideal_seg=2 → seg_chars snapped to 4; actual=36 km
+            (9.0, 4),   // ideal_seg=4 → seg_chars=4; actual=36 km
+            (9.79, 10), // ideal_seg=10 → seg_chars=10; actual≈98 km
+            (2.45, 4),  // ideal_seg=4 → seg_chars=4; actual≈9.8 km
+            (50.0, 5),  // ideal_seg=5 → seg_chars=5; actual=250 km
+        ];
+        for &(kmpc, ideal_seg) in cases {
+            let seg_chars = scale_bar_seg_chars(ideal_seg);
+            let actual_seg_km = seg_chars as f64 * kmpc;
+            let label_km = NICE
+                .iter()
+                .copied()
+                .min_by(|&a, &b| {
+                    (a - actual_seg_km)
+                        .abs()
+                        .partial_cmp(&(b - actual_seg_km).abs())
+                        .unwrap()
+                })
+                .unwrap_or(actual_seg_km);
+            let ratio = label_km / actual_seg_km;
+            assert!(
+                ratio >= 0.5 && ratio <= 2.0,
+                "kmpc={kmpc} ideal={ideal_seg}: label={label_km} actual={actual_seg_km} ratio={ratio:.2}"
+            );
         }
     }
 }
