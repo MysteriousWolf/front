@@ -1,0 +1,10 @@
+[advisories]
+# rustls-webpki 0.102.8 vulnerabilities — blocked on rumqttc upgrading to
+# rustls 0.23+ (rumqttc 0.24 pins rustls 0.22). No fix available within the
+# current semver range. Revisit when rumqttc 0.25+ is released.
+ignore = [
+    "RUSTSEC-2026-0049",  # CRL matching logic
+    "RUSTSEC-2026-0098",  # URI name constraints
+    "RUSTSEC-2026-0099",  # wildcard name constraints
+    "RUSTSEC-2026-0104",  # reachable panic in CRL parsing
+]

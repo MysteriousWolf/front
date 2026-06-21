@@ -1042,7 +1042,7 @@ pub struct BorderLayer {
     pub resolution: BorderResolution,
     pub lines: Vec<BorderLine>,
     /// Spatial grid index over `lines`.  A 16×16 fixed grid in world-
-    /// coordinate space [0,1].  Each cell stores the indices of lines
+    /// coordinate space \[0,1\].  Each cell stores the indices of lines
     /// whose bbox overlaps that cell.  Used during mask recompute to
     /// skip lines that cannot intersect the viewport, reducing the
     /// per-frame scan from O(all_lines) to O(viewport_lines).

@@ -64,7 +64,7 @@ fn default_viewport_zoom() -> f64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MeteoGateConfig {
     /// Optional API key for higher rate limits on the ORD REST API.
-    /// Get yours at https://devportal.meteogate.eu/
+    /// Get yours at <https://devportal.meteogate.eu/>
     /// The S3 bucket does not require authentication.
     /// Leave empty to use anonymous access.
     #[serde(default)]

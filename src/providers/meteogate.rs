@@ -159,9 +159,9 @@ impl MeteoGateProvider {
         Ok(g)
     }
 
-    /// Like [`frame`] but builds tiles in **centre-first clockwise spiral
+    /// Like [`Self::frame`] but builds tiles in **centre-first clockwise spiral
     /// order** and sends each completed tile through `tile_tx` as soon as
-    /// it is ready.  Up to [`MAX_CONCURRENT_TILES`] tiles are built
+    /// it is ready.  Up to `MAX_CONCURRENT_TILES` tiles are built
     /// concurrently via `tokio::task::spawn_blocking`.
     ///
     /// The returned frame's `tiles` vec may be empty — the caller is

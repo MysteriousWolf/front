@@ -1356,7 +1356,7 @@ impl App {
             }));
         }
         #[cfg(not(feature = "lightning"))]
-        let _ = close_rx;
+        drop(close_rx);
         write_log(&self.dirs.log_path, "lightning: connection requested");
     }
 
