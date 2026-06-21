@@ -715,16 +715,11 @@ fn relative_mouse(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
     contains(area, column, row).then(|| (column - area.x, row - area.y))
 }
 
-fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &App) {
+    let version = env!("CARGO_PKG_VERSION");
     let title = TextLine::from(vec![
         Span::styled("FRONT", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  Fancy Radar ObservatioN Tool"),
-        Span::raw(format!(
-            "  zoom {:.1}  frame {}  {}",
-            app.viewport.zoom,
-            app.frame_label(),
-            app.location_label
-        )),
+        Span::raw(format!(" v{version}")),
     ]);
     frame.render_widget(Paragraph::new(title), area);
 }
@@ -2689,18 +2684,29 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" help  "),
     ]);
 
+    // " zoom " badge (6) + " X.X" value (5) = 11 chars, always fixed
+    let zoom_line = TextLine::from(vec![
+        Span::styled(" zoom ", Style::default().bg(Color::DarkGray)),
+        Span::raw(format!(" {:4.1}", app.viewport.zoom)),
+    ]);
+
     let scale = render_scale_bar(app);
     let scale_w = scale.chars().count() as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Fill(1), Constraint::Length(scale_w)])
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(11),
+            Constraint::Length(scale_w),
+        ])
         .split(area);
 
     frame.render_widget(Paragraph::new(hints), chunks[0]);
+    frame.render_widget(Paragraph::new(zoom_line), chunks[1]);
     frame.render_widget(
         Paragraph::new(TextLine::from(scale)).alignment(ratatui::layout::Alignment::Right),
-        chunks[1],
+        chunks[2],
     );
 }
 
@@ -2733,7 +2739,7 @@ fn scale_bar_seg_chars(ideal: usize) -> usize {
 
 fn render_scale_bar(app: &App) -> String {
     const BAR_CHARS: usize = 20;
-    const TOTAL_WIDTH: usize = 35;
+    const TOTAL_WIDTH: usize = 30;
 
     let kmpc = km_per_char(app).max(f64::EPSILON);
     let total_km = BAR_CHARS as f64 * kmpc;
@@ -3200,7 +3206,7 @@ mod tests {
                 .unwrap_or(actual_seg_km);
             let ratio = label_km / actual_seg_km;
             assert!(
-                ratio >= 0.5 && ratio <= 2.0,
+                (0.5..=2.0).contains(&ratio),
                 "kmpc={kmpc} ideal={ideal_seg}: label={label_km} actual={actual_seg_km} ratio={ratio:.2}"
             );
         }
