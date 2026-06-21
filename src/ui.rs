@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 
 use crate::app::{
-    App, BorderMask, BorderMaskPoint, BorderMaskStamp, TaskState, LIGHTNING_IMPACT_MS,
+    App, BorderMask, BorderMaskPoint, BorderMaskStamp, PlaybackMode, TaskState, LIGHTNING_IMPACT_MS,
 };
 use crate::cache::write_log;
 use crate::geo::{
@@ -232,8 +232,12 @@ async fn run_loop(
     let mut last_radar_poll = Instant::now();
     let mut state_dirty = false;
     let mut last_state_save = Instant::now();
+    let mut last_playback_step = Instant::now();
     loop {
         if app.drain_refresh_results() {
+            dirty = true;
+        }
+        if app.drain_preload_results() {
             dirty = true;
         }
         if app.drain_frame_list() {
@@ -262,6 +266,18 @@ async fn run_loop(
         if last_radar_poll.elapsed() >= RADAR_POLL_INTERVAL {
             last_radar_poll = Instant::now();
             if app.poll_radar_timestamps() {
+                app.request_meteogate_refresh(app.map_width, app.map_height);
+                dirty = true;
+            }
+        }
+        // Playback: when Playing, advance one frame per speed interval.
+        // Hold 3x longer on the live (newest) frame before looping back to oldest.
+        if app.playback_mode == PlaybackMode::Playing && !app.timestamps.is_empty() {
+            let base = Duration::from_millis(app.playback_speed.interval_ms());
+            let interval = if app.frame_index == 0 { base * 3 } else { base };
+            if last_playback_step.elapsed() >= interval {
+                last_playback_step = Instant::now();
+                app.playback_step();
                 app.request_meteogate_refresh(app.map_width, app.map_height);
                 dirty = true;
             }
@@ -335,8 +351,9 @@ async fn run_loop(
             last_render = Instant::now();
         } else if (app.layers.any_loading()
             || !app.active_tasks.is_empty()
-            || app.has_lightning_impact())
-            && last_render.elapsed() >= Duration::from_millis(25)
+            || app.has_lightning_impact()
+            || app.playback_mode == PlaybackMode::Live)
+            && last_render.elapsed() >= Duration::from_millis(50)
         {
             dirty = true;
         }
@@ -485,13 +502,31 @@ async fn run_loop(
                             dirty = true;
                         }
                         KeyCode::Char(']') => {
-                            app.next_frame();
+                            app.previous_frame();
                             refresh = true;
                             dirty = true;
                         }
                         KeyCode::Char('[') => {
-                            app.previous_frame();
+                            app.next_frame();
                             refresh = true;
+                            dirty = true;
+                        }
+                        KeyCode::Char('p') => {
+                            app.toggle_play_pause();
+                            last_playback_step = Instant::now();
+                            dirty = true;
+                        }
+                        KeyCode::Char('0') => {
+                            app.jump_to_live();
+                            app.request_meteogate_refresh(app.map_width, app.map_height);
+                            dirty = true;
+                        }
+                        KeyCode::Char('.') => {
+                            app.speed_faster();
+                            dirty = true;
+                        }
+                        KeyCode::Char(',') => {
+                            app.speed_slower();
                             dirty = true;
                         }
                         KeyCode::Char('?') => {
@@ -636,7 +671,10 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         TextLine::from("    ?          Toggle this help"),
         TextLine::from("    arrows     Pan map"),
         TextLine::from("    + / -      Zoom in / out"),
-        TextLine::from("    [ / ]      Previous / next frame"),
+        TextLine::from("    [ / ]      Step to older / newer frame (enters pause)"),
+        TextLine::from("    p          Play / pause timeline"),
+        TextLine::from("    0          Return to live (latest frame)"),
+        TextLine::from("    , / .      Playback speed slower / faster"),
         TextLine::from("    space      Toggle layer / enable best render mode"),
         TextLine::from("    b / c / l  Toggle braille / color / text render mode"),
         TextLine::from("    ⇧↑ / ⇧↓   Select previous / next layer"),
@@ -715,13 +753,181 @@ fn relative_mouse(area: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
     contains(area, column, row).then(|| (column - area.x, row - area.y))
 }
 
-fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &App) {
+fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let version = env!("CARGO_PKG_VERSION");
+    // "FRONT" bold white, version dimmed — version is secondary info.
     let title = TextLine::from(vec![
         Span::styled("FRONT", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(" v{version}")),
+        Span::styled(format!(" v{version}"), Style::default().fg(Color::DarkGray)),
     ]);
-    frame.render_widget(Paragraph::new(title), area);
+    let title_width = (5 + 1 + 1 + version.len()) as u16; // "FRONT v" + version
+
+    if area.width <= title_width + 16 {
+        frame.render_widget(Paragraph::new(title), area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(title_width), Constraint::Fill(1)])
+        .split(area);
+
+    let timeline = timeline_line(app, chunks[1].width);
+
+    frame.render_widget(Paragraph::new(title), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(timeline).alignment(ratatui::layout::Alignment::Right),
+        chunks[1],
+    );
+}
+
+/// Build the compact timeline right-aligned in the header.
+///
+/// Format: `● 13:50 ···░░░█░░`  (icon · sp · time · sp · one-char-per-frame bar)
+/// When playing: speed label appended after the bar (`▶ 13:50 ···░░░█░░ 2×`).
+fn timeline_line(app: &App, avail: u16) -> TextLine<'static> {
+    let frame_count = app.timestamps.len();
+
+    let time_str = if app.radar_frame.is_some() {
+        app.frame_label()
+    } else {
+        "--:--".to_string()
+    };
+
+    // Live icon pulses smoothly using a cosine wave over a 2-second period.
+    // Other modes use flat colours.
+    let (icon, accent) = match app.playback_mode {
+        PlaybackMode::Live => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as f64;
+            let t = 0.5 - 0.5 * (std::f64::consts::TAU * ms / 2000.0).cos();
+            let g = (80.0 + 175.0 * t).round() as u8;
+            ('●', Color::Rgb(0, g, 0))
+        }
+        PlaybackMode::Paused => ('‖', Color::Yellow),
+        PlaybackMode::Playing => ('▶', Color::Cyan),
+    };
+    let time_color = Color::Reset;
+
+    // Speed label sits left of the icon when playing; absent otherwise.
+    let speed_prefix: Option<&'static str> = if app.playback_mode == PlaybackMode::Playing {
+        Some(app.playback_speed.label())
+    } else {
+        None
+    };
+
+    // Minimum: [speed ]icon sp time  (7 or 10 chars)
+    let min_w = 1 + 1 + 5 + speed_prefix.map_or(0, |s| s.len() as u16 + 1);
+    if avail < min_w {
+        return TextLine::from(Span::styled(icon.to_string(), Style::default().fg(accent)));
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if let Some(spd) = speed_prefix {
+        spans.push(Span::styled(
+            spd.to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(icon.to_string(), Style::default().fg(accent)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(time_str, Style::default().fg(time_color)));
+
+    // One character per frame, no brackets.
+    if frame_count > 0 && avail >= min_w + 1 + frame_count as u16 {
+        let cached: Vec<bool> = app
+            .timestamps
+            .iter()
+            .map(|ts| app.frame_cache.contains_key(ts))
+            .collect();
+        spans.push(Span::raw(" "));
+        spans.extend(timeline_bar_spans(
+            frame_count,
+            app.frame_index,
+            &cached,
+            frame_count,
+        ));
+    }
+
+    TextLine::from(spans)
+}
+
+/// Map frame `i` (0 = newest) to a bar position (0 = left/oldest, width-1 = right/newest).
+fn frame_to_bar_pos(i: usize, frame_count: usize, bar_width: usize) -> usize {
+    if bar_width == 0 {
+        return 0;
+    }
+    if frame_count <= 1 {
+        return bar_width.saturating_sub(1);
+    }
+    let normalized = i as f64 / (frame_count - 1) as f64;
+    let pos = ((1.0 - normalized) * (bar_width - 1) as f64).round() as usize;
+    pos.min(bar_width - 1)
+}
+
+/// Build colored spans for the timeline bar.
+///
+/// `·` uncached frame  `░` cached/ready  `█` current  `─` track background
+fn timeline_bar_spans(
+    frame_count: usize,
+    frame_index: usize,
+    cached: &[bool],
+    bar_width: usize,
+) -> Vec<Span<'static>> {
+    if bar_width == 0 {
+        return vec![];
+    }
+    if frame_count == 0 {
+        return vec![Span::styled(
+            "─".repeat(bar_width),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+
+    // Build character array: background `─`, then stamp each frame tick.
+    let mut cells: Vec<char> = vec!['─'; bar_width];
+    for i in 0..frame_count {
+        let pos = frame_to_bar_pos(i, frame_count, bar_width);
+        if cells[pos] != '█' {
+            cells[pos] = if i == frame_index {
+                '█'
+            } else if cached.get(i).copied().unwrap_or(false) {
+                '░'
+            } else {
+                '·'
+            };
+        }
+    }
+    // Current marker always wins a collision at its position.
+    let cur_pos = frame_to_bar_pos(frame_index, frame_count, bar_width);
+    cells[cur_pos] = '█';
+
+    // Emit grouped runs of same-style characters.
+    let style_of = |c: char| -> Style {
+        match c {
+            '█' => Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            '░' => Style::default().fg(Color::White),
+            _ => Style::default().fg(Color::DarkGray), // '·' and '─'
+        }
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut i = 0;
+    while i < bar_width {
+        let style = style_of(cells[i]);
+        let mut run = String::new();
+        while i < bar_width && style_of(cells[i]) == style {
+            run.push(cells[i]);
+            i += 1;
+        }
+        spans.push(Span::styled(run, style));
+    }
+    spans
 }
 
 fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -1428,9 +1634,38 @@ fn raster_lightning(cells: &mut [RasterCell], app: &App, bounds: Bounds, width: 
         return;
     }
 
+    // On non-live frames only show strikes that arrived near the displayed
+    // radar frame's capture time (within ±5 min).  Live mode shows all strikes.
+    let frame_ts_filter: Option<i64> = if app.playback_mode != PlaybackMode::Live {
+        app.timestamps.get(app.frame_index).copied()
+    } else {
+        None
+    };
+    let now = std::time::Instant::now();
+    let now_sys = std::time::SystemTime::now();
+    let strike_matches_frame = |arrived: &std::time::Instant| -> bool {
+        let Some(frame_ts) = frame_ts_filter else {
+            return true;
+        };
+        let age = now.duration_since(*arrived);
+        let strike_sys = now_sys.checked_sub(age).unwrap_or(now_sys);
+        let strike_unix = strike_sys
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        (strike_unix - frame_ts).abs() < 300
+    };
+    if frame_ts_filter.is_some()
+        && !app
+            .lightning_strikes
+            .iter()
+            .any(|(_, a, _)| strike_matches_frame(a))
+    {
+        return;
+    }
+
     let trail_dur_ms = u64::from(app.layers.lightning_trail_minutes) * 60_000;
     let trail_dur = std::time::Duration::from_millis(trail_dur_ms);
-    let now = std::time::Instant::now();
 
     let sub_width = u32::from(width) * 2;
     let sub_height = u32::from(height) * 4;
@@ -1462,7 +1697,12 @@ fn raster_lightning(cells: &mut [RasterCell], app: &App, bounds: Bounds, width: 
     // so the bolt shape is unambiguous.
     let mut impact_cells = vec![false; num_cells];
 
-    for (point, arrived, pol) in app.lightning_strikes.iter().rev() {
+    for (point, arrived, pol) in app
+        .lightning_strikes
+        .iter()
+        .rev()
+        .filter(|(_, a, _)| strike_matches_frame(a))
+    {
         let elapsed = now.duration_since(*arrived);
         if elapsed >= trail_dur {
             continue;
@@ -1521,7 +1761,12 @@ fn raster_lightning(cells: &mut [RasterCell], app: &App, bounds: Bounds, width: 
     let mut trail_cell_list: Vec<usize> = Vec::new();
     let mut text_cells = vec![false; num_cells];
 
-    for (point, arrived, pol) in app.lightning_strikes.iter().rev() {
+    for (point, arrived, pol) in app
+        .lightning_strikes
+        .iter()
+        .rev()
+        .filter(|(_, a, _)| strike_matches_frame(a))
+    {
         let elapsed = now.duration_since(*arrived);
         if elapsed >= trail_dur {
             continue;
@@ -2678,6 +2923,12 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" pan  "),
         Span::styled(" +/- ", Style::default().bg(Color::DarkGray)),
         Span::raw(" zoom  "),
+        Span::styled(" [/] ", Style::default().bg(Color::DarkGray)),
+        Span::raw(" frame  "),
+        Span::styled(" p ", Style::default().bg(Color::DarkGray)),
+        Span::raw(" play  "),
+        Span::styled(" 0 ", Style::default().bg(Color::DarkGray)),
+        Span::raw(" live  "),
         Span::styled(" space ", Style::default().bg(Color::DarkGray)),
         Span::raw(" toggle  "),
         Span::styled(" ? ", Style::default().bg(Color::DarkGray)),

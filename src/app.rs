@@ -64,6 +64,68 @@ pub struct BorderMaskPoint {
 /// and `ui` (frame selection).
 pub(crate) const LIGHTNING_IMPACT_MS: u32 = 900;
 
+struct RadarPreloadResult {
+    timestamp: i64,
+    tile_zoom: u8,
+    frame: RadarFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackMode {
+    /// Always displays the latest frame; auto-advances as new data arrives.
+    Live,
+    /// Holds on the current frame; no auto-advance.
+    Paused,
+    /// Steps forward through history automatically at `playback_speed`.
+    Playing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackSpeed {
+    Half,
+    Normal,
+    Double,
+    Quad,
+}
+
+impl PlaybackSpeed {
+    pub fn interval_ms(self) -> u64 {
+        match self {
+            PlaybackSpeed::Half => 2000,
+            PlaybackSpeed::Normal => 1000,
+            PlaybackSpeed::Double => 500,
+            PlaybackSpeed::Quad => 250,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaybackSpeed::Half => "½×",
+            PlaybackSpeed::Normal => "1×",
+            PlaybackSpeed::Double => "2×",
+            PlaybackSpeed::Quad => "4×",
+        }
+    }
+
+    pub fn faster(self) -> Self {
+        match self {
+            PlaybackSpeed::Half => PlaybackSpeed::Normal,
+            PlaybackSpeed::Normal => PlaybackSpeed::Double,
+            PlaybackSpeed::Double => PlaybackSpeed::Quad,
+            PlaybackSpeed::Quad => PlaybackSpeed::Quad,
+        }
+    }
+
+    pub fn slower(self) -> Self {
+        match self {
+            PlaybackSpeed::Half => PlaybackSpeed::Half,
+            PlaybackSpeed::Normal => PlaybackSpeed::Half,
+            PlaybackSpeed::Double => PlaybackSpeed::Normal,
+            PlaybackSpeed::Quad => PlaybackSpeed::Double,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub viewport: Viewport,
@@ -91,6 +153,8 @@ pub struct App {
     pub braille_frame: BrailleFrame,
     pub frame_count: u64,
     pub frame_index: usize,
+    pub playback_mode: PlaybackMode,
+    pub playback_speed: PlaybackSpeed,
     pub show_help: bool,
     /// False when the layer panel is defocused (dimmed, no selection indicators,
     /// submenu hidden).  Toggled by Alt+← from the root list; set to true by
@@ -130,6 +194,14 @@ pub struct App {
     /// tiles belong to a different frame time and the old tiles must be
     /// evicted instead of merged.
     radar_frame_ts: Option<i64>,
+    /// Rendered radar frames cached by timestamp, valid for `frame_cache_zoom`.
+    pub frame_cache: HashMap<i64, RadarFrame>,
+    /// Tile zoom the frame_cache entries were built at; cleared on change.
+    frame_cache_zoom: u8,
+    /// Single sequential background task preloading uncached radar frames.
+    radar_preload_task: Option<JoinHandle<()>>,
+    radar_preload_tx: UnboundedSender<RadarPreloadResult>,
+    radar_preload_rx: UnboundedReceiver<RadarPreloadResult>,
     maps: NaturalEarthProvider,
     meteogate: MeteoGateProvider,
     meteoalarm: MeteoAlarmProvider,
@@ -211,6 +283,7 @@ impl App {
         let (warn_tx, warn_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
+        let (radar_preload_tx, radar_preload_rx) = unbounded_channel::<RadarPreloadResult>();
         let (lightning_tx, lightning_rx) = unbounded_channel::<(WorldPoint, i8)>();
         write_log(&log, "boot: creating providers");
         let cancel = Arc::new(AtomicBool::new(false));
@@ -244,6 +317,8 @@ impl App {
             braille_frame: BrailleFrame::default(),
             frame_count: 0,
             frame_index: 0,
+            playback_mode: PlaybackMode::Live,
+            playback_speed: PlaybackSpeed::Normal,
             show_help: false,
             layer_panel_focused: false,
             location_label,
@@ -260,6 +335,11 @@ impl App {
             warn_last_attempt: None,
             radar_requested_ts: None,
             radar_frame_ts: None,
+            frame_cache: HashMap::new(),
+            frame_cache_zoom: 0,
+            radar_preload_task: None,
+            radar_preload_tx,
+            radar_preload_rx,
             dirs,
             config,
             maps,
@@ -424,8 +504,38 @@ impl App {
         let Some(ts) = self.timestamps.get(self.frame_index).copied() else {
             return;
         };
-        let bounds = self.viewport.bounds(width, height);
         let tile_zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
+
+        // Invalidate frame cache when zoom level changes.
+        if tile_zoom != self.frame_cache_zoom {
+            self.frame_cache.clear();
+            self.frame_cache_zoom = tile_zoom;
+            if let Some(task) = self.radar_preload_task.take() {
+                task.abort();
+            }
+        }
+
+        let bounds = self.viewport.bounds(width, height);
+
+        // Serve from cache when the cached frame already covers the viewport.
+        if let Some(cached) = self.frame_cache.get(&ts) {
+            if cached.covers_bounds(bounds, tile_zoom) {
+                let frame = cached.clone();
+                self.radar_frame = Some(frame);
+                self.radar_requested_ts = Some(ts);
+                self.radar_frame_ts = Some(ts);
+                self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
+                self.trigger_radar_preload();
+                return;
+            }
+        }
+
+        // Cache miss or stale coverage: abort preload to avoid grid_cache
+        // mutex contention, then proceed with normal streaming fetch.
+        if let Some(task) = self.radar_preload_task.take() {
+            task.abort();
+        }
+
         // Skip only when the current frame already covers the viewport
         // AND is for the same timestamp — coverage alone can't tell two
         // frame times apart, which used to break `[`/`]` stepping.
@@ -774,9 +884,9 @@ impl App {
             return false;
         }
         let current_ts = self.timestamps.get(self.frame_index).copied();
-        let was_latest = self.frame_index == 0;
+        let is_live = self.playback_mode == PlaybackMode::Live;
         self.timestamps = fresh;
-        self.frame_index = if was_latest {
+        self.frame_index = if is_live {
             0
         } else {
             current_ts
@@ -1076,6 +1186,44 @@ impl App {
                     }
                     self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
                     self.refresh_task = None;
+                    // If the provider resolved a different timestamp than requested,
+                    // that slot is a phantom (not yet published on S3). Remove it so
+                    // it can't masquerade as a distinct frame on the timeline.
+                    if let (Some(req_ts), Some(actual_ts)) = (
+                        self.radar_requested_ts,
+                        self.radar_frame.as_ref().map(|f| f.time),
+                    ) {
+                        if actual_ts != req_ts {
+                            let before = self.timestamps.len();
+                            self.timestamps.retain(|&t| t != req_ts);
+                            if self.timestamps.len() != before {
+                                write_log(
+                                    &self.dirs.log_path,
+                                    format!(
+                                        "meteogate: removed phantom slot {req_ts} (resolved to {actual_ts})"
+                                    ),
+                                );
+                                self.frame_index = if self.playback_mode == PlaybackMode::Live {
+                                    0
+                                } else {
+                                    self.timestamps
+                                        .iter()
+                                        .position(|&t| t == actual_ts)
+                                        .unwrap_or(0)
+                                };
+                            }
+                        }
+                    }
+                    // Cache the completed frame and kick off preload for the rest.
+                    if let Some(ts) = self.radar_requested_ts {
+                        let zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
+                        if zoom == self.frame_cache_zoom {
+                            if let Some(f) = self.radar_frame.as_ref() {
+                                self.frame_cache.insert(ts, f.clone());
+                            }
+                        }
+                    }
+                    self.trigger_radar_preload();
                 }
                 RadarRefreshPayload::Error(error) => {
                     self.layers
@@ -1187,8 +1335,15 @@ impl App {
             }
             let n = ts.len();
             changed = true;
+            let current_ts = self.timestamps.get(self.frame_index).copied();
             self.timestamps = ts;
-            self.frame_index = 0;
+            self.frame_index = if self.playback_mode == PlaybackMode::Live {
+                0
+            } else {
+                current_ts
+                    .and_then(|t| self.timestamps.iter().position(|&x| x == t))
+                    .unwrap_or(0)
+            };
             write_log(
                 &self.dirs.log_path,
                 format!("frame_list: got {n} timestamps"),
@@ -1320,6 +1475,9 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         for task in self.preload_tasks.drain(..) {
+            task.abort();
+        }
+        if let Some(task) = self.radar_preload_task.take() {
             task.abort();
         }
         if let Some(task) = self.refresh_task.take() {
@@ -1499,11 +1657,116 @@ impl App {
     pub fn next_frame(&mut self) {
         if !self.timestamps.is_empty() {
             self.frame_index = (self.frame_index + 1).min(self.timestamps.len() - 1);
+            self.playback_mode = PlaybackMode::Paused;
         }
     }
 
     pub fn previous_frame(&mut self) {
         self.frame_index = self.frame_index.saturating_sub(1);
+        // Stepping onto the newest frame re-enters live mode automatically.
+        self.playback_mode = if self.frame_index == 0 {
+            PlaybackMode::Live
+        } else {
+            PlaybackMode::Paused
+        };
+    }
+
+    /// Return to Live mode and snap to the newest frame.
+    pub fn jump_to_live(&mut self) {
+        self.playback_mode = PlaybackMode::Live;
+        self.frame_index = 0;
+    }
+
+    /// Toggle between Playing and Paused; Live transitions to Playing.
+    /// Stopping playback while on the newest frame re-enters live mode.
+    pub fn toggle_play_pause(&mut self) {
+        self.playback_mode = match self.playback_mode {
+            PlaybackMode::Live | PlaybackMode::Paused => PlaybackMode::Playing,
+            PlaybackMode::Playing => {
+                if self.frame_index == 0 {
+                    PlaybackMode::Live
+                } else {
+                    PlaybackMode::Paused
+                }
+            }
+        };
+    }
+
+    /// Advance one frame toward newer (decrement index toward 0), wrapping
+    /// from newest back to oldest so the loop repeats.  Only called by the
+    /// playback tick — does not change `playback_mode`.
+    pub fn playback_step(&mut self) {
+        if self.timestamps.is_empty() {
+            return;
+        }
+        if self.frame_index == 0 {
+            self.frame_index = self.timestamps.len() - 1;
+        } else {
+            self.frame_index -= 1;
+        }
+    }
+
+    pub fn speed_faster(&mut self) {
+        self.playback_speed = self.playback_speed.faster();
+    }
+
+    pub fn speed_slower(&mut self) {
+        self.playback_speed = self.playback_speed.slower();
+    }
+
+    /// Spawn a single sequential background task that loads all uncached
+    /// radar frames at the current viewport.  Aborts any existing preload.
+    pub fn trigger_radar_preload(&mut self) {
+        if let Some(task) = self.radar_preload_task.take() {
+            task.abort();
+        }
+        if self.timestamps.is_empty() || !self.layers.enabled(LayerId::Radar) {
+            return;
+        }
+        let zoom = self.viewport.zoom;
+        let tile_zoom = zoom.round().clamp(1.0, 7.0) as u8;
+        let bounds = self.viewport.bounds(self.map_width, self.map_height);
+        let fetch_bounds = bounds.expanded(0.5);
+        let current_ts = self.timestamps.get(self.frame_index).copied();
+        let to_load: Vec<i64> = self
+            .timestamps
+            .iter()
+            .copied()
+            .filter(|ts| !self.frame_cache.contains_key(ts) && Some(*ts) != current_ts)
+            .collect();
+        if to_load.is_empty() {
+            return;
+        }
+        let provider = self.meteogate.clone();
+        let tx = self.radar_preload_tx.clone();
+        self.radar_preload_task = Some(tokio::spawn(async move {
+            for ts in to_load {
+                if let Ok(frame) = provider.frame(ts, fetch_bounds, zoom).await {
+                    let _ = tx.send(RadarPreloadResult {
+                        timestamp: ts,
+                        tile_zoom,
+                        frame,
+                    });
+                }
+            }
+        }));
+    }
+
+    /// Drain completed preload results into `frame_cache`.
+    pub fn drain_preload_results(&mut self) -> bool {
+        let mut changed = false;
+        let current_zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
+        while let Ok(result) = self.radar_preload_rx.try_recv() {
+            if result.tile_zoom != current_zoom {
+                continue;
+            }
+            if !self.timestamps.contains(&result.timestamp) {
+                continue;
+            }
+            self.frame_cache.insert(result.timestamp, result.frame);
+            changed = true;
+        }
+        changed
     }
 
     fn merge_radar_frame(&mut self, frame: RadarFrame) {

@@ -120,8 +120,25 @@ impl MeteoGateProvider {
     }
 
     /// Discover available frame timestamps (12 frames × 5 min = 1 hour).
+    /// Return the list of available radar frame timestamps, newest first.
+    ///
+    /// Probes S3 for the current boundary slot so the caller gets the
+    /// absolute latest frame when it is already published.  Falls back to
+    /// one slot back (`latest - 300`) — the same conservative value used
+    /// by the synchronous [`compute_frame_list`] — if the boundary is not
+    /// on S3 yet.  One HEAD request at most; result is probe-cached.
     pub async fn frame_list(&self) -> Result<Vec<i64>> {
-        Ok(compute_frame_list())
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let latest = now - (now % 300);
+        let start = if self.probe_geotiff(latest).await.unwrap_or(false) {
+            latest
+        } else {
+            latest - 300
+        };
+        Ok((0..12).map(|i| start - i * 300).collect())
     }
 
     pub async fn frame(&self, timestamp: i64, bounds: Bounds, zoom: f64) -> Result<RadarFrame> {
@@ -401,13 +418,17 @@ impl MeteoGateProvider {
 /// Compute the list of expected radar frame timestamps (12 frames ×
 /// 5 min = 1 hour), newest first.  Purely local — no network traffic —
 /// so the UI can poll it cheaply to detect when a new slot opens.
+///
+/// Starts one slot back from the current 5-min boundary: the boundary
+/// itself is the still-scanning slot and is never published yet, causing
+/// the two most recent entries to resolve to the same file on S3.
 pub fn compute_frame_list() -> Vec<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let latest = now - (now % 300);
-    (0..12).map(|i| latest - i * 300).collect()
+    (0..12).map(|i| latest - 300 - i * 300).collect()
 }
 
 #[derive(Debug)]
