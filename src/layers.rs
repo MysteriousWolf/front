@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::geo::{visible_tiles, Bounds, GeoPoint, TileCoord, WorldPoint};
+use crate::geo::{tile_bounds, visible_tiles, Bounds, GeoPoint, TileCoord, WorldPoint};
 
 /// Global render modes.  Each mode can be assigned to at most one layer
 /// at a time so that different rendering techniques (braille dots,
@@ -1310,6 +1310,13 @@ impl RadarFrame {
         tiles
             .into_iter()
             .all(|coord| self.tiles.iter().any(|tile| tile.coord == coord))
+    }
+
+    /// Remove tiles whose bounds don't intersect `bounds`.  Keeps the
+    /// tile list bounded during extended panning sessions.
+    pub fn trim_to_bounds(&mut self, bounds: Bounds) {
+        self.tiles
+            .retain(|t| bounds.intersects(tile_bounds(t.coord)));
     }
 }
 

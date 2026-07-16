@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
 use color_eyre::eyre::{Result, WrapErr};
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::cache::{write_log, FrontDirs};
@@ -151,11 +153,13 @@ pub struct App {
     frame_list_tx: UnboundedSender<Vec<i64>>,
     frame_list_rx: UnboundedReceiver<Vec<i64>>,
     pub braille_frame: BrailleFrame,
+    pub render_rows: Vec<ratatui::text::Line<'static>>,
     pub frame_count: u64,
     pub frame_index: usize,
     pub playback_mode: PlaybackMode,
     pub playback_speed: PlaybackSpeed,
     pub show_help: bool,
+    pub is_dragging: bool,
     /// False when the layer panel is defocused (dimmed, no selection indicators,
     /// submenu hidden).  Toggled by Alt+← from the root list; set to true by
     /// any layer interaction.  True on startup.
@@ -272,6 +276,7 @@ impl App {
             .user_agent("front/0.1.0")
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(64)
             .build()
             .wrap_err("build HTTP client")?;
 
@@ -315,11 +320,13 @@ impl App {
             border_total_resolutions: 4,
             border_built_set: HashSet::new(),
             braille_frame: BrailleFrame::default(),
+            render_rows: Vec::new(),
             frame_count: 0,
             frame_index: 0,
             playback_mode: PlaybackMode::Live,
             playback_speed: PlaybackSpeed::Normal,
             show_help: false,
+            is_dragging: false,
             layer_panel_focused: false,
             location_label,
             location_marker,
@@ -434,69 +441,6 @@ impl App {
         Ok(app)
     }
 
-    pub async fn refresh_meteogate(&mut self, width: u16, height: u16) {
-        let log = self.dirs.log_path.clone();
-        if self.timestamps.is_empty() {
-            write_log(&log, "meteogate: fetching frame list");
-            match self.meteogate.frame_list().await {
-                Ok(ts) => {
-                    write_log(&log, format!("meteogate: got {} timestamps", ts.len()));
-                    self.frame_index = 0;
-                    self.timestamps = ts;
-                }
-                Err(error) => {
-                    write_log(&log, format!("meteogate: frame_list failed: {error}"));
-                    self.layers
-                        .set_status(LayerId::Radar, LayerStatus::Error(error.to_string()));
-                    return;
-                }
-            }
-        }
-
-        if !self.layers.enabled(LayerId::Radar) || self.timestamps.is_empty() {
-            write_log(&log, "meteogate: radar disabled or no timestamps, skipping");
-            return;
-        }
-
-        let ts = self.timestamps[self.frame_index];
-        let bounds = self.viewport.bounds(width, height);
-        let zoom = self.viewport.zoom;
-        self.layers.set_status(LayerId::Radar, LayerStatus::Loading);
-
-        write_log(
-            &log,
-            format!("meteogate: loading frame ts={ts} zoom={zoom:.1}"),
-        );
-
-        let frame_result = self.meteogate.frame(ts, bounds, zoom).await;
-
-        match &frame_result {
-            Ok(frame) => {
-                write_log(
-                    &log,
-                    format!(
-                        "meteogate: frame ready ({} tiles, {} missing)",
-                        frame.tiles.len(),
-                        frame.missing_tiles,
-                    ),
-                );
-            }
-            Err(error) => {
-                write_log(&log, format!("meteogate: frame failed: {error}"));
-            }
-        }
-        match frame_result {
-            Ok(frame) => {
-                self.merge_radar_frame(frame);
-                self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
-            }
-            Err(error) => {
-                self.layers
-                    .set_status(LayerId::Radar, LayerStatus::Error(error.to_string()));
-            }
-        }
-    }
-
     pub fn request_meteogate_refresh(&mut self, width: u16, height: u16) {
         if !self.layers.enabled(LayerId::Radar) {
             return;
@@ -520,7 +464,8 @@ impl App {
         // Serve from cache when the cached frame already covers the viewport.
         if let Some(cached) = self.frame_cache.get(&ts) {
             if cached.covers_bounds(bounds, tile_zoom) {
-                let frame = cached.clone();
+                let mut frame = cached.clone();
+                frame.trim_to_bounds(bounds);
                 self.radar_frame = Some(frame);
                 self.radar_requested_ts = Some(ts);
                 self.radar_frame_ts = Some(ts);
@@ -660,6 +605,9 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         let _ = self.border_task.take();
+        if let Some(task) = self.radar_preload_task.take() {
+            task.abort();
+        }
         let spawn_cancel = Arc::new(AtomicBool::new(false));
         self.border_spawn_cancel = Some(spawn_cancel.clone());
         self.border_fetch_resolution = Some(resolution);
@@ -759,6 +707,9 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         let _ = self.border_task.take();
+        if let Some(task) = self.radar_preload_task.take() {
+            task.abort();
+        }
         let spawn_cancel = Arc::new(AtomicBool::new(false));
         self.border_spawn_cancel = Some(spawn_cancel.clone());
         self.border_fetch_resolution = Some(desired);
@@ -1184,6 +1135,12 @@ impl App {
                             self.radar_frame = Some(frame);
                         }
                     }
+                    // Trim off-screen tiles so the tile list doesn't grow
+                    // unbounded across successive pan-triggered refreshes.
+                    if let Some(rf) = &mut self.radar_frame {
+                        let b = self.viewport.bounds(self.map_width, self.map_height);
+                        rf.trim_to_bounds(b);
+                    }
                     self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
                     self.refresh_task = None;
                     // If the provider resolved a different timestamp than requested,
@@ -1220,6 +1177,12 @@ impl App {
                         if zoom == self.frame_cache_zoom {
                             if let Some(f) = self.radar_frame.as_ref() {
                                 self.frame_cache.insert(ts, f.clone());
+                                // Evict oldest entries beyond 6 to bound memory.
+                                if self.frame_cache.len() > 6 {
+                                    let evict_ts =
+                                        self.frame_cache.keys().copied().min().unwrap_or(ts);
+                                    self.frame_cache.remove(&evict_ts);
+                                }
                             }
                         }
                     }
@@ -1714,9 +1677,21 @@ impl App {
         self.playback_speed = self.playback_speed.slower();
     }
 
-    /// Spawn a single sequential background task that loads all uncached
-    /// radar frames at the current viewport.  Aborts any existing preload.
+    /// Spawn a background task that loads all uncached radar frames at the
+    /// current viewport in parallel.  Uses a small semaphore (2) so preload
+    /// doesn't steal HTTP/CPU resources from higher-priority work (borders,
+    /// current frame, observations).  Aborts any existing preload.
     pub fn trigger_radar_preload(&mut self) {
+        // Never preload mid-drag.  `request_meteogate_refresh` runs on
+        // every mouse-move tick and, while the current frame still covers
+        // the viewport, reaches this call each time.  Aborting and
+        // relaunching the 11-frame preload pipeline every tick spawns
+        // GeoTIFF decodes that `spawn_blocking` cannot cancel, so they
+        // pile up on the blocking pool and make dragging progressively
+        // slower.  Preload resumes once the drag ends.
+        if self.is_dragging {
+            return;
+        }
         if let Some(task) = self.radar_preload_task.take() {
             task.abort();
         }
@@ -1740,15 +1715,25 @@ impl App {
         let provider = self.meteogate.clone();
         let tx = self.radar_preload_tx.clone();
         self.radar_preload_task = Some(tokio::spawn(async move {
+            const MAX_CONCURRENT_PRELOADS: usize = 2;
+            let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PRELOADS));
+            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
             for ts in to_load {
-                if let Ok(frame) = provider.frame(ts, fetch_bounds, zoom).await {
-                    let _ = tx.send(RadarPreloadResult {
-                        timestamp: ts,
-                        tile_zoom,
-                        frame,
-                    });
-                }
+                let provider = provider.clone();
+                let tx = tx.clone();
+                let sem = Arc::clone(&sem);
+                futs.push(async move {
+                    let _permit = sem.acquire().await;
+                    if let Ok(frame) = provider.frame(ts, fetch_bounds, zoom).await {
+                        let _ = tx.send(RadarPreloadResult {
+                            timestamp: ts,
+                            tile_zoom,
+                            frame,
+                        });
+                    }
+                });
             }
+            while futs.next().await.is_some() {}
         }));
     }
 

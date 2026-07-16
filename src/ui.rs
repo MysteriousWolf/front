@@ -357,7 +357,7 @@ async fn run_loop(
         {
             dirty = true;
         }
-        if !event::poll(Duration::from_millis(25))? {
+        if !event::poll(Duration::from_millis(16))? {
             continue;
         }
         let area = terminal.size()?;
@@ -366,268 +366,296 @@ async fn run_loop(
         app.map_width = map_area.width;
         app.map_height = map_area.height;
         let mut refresh = false;
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    match key.code {
-                        KeyCode::Up => {
-                            app.layer_panel_focused = true;
-                            app.layers.select_previous();
-                            dirty = true;
-                        }
-                        KeyCode::Down => {
-                            app.layer_panel_focused = true;
-                            app.layers.select_next();
-                            dirty = true;
-                        }
-                        _ => {}
-                    }
-                } else if key.modifiers.contains(KeyModifiers::ALT) {
-                    match key.code {
-                        KeyCode::Up => {
-                            app.layer_panel_focused = true;
-                            app.layers.select_previous();
-                            dirty = true;
-                        }
-                        KeyCode::Down => {
-                            app.layer_panel_focused = true;
-                            app.layers.select_next();
-                            dirty = true;
-                        }
-                        // Enhanced terminals send Alt+arrow; Terminal.app sends ESC+f/b.
-                        KeyCode::Right | KeyCode::Char('f') => {
-                            app.layer_panel_focused = true;
-                            dirty |= app.layers.enter_options();
-                        }
-                        // Alt+Left: exit options → defocus root list → refocus.
-                        KeyCode::Left | KeyCode::Char('b') => {
-                            if !app.layer_panel_focused {
-                                // Panel was defocused — refocus it.
+        let mut quit = false;
+        // Coalesce a burst of queued input events into a single render.
+        // A fast drag or scroll delivers many events per frame; processing
+        // them all before drawing (instead of one render per event) keeps
+        // interaction smooth without dropping any input — every pan delta
+        // and zoom step is still applied, just rendered once.
+        const MAX_EVENT_BATCH: u32 = 64;
+        let mut events_processed = 0u32;
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        match key.code {
+                            KeyCode::Up => {
                                 app.layer_panel_focused = true;
+                                app.layers.select_previous();
                                 dirty = true;
-                            } else if app.layers.is_in_options() {
-                                dirty |= app.layers.exit_options();
-                            } else {
-                                // Already at root list — defocus the panel.
+                            }
+                            KeyCode::Down => {
+                                app.layer_panel_focused = true;
+                                app.layers.select_next();
+                                dirty = true;
+                            }
+                            _ => {}
+                        }
+                    } else if key.modifiers.contains(KeyModifiers::ALT) {
+                        match key.code {
+                            KeyCode::Up => {
+                                app.layer_panel_focused = true;
+                                app.layers.select_previous();
+                                dirty = true;
+                            }
+                            KeyCode::Down => {
+                                app.layer_panel_focused = true;
+                                app.layers.select_next();
+                                dirty = true;
+                            }
+                            // Enhanced terminals send Alt+arrow; Terminal.app sends ESC+f/b.
+                            KeyCode::Right | KeyCode::Char('f') => {
+                                app.layer_panel_focused = true;
+                                dirty |= app.layers.enter_options();
+                            }
+                            // Alt+Left: exit options → defocus root list → refocus.
+                            KeyCode::Left | KeyCode::Char('b') => {
+                                if !app.layer_panel_focused {
+                                    // Panel was defocused — refocus it.
+                                    app.layer_panel_focused = true;
+                                    dirty = true;
+                                } else if app.layers.is_in_options() {
+                                    dirty |= app.layers.exit_options();
+                                } else {
+                                    // Already at root list — defocus the panel.
+                                    app.layer_panel_focused = false;
+                                    dirty = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                if app.show_help {
+                                    app.show_help = false;
+                                    dirty = true;
+                                } else {
+                                    app.shutdown();
+                                    quit = true;
+                                    break;
+                                }
+                            }
+                            KeyCode::Char(' ') => {
+                                app.layer_panel_focused = true;
+                                if let Some(id) = app.layers.handle_space() {
+                                    handle_layer_enable(app, id, &mut refresh);
+                                }
+                                dirty = true;
+                            }
+                            KeyCode::Char('b') => {
+                                app.layer_panel_focused = true;
+                                let id = app.layers.selected_layer();
+                                if id.is_rendered() && !id.is_observation() {
+                                    app.layers.mode_state_mut().toggle(RenderMode::Braille, id);
+                                    handle_layer_enable(app, id, &mut refresh);
+                                    dirty = true;
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                app.layer_panel_focused = true;
+                                let id = app.layers.selected_layer();
+                                if id.is_rendered() && !id.is_observation() {
+                                    app.layers.mode_state_mut().toggle(RenderMode::Color, id);
+                                    handle_layer_enable(app, id, &mut refresh);
+                                    dirty = true;
+                                }
+                            }
+                            KeyCode::Char('l') => {
+                                app.layer_panel_focused = true;
+                                let id = app.layers.selected_layer();
+                                if id.is_rendered() {
+                                    app.layers.mode_state_mut().toggle(RenderMode::Text, id);
+                                    handle_layer_enable(app, id, &mut refresh);
+                                    dirty = true;
+                                }
+                            }
+                            KeyCode::Char('m') => {
+                                app.request_border_refetch();
+                                dirty = true;
+                            }
+                            // Zoom / pan — defocus the panel so the map fills the screen.
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
                                 app.layer_panel_focused = false;
+                                app.viewport.zoom_by(0.25);
+                                refresh = true;
                                 dirty = true;
                             }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if app.show_help {
-                                app.show_help = false;
-                                dirty = true;
-                            } else {
-                                app.shutdown();
-                                break;
-                            }
-                        }
-                        KeyCode::Char(' ') => {
-                            app.layer_panel_focused = true;
-                            if let Some(id) = app.layers.handle_space() {
-                                handle_layer_enable(app, id, &mut refresh);
-                            }
-                            dirty = true;
-                        }
-                        KeyCode::Char('b') => {
-                            app.layer_panel_focused = true;
-                            let id = app.layers.selected_layer();
-                            if id.is_rendered() && !id.is_observation() {
-                                app.layers.mode_state_mut().toggle(RenderMode::Braille, id);
-                                handle_layer_enable(app, id, &mut refresh);
+                            KeyCode::Char('-') => {
+                                app.layer_panel_focused = false;
+                                app.viewport.zoom_by(-0.25);
+                                refresh = true;
                                 dirty = true;
                             }
-                        }
-                        KeyCode::Char('c') => {
-                            app.layer_panel_focused = true;
-                            let id = app.layers.selected_layer();
-                            if id.is_rendered() && !id.is_observation() {
-                                app.layers.mode_state_mut().toggle(RenderMode::Color, id);
-                                handle_layer_enable(app, id, &mut refresh);
+                            KeyCode::Left => {
+                                app.layer_panel_focused = false;
+                                app.viewport.pan(-1.0, 0.0);
+                                refresh = true;
                                 dirty = true;
                             }
-                        }
-                        KeyCode::Char('l') => {
-                            app.layer_panel_focused = true;
-                            let id = app.layers.selected_layer();
-                            if id.is_rendered() {
-                                app.layers.mode_state_mut().toggle(RenderMode::Text, id);
-                                handle_layer_enable(app, id, &mut refresh);
+                            KeyCode::Right => {
+                                app.layer_panel_focused = false;
+                                app.viewport.pan(1.0, 0.0);
+                                refresh = true;
                                 dirty = true;
                             }
+                            KeyCode::Up => {
+                                app.layer_panel_focused = false;
+                                app.viewport.pan(0.0, -1.0);
+                                refresh = true;
+                                dirty = true;
+                            }
+                            KeyCode::Down => {
+                                app.layer_panel_focused = false;
+                                app.viewport.pan(0.0, 1.0);
+                                refresh = true;
+                                dirty = true;
+                            }
+                            KeyCode::Char(']') => {
+                                app.previous_frame();
+                                refresh = true;
+                                dirty = true;
+                            }
+                            KeyCode::Char('[') => {
+                                app.next_frame();
+                                refresh = true;
+                                dirty = true;
+                            }
+                            KeyCode::Char('p') => {
+                                app.toggle_play_pause();
+                                last_playback_step = Instant::now();
+                                dirty = true;
+                            }
+                            KeyCode::Char('0') => {
+                                app.jump_to_live();
+                                app.request_meteogate_refresh(app.map_width, app.map_height);
+                                dirty = true;
+                            }
+                            KeyCode::Char('.') => {
+                                app.speed_faster();
+                                dirty = true;
+                            }
+                            KeyCode::Char(',') => {
+                                app.speed_slower();
+                                dirty = true;
+                            }
+                            KeyCode::Char('?') => {
+                                app.show_help = !app.show_help;
+                                dirty = true;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('m') => {
-                            app.request_border_refetch();
-                            dirty = true;
-                        }
-                        // Zoom / pan — defocus the panel so the map fills the screen.
-                        KeyCode::Char('+') | KeyCode::Char('=') => {
-                            app.layer_panel_focused = false;
-                            app.viewport.zoom_by(0.25);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Char('-') => {
-                            app.layer_panel_focused = false;
-                            app.viewport.zoom_by(-0.25);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Left => {
-                            app.layer_panel_focused = false;
-                            app.viewport.pan(-1.0, 0.0);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Right => {
-                            app.layer_panel_focused = false;
-                            app.viewport.pan(1.0, 0.0);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Up => {
-                            app.layer_panel_focused = false;
-                            app.viewport.pan(0.0, -1.0);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Down => {
-                            app.layer_panel_focused = false;
-                            app.viewport.pan(0.0, 1.0);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Char(']') => {
-                            app.previous_frame();
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Char('[') => {
-                            app.next_frame();
-                            refresh = true;
-                            dirty = true;
-                        }
-                        KeyCode::Char('p') => {
-                            app.toggle_play_pause();
-                            last_playback_step = Instant::now();
-                            dirty = true;
-                        }
-                        KeyCode::Char('0') => {
-                            app.jump_to_live();
-                            app.request_meteogate_refresh(app.map_width, app.map_height);
-                            dirty = true;
-                        }
-                        KeyCode::Char('.') => {
-                            app.speed_faster();
-                            dirty = true;
-                        }
-                        KeyCode::Char(',') => {
-                            app.speed_slower();
-                            dirty = true;
-                        }
-                        KeyCode::Char('?') => {
-                            app.show_help = !app.show_help;
-                            dirty = true;
-                        }
-                        _ => {}
                     }
                 }
-            }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    app.layer_panel_focused = false;
-                    let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
-                    let delta = if shift { 0.10 } else { 0.25 };
-                    if let Some((column, row)) = relative_mouse(map_area, mouse.column, mouse.row) {
-                        app.viewport.zoom_around_screen(
-                            map_area.width,
-                            map_area.height,
-                            column,
-                            row,
-                            delta,
-                        );
-                    } else {
-                        app.viewport.zoom_by(delta);
-                    }
-                    // Borders are cache-hit-fast; radar is debounced to avoid
-                    // aborting in-flight tile tasks on every scroll tick.
-                    app.request_border_refresh();
-                    pending_zoom_refresh = true;
-                    next_zoom_refresh =
-                        Some(Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS));
-                    dirty = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    app.layer_panel_focused = false;
-                    let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
-                    let delta = if shift { -0.10 } else { -0.25 };
-                    if let Some((column, row)) = relative_mouse(map_area, mouse.column, mouse.row) {
-                        app.viewport.zoom_around_screen(
-                            map_area.width,
-                            map_area.height,
-                            column,
-                            row,
-                            delta,
-                        );
-                    } else {
-                        app.viewport.zoom_by(delta);
-                    }
-                    app.request_border_refresh();
-                    pending_zoom_refresh = true;
-                    next_zoom_refresh =
-                        Some(Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS));
-                    dirty = true;
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if contains(map_area, mouse.column, mouse.row) {
-                        last_mouse = Some((mouse.column, mouse.row));
-                    }
-                }
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    app.layer_panel_focused = false;
-                    if let Some((last_col, last_row)) = last_mouse {
-                        let dx = last_col as f64 - mouse.column as f64;
-                        let dy = last_row as f64 - mouse.row as f64;
-                        app.viewport
-                            .pan_screen_delta(map_area.width, map_area.height, dx, dy);
-                        // Live-load radar tiles as you drag: the guards inside
-                        // request_meteogate_refresh skip the call when coverage
-                        // is still adequate or a task is already in-flight, so
-                        // this is cheap during small pans and only spawns a new
-                        // task when you've panned outside the pre-fetched buffer.
-                        app.request_meteogate_refresh(map_area.width, map_area.height);
-                        pending_interaction_refresh = true;
-                        next_interaction_refresh = Some(
-                            Instant::now() + Duration::from_millis(INTERACTION_REFRESH_DEBOUNCE_MS),
-                        );
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.layer_panel_focused = false;
+                        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                        let delta = if shift { 0.10 } else { 0.25 };
+                        if let Some((column, row)) =
+                            relative_mouse(map_area, mouse.column, mouse.row)
+                        {
+                            app.viewport.zoom_around_screen(
+                                map_area.width,
+                                map_area.height,
+                                column,
+                                row,
+                                delta,
+                            );
+                        } else {
+                            app.viewport.zoom_by(delta);
+                        }
+                        // Borders are cache-hit-fast; radar is debounced to avoid
+                        // aborting in-flight tile tasks on every scroll tick.
+                        app.request_border_refresh();
+                        pending_zoom_refresh = true;
+                        next_zoom_refresh =
+                            Some(Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS));
                         dirty = true;
                     }
-                    last_mouse = Some((mouse.column, mouse.row));
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    last_mouse = None;
-                    if pending_interaction_refresh {
-                        refresh = true;
-                        pending_interaction_refresh = false;
-                        next_interaction_refresh = None;
+                    MouseEventKind::ScrollDown => {
+                        app.layer_panel_focused = false;
+                        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                        let delta = if shift { -0.10 } else { -0.25 };
+                        if let Some((column, row)) =
+                            relative_mouse(map_area, mouse.column, mouse.row)
+                        {
+                            app.viewport.zoom_around_screen(
+                                map_area.width,
+                                map_area.height,
+                                column,
+                                row,
+                                delta,
+                            );
+                        } else {
+                            app.viewport.zoom_by(delta);
+                        }
+                        app.request_border_refresh();
+                        pending_zoom_refresh = true;
+                        next_zoom_refresh =
+                            Some(Instant::now() + Duration::from_millis(ZOOM_RADAR_DEBOUNCE_MS));
+                        dirty = true;
                     }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if contains(map_area, mouse.column, mouse.row) {
+                            last_mouse = Some((mouse.column, mouse.row));
+                            app.is_dragging = true;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        app.layer_panel_focused = false;
+                        if let Some((last_col, last_row)) = last_mouse {
+                            let dx = last_col as f64 - mouse.column as f64;
+                            let dy = last_row as f64 - mouse.row as f64;
+                            app.viewport
+                                .pan_screen_delta(map_area.width, map_area.height, dx, dy);
+                            // Live-load radar tiles as you drag: the guards inside
+                            // request_meteogate_refresh skip the call when coverage
+                            // is still adequate or a task is already in-flight, so
+                            // this is cheap during small pans and only spawns a new
+                            // task when you've panned outside the pre-fetched buffer.
+                            app.request_meteogate_refresh(map_area.width, map_area.height);
+                            pending_interaction_refresh = true;
+                            next_interaction_refresh = Some(
+                                Instant::now()
+                                    + Duration::from_millis(INTERACTION_REFRESH_DEBOUNCE_MS),
+                            );
+                            dirty = true;
+                        }
+                        last_mouse = Some((mouse.column, mouse.row));
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        last_mouse = None;
+                        app.is_dragging = false;
+                        dirty = true;
+                        if pending_interaction_refresh {
+                            refresh = true;
+                            pending_interaction_refresh = false;
+                            next_interaction_refresh = None;
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Resize(width, height) => {
+                    let map_area = map_rect(Rect::new(0, 0, width, height));
+                    app.request_meteogate_refresh(map_area.width, map_area.height);
+                    app.request_border_refresh();
+                    if (app.any_obs_enabled()) && !app.has_obs_task() {
+                        app.request_obs_refresh();
+                    }
+                    dirty = true;
                 }
                 _ => {}
-            },
-            Event::Resize(width, height) => {
-                let map_area = map_rect(Rect::new(0, 0, width, height));
-                app.request_meteogate_refresh(map_area.width, map_area.height);
-                app.request_border_refresh();
-                if (app.any_obs_enabled()) && !app.has_obs_task() {
-                    app.request_obs_refresh();
-                }
-                dirty = true;
             }
-            _ => {}
+            events_processed += 1;
+            // Keep draining while more input is already queued, up to a
+            // bounded batch so a continuous drag can't starve the render.
+            if quit || events_processed >= MAX_EVENT_BATCH || !event::poll(Duration::ZERO)? {
+                break;
+            }
+        }
+        if quit {
+            break;
         }
         state_dirty = true;
         if refresh {
@@ -657,60 +685,45 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 }
 
 fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let header = |t: &str| {
+        TextLine::from(Span::styled(
+            format!("  {t}"),
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        ))
+    };
+    let entry = |key: &str, desc: &str| TextLine::from(format!("    {key:<12}{desc}"));
+
     let content = vec![
         TextLine::from(Span::styled(
-            "  Help & About",
+            "  Fancy Radar ObservatioN Tool",
             Style::default().add_modifier(Modifier::BOLD),
         )),
+        TextLine::from("  European weather radar in your terminal"),
         TextLine::from(""),
-        TextLine::from(Span::styled(
-            "  Keyboard",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        TextLine::from("    q / Esc    Quit"),
-        TextLine::from("    ?          Toggle this help"),
-        TextLine::from("    arrows     Pan map"),
-        TextLine::from("    + / -      Zoom in / out"),
-        TextLine::from("    [ / ]      Step to older / newer frame (enters pause)"),
-        TextLine::from("    p          Play / pause timeline"),
-        TextLine::from("    0          Return to live (latest frame)"),
-        TextLine::from("    , / .      Playback speed slower / faster"),
-        TextLine::from("    space      Toggle layer / enable best render mode"),
-        TextLine::from("    b / c / l  Toggle braille / color / text render mode"),
-        TextLine::from("    ⇧↑ / ⇧↓   Select previous / next layer"),
-        TextLine::from("    Alt+↑/↓   Select previous / next layer"),
-        TextLine::from("    Alt+→/←   Enter / exit layer group"),
-        TextLine::from("    m          Refetch map data (clear cache)"),
+        header("Navigation"),
+        entry("arrows", "Pan map"),
+        entry("drag", "Pan map"),
+        entry("scroll", "Zoom in/out"),
+        entry("+ / -", "Zoom in/out"),
         TextLine::from(""),
-        TextLine::from(Span::styled(
-            "  Files",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        TextLine::from("    config     ~/.config/front/config.toml"),
-        TextLine::from("    state      ~/.config/front/state.toml"),
-        TextLine::from("    map cache  ~/.cache/front/maps/"),
-        TextLine::from("    logs       ~/.cache/front/front.log"),
+        header("Timeline"),
+        entry("[ / ]", "Step frame back/forward"),
+        entry("p", "Play/pause"),
+        entry("0", "Jump to live"),
+        entry(", / .", "Playback speed"),
         TextLine::from(""),
-        TextLine::from(Span::styled(
-            "  Mouse",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        TextLine::from("    scroll     Zoom in / out"),
-        TextLine::from("    drag       Pan map"),
+        header("Layers"),
+        entry("space", "Toggle layer"),
+        entry("b / c / l", "Braille/color/text mode"),
+        entry("Shift+↑/↓", "Select layer"),
+        entry("Alt+←/→", "Navigate layer group"),
         TextLine::from(""),
-        TextLine::from(Span::styled(
-            "  Data Sources",
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )),
-        TextLine::from("    Country borders: Natural Earth Data (public domain)"),
-        TextLine::from("    Region borders:  Natural Earth Data (public domain)"),
-        TextLine::from("    Roads:           Natural Earth Data (public domain)"),
-        TextLine::from("    Radar:           MeteoGate (meteogate.org)"),
-        TextLine::from("    Lightning:       Blitzortung.org (opt-in, no API key needed)"),
-        TextLine::from("    Projection:      Web Mercator (EPSG:3857)"),
+        header("Other"),
+        entry("?", "Toggle help"),
+        entry("q / Esc", "Quit"),
+        entry("m", "Refetch map data"),
         TextLine::from(""),
-        TextLine::from("    Built with Rust, ratatui, and lots of coffee."),
-        TextLine::from("    Press q, Esc, or ? to close."),
+        TextLine::from("  Press ? or Esc to close."),
     ];
 
     let block = Block::default()
@@ -956,18 +969,22 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
     // If pan exceeded 50 % of the viewport, invalidate so the next
     // call to `get_or_compute_border_mask` does a full recompute.
-    if let Some((_, mask)) = app.border_mask_cache.as_ref() {
-        let (dx_sub, dy_sub) = subcell_offset(
-            app.viewport.center,
-            mask.center,
-            &bounds,
-            sub_width,
-            sub_height,
-        );
-        let max_dx = (sub_width as f64 * 0.5) as i32;
-        let max_dy = (sub_height as f64 * 0.5) as i32;
-        if dx_sub.abs() > max_dx || dy_sub.abs() > max_dy {
-            app.border_mask_cache = None;
+    // Skip this during active drag — the offset-shifted mask is good
+    // enough and recompute would cause visible lag/stutter.
+    if !app.is_dragging {
+        if let Some((_, mask)) = app.border_mask_cache.as_ref() {
+            let (dx_sub, dy_sub) = subcell_offset(
+                app.viewport.center,
+                mask.center,
+                &bounds,
+                sub_width,
+                sub_height,
+            );
+            let max_dx = (sub_width as f64 * 0.5) as i32;
+            let max_dy = (sub_height as f64 * 0.5) as i32;
+            if dx_sub.abs() > max_dx || dy_sub.abs() > max_dy {
+                app.border_mask_cache = None;
+            }
         }
     }
 
@@ -1014,18 +1031,23 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         })
         .unwrap_or((0, 0));
     let mut braille_frame = std::mem::take(&mut app.braille_frame);
-    let rows = raster_map_rows(
+    let mut render_rows = std::mem::take(&mut app.render_rows);
+    raster_map_rows(
         app,
         bounds,
         area.width,
         area.height,
         offset,
         &mut braille_frame,
+        &mut render_rows,
     );
     app.braille_frame = braille_frame;
-    frame.render_widget(Paragraph::new(rows), area);
-    render_layer_list(frame, area, app);
-    render_task_queue(frame, area, app);
+    frame.render_widget(Paragraph::new(&render_rows[..]), area);
+    app.render_rows = render_rows;
+    if !app.is_dragging {
+        render_layer_list(frame, area, app);
+        render_task_queue(frame, area, app);
+    }
 }
 
 fn get_or_compute_border_mask(
@@ -1282,7 +1304,8 @@ fn raster_map_rows(
     height: u16,
     mask_offset: (i32, i32),
     braille_frame: &mut BrailleFrame,
-) -> Vec<TextLine<'static>> {
+    render_rows: &mut Vec<TextLine<'static>>,
+) {
     let width = width.max(1);
     let height = height.max(1);
     braille_frame.reset(width, height);
@@ -1293,18 +1316,29 @@ fn raster_map_rows(
     // coincident road or region line.
     if let Some((_, mask)) = &app.border_mask_cache {
         let (dx, dy) = mask_offset;
-        for kind in [
-            BorderLineKind::Region,
-            BorderLineKind::Road,
-            BorderLineKind::Country,
-        ] {
-            for mark in &mask.marks {
-                if mark.kind != kind {
-                    continue;
-                }
-                let sx = (mark.sx as i32 + dx).max(0) as u32;
-                let sy = (mark.sy as i32 + dy).max(0) as u32;
-                set_subcell(cells, width, sx, sy, border_line_color(mark.kind), 1);
+        let w_usize = usize::from(width);
+        let cells_len = cells.len();
+        for mark in &mask.marks {
+            let sx = mark.sx as i32 + dx;
+            let sy = mark.sy as i32 + dy;
+            if sx < 0 || sy < 0 {
+                continue;
+            }
+            let sx = sx as u32;
+            let sy = sy as u32;
+            let cell_x = (sx / 2) as usize;
+            let cell_y = (sy / 4) as usize;
+            let idx = cell_y * w_usize + cell_x;
+            if idx >= cells_len {
+                continue;
+            }
+            let cell = &mut cells[idx];
+            let bit = braille_bit(sx % 2, sy % 4);
+            cell.bits |= bit;
+            let color = border_line_color(mark.kind);
+            if mark.kind == BorderLineKind::Country || cell.intensity == 0 {
+                cell.color = Some(color);
+                cell.intensity = 1;
             }
         }
     }
@@ -1346,7 +1380,7 @@ fn raster_map_rows(
         }
     }
 
-    raster_rows(braille_frame.cells(), width, height)
+    raster_rows_into(braille_frame.cells(), width, height, render_rows);
 }
 
 fn desired_border_resolution(app: &App) -> BorderResolution {
@@ -1383,53 +1417,167 @@ fn raster_radar(
 
     let sub_width = u32::from(width) * 2;
     let sub_height = u32::from(height) * 4;
+    let cells_len = cells.len();
+    let w_usize = usize::from(width);
 
+    let sx_scale = sub_width as f64 / bounds.width().max(f64::EPSILON);
+    let sy_scale = sub_height as f64 / bounds.height().max(f64::EPSILON);
+    let min_x = bounds.min_x;
+    let min_y = bounds.min_y;
+
+    // Color-only fast path: one bg write per terminal cell.  Skips
+    // braille bit computation and coalesces radar rows that map to the
+    // same terminal cell row (4 subcell rows per cell).
+    if in_color && !in_braille && !in_text {
+        for tile in &radar.tiles {
+            let tb = tile_bounds(tile.coord);
+            if !bounds.intersects(tb) {
+                continue;
+            }
+            let tile_world_width = tb.max_x - tb.min_x;
+            let tile_world_height = tb.max_y - tb.min_y;
+            let inv_size = 1.0 / f64::from(tile.size);
+            let tile_rows = &tile.rows;
+
+            let mut row_idx = 0usize;
+            while row_idx < tile_rows.len() {
+                let world_y_start = tb.min_y + row_idx as f64 * inv_size * tile_world_height;
+                let start_sy = ((world_y_start - min_y) * sy_scale).floor() as i32;
+                let start_cell_y = (start_sy.clamp(0, sub_height as i32) as u32 / 4) as usize;
+
+                // Find the last radar row that maps to the same cell row.
+                let mut end_idx = row_idx;
+                while end_idx + 1 < tile_rows.len() {
+                    let ny = tb.min_y + (end_idx + 2) as f64 * inv_size * tile_world_height;
+                    let next_sy = ((ny - min_y) * sy_scale).floor() as i32;
+                    let next_cell_y = (next_sy.clamp(0, sub_height as i32) as u32 / 4) as usize;
+                    if next_cell_y != start_cell_y {
+                        break;
+                    }
+                    end_idx += 1;
+                }
+
+                let runs = &tile_rows[end_idx];
+                for run in runs {
+                    let world_x_start =
+                        tb.min_x + f64::from(run.start_x) * inv_size * tile_world_width;
+                    let world_x_end = tb.min_x + f64::from(run.end_x) * inv_size * tile_world_width;
+                    let start_sx = ((world_x_start - min_x) * sx_scale).floor() as i32;
+                    let end_sx = ((world_x_end - min_x) * sx_scale).ceil() as i32;
+                    let start_sx = start_sx.clamp(0, sub_width as i32) as u32;
+                    let end_sx = end_sx.clamp(0, sub_width as i32) as u32;
+                    if start_sx >= end_sx {
+                        continue;
+                    }
+
+                    let color = run.color;
+                    let start_cell_x = (start_sx / 2) as usize;
+                    let end_cell_x = ((end_sx - 1) / 2) as usize + 1;
+                    let row_base = start_cell_y * w_usize;
+                    for cx in start_cell_x..end_cell_x {
+                        let idx = row_base + cx;
+                        if idx < cells_len {
+                            cells[idx].bg = Some(color);
+                        }
+                    }
+                }
+
+                row_idx = end_idx + 1;
+            }
+        }
+        return;
+    }
+
+    // Full path: braille + optional color/text overlays.
     for tile in &radar.tiles {
         let tb = tile_bounds(tile.coord);
-        let tile_world_width = tb.max_x - tb.min_x;
-        let tile_world_height = tb.max_y - tb.min_y;
-
         if !bounds.intersects(tb) {
             continue;
         }
 
+        let tile_world_width = tb.max_x - tb.min_x;
+        let tile_world_height = tb.max_y - tb.min_y;
+        let inv_size = 1.0 / f64::from(tile.size);
+
         for (row_index, runs) in tile.rows.iter().enumerate() {
-            let world_y_start =
-                tb.min_y + row_index as f64 / f64::from(tile.size) * tile_world_height;
-            let world_y_end =
-                tb.min_y + (row_index + 1) as f64 / f64::from(tile.size) * tile_world_height;
-            let start_sy =
-                world_to_subcell_start(world_y_start, bounds.min_y, bounds.height(), sub_height);
-            let end_sy =
-                world_to_subcell_end(world_y_end, bounds.min_y, bounds.height(), sub_height);
+            let world_y_start = tb.min_y + row_index as f64 * inv_size * tile_world_height;
+            let world_y_end = tb.min_y + (row_index + 1) as f64 * inv_size * tile_world_height;
+
+            let start_sy = ((world_y_start - min_y) * sy_scale).floor() as i32;
+            let end_sy = ((world_y_end - min_y) * sy_scale).ceil() as i32;
+            let start_sy = start_sy.clamp(0, sub_height as i32) as u32;
+            let end_sy = end_sy.clamp(0, sub_height as i32) as u32;
             if start_sy >= end_sy {
                 continue;
             }
 
             for run in runs {
-                let world_x_start =
-                    tb.min_x + f64::from(run.start_x) / f64::from(tile.size) * tile_world_width;
-                let world_x_end =
-                    tb.min_x + f64::from(run.end_x) / f64::from(tile.size) * tile_world_width;
-                let start_sx =
-                    world_to_subcell_start(world_x_start, bounds.min_x, bounds.width(), sub_width);
-                let end_sx =
-                    world_to_subcell_end(world_x_end, bounds.min_x, bounds.width(), sub_width);
+                let world_x_start = tb.min_x + f64::from(run.start_x) * inv_size * tile_world_width;
+                let world_x_end = tb.min_x + f64::from(run.end_x) * inv_size * tile_world_width;
+
+                let start_sx = ((world_x_start - min_x) * sx_scale).floor() as i32;
+                let end_sx = ((world_x_end - min_x) * sx_scale).ceil() as i32;
+                let start_sx = start_sx.clamp(0, sub_width as i32) as u32;
+                let end_sx = end_sx.clamp(0, sub_width as i32) as u32;
                 if start_sx >= end_sx {
                     continue;
                 }
 
-                for sy in start_sy..end_sy {
-                    for sx in start_sx..end_sx {
+                let color = run.color;
+                let intensity = run.intensity;
+
+                // Iterate terminal cells, not subcells: a run spans up to
+                // 8 subcells per cell, so accumulating the braille bits per
+                // cell (rather than one write per dot) cuts the inner loop
+                // ~8× while producing byte-identical output.
+                let glyph = in_text.then(|| radar_glyph(intensity));
+                let cy_start = (start_sy / 4) as usize;
+                let cy_end = ((end_sy - 1) / 4) as usize;
+                let cx_start = (start_sx / 2) as usize;
+                let cx_end = ((end_sx - 1) / 2) as usize;
+
+                for cy in cy_start..=cy_end {
+                    // Braille bit masks for the left/right columns, ORed
+                    // over this cell's covered sub-rows.
+                    let (mut col0, mut col1) = (0u8, 0u8);
+                    if in_braille {
+                        let cell_sy0 = cy as u32 * 4;
+                        let sy_lo = start_sy.max(cell_sy0);
+                        let sy_hi = end_sy.min(cell_sy0 + 4);
+                        for sy in sy_lo..sy_hi {
+                            let r = sy & 3;
+                            col0 |= braille_bit(0, r);
+                            col1 |= braille_bit(1, r);
+                        }
+                    }
+                    let row_base = cy * w_usize;
+                    for cx in cx_start..=cx_end {
+                        let idx = row_base + cx;
+                        if idx >= cells_len {
+                            continue;
+                        }
+                        let cell = &mut cells[idx];
                         if in_braille {
-                            set_subcell(cells, width, sx, sy, run.color, run.intensity);
+                            let cell_sx0 = cx as u32 * 2;
+                            let mut bits = 0u8;
+                            if cell_sx0 >= start_sx && cell_sx0 < end_sx {
+                                bits |= col0;
+                            }
+                            if cell_sx0 + 1 >= start_sx && cell_sx0 + 1 < end_sx {
+                                bits |= col1;
+                            }
+                            cell.bits |= bits;
+                            if intensity >= cell.intensity {
+                                cell.color = Some(color);
+                                cell.intensity = intensity;
+                            }
                         }
                         if in_color {
-                            set_subcell_bg(cells, width, sx, sy, run.color);
+                            cell.bg = Some(color);
                         }
                         if in_text {
-                            let glyph = radar_glyph(run.intensity);
-                            set_subcell_glyph(cells, width, sx, sy, glyph, run.color);
+                            cell.glyph = glyph;
+                            cell.color = Some(color);
                         }
                     }
                 }
@@ -1919,7 +2067,9 @@ fn raster_observations(
         }
         return;
     }
-    let obs = app.obs_cache.as_ref().unwrap();
+    let Some(obs) = app.obs_cache.as_ref() else {
+        return;
+    };
 
     let sub_width = u32::from(width) * 2;
     let sub_height = u32::from(height) * 4;
@@ -2254,14 +2404,21 @@ fn braille_bit(x: u32, y: u32) -> u8 {
     }
 }
 
-fn raster_rows(cells: &[RasterCell], width: u16, height: u16) -> Vec<TextLine<'static>> {
-    let mut rows = Vec::with_capacity(usize::from(height));
+fn raster_rows_into(
+    cells: &[RasterCell],
+    width: u16,
+    height: u16,
+    out: &mut Vec<TextLine<'static>>,
+) {
+    out.clear();
+    out.reserve(usize::from(height));
+    let w = usize::from(width);
     for y in 0..height {
-        let mut spans = Vec::new();
-        let mut text = String::new();
+        let mut spans: Vec<Span> = Vec::with_capacity(4);
+        let mut text = String::with_capacity(w);
         let mut style = Style::default();
-        for x in 0..width {
-            let cell = cells[usize::from(y) * usize::from(width) + usize::from(x)];
+        let row = &cells[y as usize * w..y as usize * w + w];
+        for cell in row {
             let packed = cell.packed();
             let next_style = match packed.fg {
                 Some(fg) => Style::default().fg(to_terminal_color(fg)),
@@ -2281,9 +2438,8 @@ fn raster_rows(cells: &[RasterCell], width: u16, height: u16) -> Vec<TextLine<'s
         if !text.is_empty() {
             spans.push(Span::styled(text, style));
         }
-        rows.push(TextLine::from(spans));
+        out.push(TextLine::from(spans));
     }
-    rows
 }
 
 fn raster_glyph(cell: PackedBrailleCell) -> char {
@@ -2421,18 +2577,6 @@ fn subcell_offset(
 
 fn world_to_subcell_axis(world: f64, min: f64, span: f64, size: u32) -> i32 {
     ((world - min) / span.max(f64::EPSILON) * f64::from(size)).floor() as i32
-}
-
-fn world_to_subcell_start(world: f64, min: f64, span: f64, size: u32) -> u32 {
-    world_to_subcell_axis(world, min, span, size)
-        .max(0)
-        .min(size as i32) as u32
-}
-
-fn world_to_subcell_end(world: f64, min: f64, span: f64, size: u32) -> u32 {
-    (((world - min) / span.max(f64::EPSILON) * f64::from(size)).ceil() as i32)
-        .max(0)
-        .min(size as i32) as u32
 }
 
 fn clipped_segment(
@@ -3088,6 +3232,7 @@ fn braille_bar(fraction: f64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layers::{RadarRun, RadarTile};
 
     #[test]
     fn clips_segments_that_cross_viewport_edges() {
@@ -3408,7 +3553,8 @@ mod tests {
         cells[5].bits |= 0x80 | 0x40; // top-right and top-left in second column
         cells[5].color = Some(Rgb8::RED);
 
-        let rows = raster_rows(&cells, 3, 2);
+        let mut rows = Vec::new();
+        raster_rows_into(&cells, 3, 2, &mut rows);
         assert_eq!(rows.len(), 2);
         for row in &rows {
             assert!(!row.spans.is_empty());
@@ -3461,5 +3607,275 @@ mod tests {
                 "kmpc={kmpc} ideal={ideal_seg}: label={label_km} actual={actual_seg_km} ratio={ratio:.2}"
             );
         }
+    }
+
+    fn synthetic_radar_frame(z: u8, bounds: Bounds) -> RadarFrame {
+        use crate::geo::visible_tiles;
+        let tiles_coords = visible_tiles(bounds, z);
+        let mut tiles = Vec::with_capacity(tiles_coords.len());
+        for coord in tiles_coords {
+            let size = 256u32;
+            let mut rows = Vec::with_capacity(size as usize);
+            for _ in 0..size {
+                let row = vec![RadarRun {
+                    start_x: 0,
+                    end_x: size as u16,
+                    color: Rgb8::new(180, 80, 160),
+                    intensity: 3,
+                }];
+                rows.push(row);
+            }
+            tiles.push(RadarTile { coord, size, rows });
+        }
+        RadarFrame {
+            time: 0,
+            path: String::new(),
+            tiles,
+            missing_tiles: 0,
+            target_zoom: z,
+        }
+    }
+
+    #[test]
+    fn bench_raster_radar_color_mode() {
+        let width = 120u16;
+        let height = 50u16;
+        let z = 5u8;
+        let bounds = Bounds {
+            min_x: 0.35,
+            max_x: 0.55,
+            min_y: 0.30,
+            max_y: 0.70,
+        };
+        let radar = synthetic_radar_frame(z, bounds);
+        let modes = RenderModeState {
+            braille: None,
+            braille_overlay: None,
+            color: Some(LayerId::Radar),
+            text: None,
+        };
+        let cell_count = usize::from(width) * usize::from(height);
+        let mut cells = vec![RasterCell::default(); cell_count];
+
+        let iters = 500;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for c in &mut cells {
+                c.clear();
+            }
+            raster_radar(&mut cells, &radar, bounds, width, height, &modes);
+        }
+        let elapsed = t0.elapsed();
+        let per_frame_us = elapsed.as_micros() / iters;
+        let per_frame_ms = per_frame_us as f64 / 1000.0;
+        eprintln!(
+            "bench: color mode — {iters} frames in {elapsed:?} = {per_frame_ms:.3} ms/frame ({:.0} fps max)",
+            1000.0 / per_frame_ms
+        );
+        assert!(
+            per_frame_ms < 10.0,
+            "color mode should render in <10ms, got {per_frame_ms}ms"
+        );
+    }
+
+    #[test]
+    fn bench_raster_radar_braille_mode() {
+        let width = 120u16;
+        let height = 50u16;
+        let z = 5u8;
+        let bounds = Bounds {
+            min_x: 0.35,
+            max_x: 0.55,
+            min_y: 0.30,
+            max_y: 0.70,
+        };
+        let radar = synthetic_radar_frame(z, bounds);
+        let modes = RenderModeState {
+            braille: Some(LayerId::Radar),
+            braille_overlay: None,
+            color: None,
+            text: None,
+        };
+        let cell_count = usize::from(width) * usize::from(height);
+        let mut cells = vec![RasterCell::default(); cell_count];
+
+        let iters = 500;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for c in &mut cells {
+                c.clear();
+            }
+            raster_radar(&mut cells, &radar, bounds, width, height, &modes);
+        }
+        let elapsed = t0.elapsed();
+        let per_frame_us = elapsed.as_micros() / iters;
+        let per_frame_ms = per_frame_us as f64 / 1000.0;
+        eprintln!(
+            "bench: braille mode — {iters} frames in {elapsed:?} = {per_frame_ms:.3} ms/frame ({:.0} fps max)",
+            1000.0 / per_frame_ms
+        );
+        assert!(
+            per_frame_ms < 20.0,
+            "braille mode should render in <20ms, got {per_frame_ms}ms"
+        );
+    }
+
+    /// Naive per-subcell reference rasteriser, used only to prove the
+    /// optimised per-cell path in `raster_radar` produces identical output.
+    fn raster_radar_reference(
+        cells: &mut [RasterCell],
+        radar: &RadarFrame,
+        bounds: Bounds,
+        width: u16,
+        height: u16,
+        modes: &RenderModeState,
+    ) {
+        let id = LayerId::Radar;
+        let in_braille = modes.has(RenderMode::Braille, id);
+        let in_color = modes.has(RenderMode::Color, id);
+        let in_text = modes.has(RenderMode::Text, id);
+        let sub_width = u32::from(width) * 2;
+        let sub_height = u32::from(height) * 4;
+        let cells_len = cells.len();
+        let w_usize = usize::from(width);
+        let sx_scale = sub_width as f64 / bounds.width().max(f64::EPSILON);
+        let sy_scale = sub_height as f64 / bounds.height().max(f64::EPSILON);
+        for tile in &radar.tiles {
+            let tb = tile_bounds(tile.coord);
+            if !bounds.intersects(tb) {
+                continue;
+            }
+            let tww = tb.max_x - tb.min_x;
+            let twh = tb.max_y - tb.min_y;
+            let inv = 1.0 / f64::from(tile.size);
+            for (row_index, runs) in tile.rows.iter().enumerate() {
+                let wy0 = tb.min_y + row_index as f64 * inv * twh;
+                let wy1 = tb.min_y + (row_index + 1) as f64 * inv * twh;
+                let start_sy = (((wy0 - bounds.min_y) * sy_scale).floor() as i32)
+                    .clamp(0, sub_height as i32) as u32;
+                let end_sy = (((wy1 - bounds.min_y) * sy_scale).ceil() as i32)
+                    .clamp(0, sub_height as i32) as u32;
+                if start_sy >= end_sy {
+                    continue;
+                }
+                for run in runs {
+                    let wx0 = tb.min_x + f64::from(run.start_x) * inv * tww;
+                    let wx1 = tb.min_x + f64::from(run.end_x) * inv * tww;
+                    let start_sx = (((wx0 - bounds.min_x) * sx_scale).floor() as i32)
+                        .clamp(0, sub_width as i32) as u32;
+                    let end_sx = (((wx1 - bounds.min_x) * sx_scale).ceil() as i32)
+                        .clamp(0, sub_width as i32) as u32;
+                    if start_sx >= end_sx {
+                        continue;
+                    }
+                    for sy in start_sy..end_sy {
+                        let cell_y = (sy / 4) as usize;
+                        let sub_y = sy % 4;
+                        let row_base = cell_y * w_usize;
+                        for sx in start_sx..end_sx {
+                            let idx = row_base + (sx / 2) as usize;
+                            if idx >= cells_len {
+                                continue;
+                            }
+                            let cell = &mut cells[idx];
+                            if in_braille {
+                                cell.bits |= braille_bit(sx % 2, sub_y);
+                                if run.intensity >= cell.intensity {
+                                    cell.color = Some(run.color);
+                                    cell.intensity = run.intensity;
+                                }
+                            }
+                            if in_color {
+                                cell.bg = Some(run.color);
+                            }
+                            if in_text {
+                                cell.glyph = Some(radar_glyph(run.intensity));
+                                cell.color = Some(run.color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raster_radar_matches_reference_all_modes() {
+        let (width, height) = (120u16, 50u16);
+        let bounds = Bounds {
+            min_x: 0.35,
+            max_x: 0.55,
+            min_y: 0.30,
+            max_y: 0.70,
+        };
+        let radar = synthetic_radar_frame(5, bounds);
+        let n = usize::from(width) * usize::from(height);
+        let mode = |b: bool, c: bool, t: bool| RenderModeState {
+            braille: b.then_some(LayerId::Radar),
+            braille_overlay: None,
+            color: c.then_some(LayerId::Radar),
+            text: t.then_some(LayerId::Radar),
+        };
+        // braille, color, text, and braille+color / braille+text overlays.
+        for (b, c, t) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let modes = mode(b, c, t);
+            let mut got = vec![RasterCell::default(); n];
+            let mut want = vec![RasterCell::default(); n];
+            raster_radar(&mut got, &radar, bounds, width, height, &modes);
+            raster_radar_reference(&mut want, &radar, bounds, width, height, &modes);
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.packed(),
+                    w.packed(),
+                    "cell {i} packed mismatch (b={b} c={c} t={t})"
+                );
+                assert_eq!(
+                    g.intensity, w.intensity,
+                    "cell {i} intensity mismatch (b={b} c={c} t={t})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bench_raster_rows_into() {
+        let width = 120u16;
+        let height = 50u16;
+        let cell_count = usize::from(width) * usize::from(height);
+        let cells = vec![
+            RasterCell {
+                bits: 0x55,
+                color: Some(Rgb8::new(180, 80, 160)),
+                intensity: 3,
+                glyph: None,
+                bg: None,
+                modifier: Modifier::empty(),
+            };
+            cell_count
+        ];
+        let mut out = Vec::new();
+
+        let iters = 500;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            raster_rows_into(&cells, width, height, &mut out);
+        }
+        let elapsed = t0.elapsed();
+        let per_frame_us = elapsed.as_micros() / iters;
+        let per_frame_ms = per_frame_us as f64 / 1000.0;
+        eprintln!(
+            "bench: raster_rows_into — {iters} frames in {elapsed:?} = {per_frame_ms:.3} ms/frame ({:.0} fps max)",
+            1000.0 / per_frame_ms
+        );
+        assert!(
+            per_frame_ms < 5.0,
+            "raster_rows should complete in <5ms, got {per_frame_ms}ms"
+        );
     }
 }

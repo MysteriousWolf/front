@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Datelike;
 use color_eyre::eyre::{Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use tiff::decoder::{ifd, Decoder, DecodingResult};
 use tiff::tags::Tag;
@@ -33,8 +34,18 @@ const LAEA_FALSE_N: f64 = -2_100_000.0;
 /// Minimum dBZ value (≈ 1 dBZ). Values below this are noise/undetect.
 const MIN_DBZ: f32 = 1.0;
 
-/// Shared in-memory cache for the decoded radar grid.
-type GridCache = Arc<tokio::sync::Mutex<Option<(i64, Arc<RadarGrid>)>>>;
+/// Shared in-memory cache for decoded radar grids, keyed by timestamp.
+///
+/// Grids are large (~63 MB each) but decoding one from the raw GeoTIFF
+/// is expensive (tens of ms), so a small LRU keeps the handful of frames
+/// touched during interaction (the current frame plus a couple being
+/// preloaded) resident instead of re-decoding them on every pan/zoom.
+type GridCache = Arc<tokio::sync::Mutex<Vec<(i64, Arc<RadarGrid>)>>>;
+
+/// Maximum number of decoded grids held in memory at once.  Sized to
+/// cover the interactive frame plus the two concurrent preload slots so
+/// none of them evicts the frame the user is actively viewing.
+const MAX_CACHED_GRIDS: usize = 3;
 
 /// How long a negative HEAD result ("object not on S3 yet") is cached
 /// before the slot is probed again.
@@ -87,7 +98,7 @@ impl MeteoGateProvider {
             client,
             dirs,
             config,
-            grid_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            grid_cache: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             probe_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cancel,
         }
@@ -157,11 +168,17 @@ impl MeteoGateProvider {
     /// `Arc` shares storage with the cache; cloning is cheap.
     async fn load_grid(&self, timestamp: i64) -> Result<Arc<RadarGrid>> {
         let log = &self.dirs.log_path;
-        let mut cache = self.grid_cache.lock().await;
-        if let Some((ts, cached)) = cache.as_ref() {
-            if *ts == timestamp {
-                write_log(log, format!("meteogate: grid cache hit ts={ts}"));
-                return Ok(Arc::clone(cached));
+        // Fast path: check the LRU without holding the lock during I/O.
+        {
+            let mut cache = self.grid_cache.lock().await;
+            if let Some(pos) = cache.iter().position(|(ts, _)| *ts == timestamp) {
+                // Bump to most-recently-used so the frame the user is
+                // viewing isn't evicted by concurrent preloads.
+                let entry = cache.remove(pos);
+                let g = Arc::clone(&entry.1);
+                cache.push(entry);
+                write_log(log, format!("meteogate: grid cache hit ts={timestamp}"));
+                return Ok(g);
             }
         }
         write_log(log, format!("meteogate: fetching geotiff ts={timestamp}"));
@@ -170,9 +187,22 @@ impl MeteoGateProvider {
             log,
             format!("meteogate: got {} bytes, parsing", bytes.len()),
         );
-        let g = Arc::new(parse_geotiff(&bytes)?);
+        let g = Arc::new(
+            tokio::task::spawn_blocking(move || parse_geotiff(&bytes))
+                .await
+                .wrap_err("parse_geotiff task panicked")??,
+        );
         write_log(log, "meteogate: grid parsed OK");
-        *cache = Some((timestamp, Arc::clone(&g)));
+        let mut cache = self.grid_cache.lock().await;
+        // A concurrent caller may have decoded the same grid while we were
+        // parsing; keep a single entry per timestamp.
+        if let Some(pos) = cache.iter().position(|(ts, _)| *ts == timestamp) {
+            cache.remove(pos);
+        }
+        cache.push((timestamp, Arc::clone(&g)));
+        while cache.len() > MAX_CACHED_GRIDS {
+            cache.remove(0);
+        }
         Ok(g)
     }
 
@@ -205,7 +235,7 @@ impl MeteoGateProvider {
     }
 
     /// Maximum concurrent tile build tasks.
-    const MAX_CONCURRENT_TILES: usize = 8;
+    const MAX_CONCURRENT_TILES: usize = 16;
 
     /// Shared implementation for [`frame`] and [`frame_streamed`].
     ///
@@ -389,9 +419,23 @@ impl MeteoGateProvider {
 
     async fn resolve_nearest_available(&self, timestamp: i64) -> Result<i64> {
         let log = &self.dirs.log_path;
-        for offset in (0..=30).step_by(5) {
-            let ts = timestamp - offset * 60;
-            if self.probe_geotiff(ts).await? {
+        let candidates: Vec<i64> = (0..=30).step_by(5).map(|o| timestamp - o * 60).collect();
+
+        // Fire all probes concurrently; the nearest existing timestamp
+        // wins.  This replaces 7 sequential 3-second HEAD requests
+        // (worst case 21s) with a single round of parallel probes.
+        let mut futs: FuturesUnordered<_> = candidates
+            .iter()
+            .map(|&ts| async move {
+                match self.probe_geotiff(ts).await {
+                    Ok(true) => Some(ts),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        while let Some(result) = futs.next().await {
+            if let Some(ts) = result {
                 write_log(
                     log,
                     format!("meteogate: resolved ts={timestamp} -> nearest={ts}"),

@@ -4,14 +4,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Duration as ChronoDuration, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde_json::{self, Value};
+use tokio::sync::Semaphore;
 
 use crate::cache::{read_if_exists, write_atomic, write_log, FrontDirs};
 use crate::config::EumetnetConfig;
 use crate::geo::{
     lat_lon_to_world, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, EUROPEAN_CAPITALS,
-    EUROPEAN_MAJOR_CITIES,
+    EUROPEAN_MAJOR_CITIES, EUROPE_LAT, EUROPE_LON,
 };
 use crate::layers::{ObservationLayer, ObservationPoint};
 
@@ -91,6 +93,11 @@ const CAPITAL_BOX_DEG: f64 = 1.0;
 /// Independent of viewport; shared across all zoom levels.
 const CAPITAL_DATA_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// Max concurrent per-location HTTP requests.  Combined with centre-outward
+/// sorting, closer stations start first while farther ones queue until a
+/// permit frees up.
+const MAX_CONCURRENT_LOCATIONS: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -126,11 +133,9 @@ pub struct EumetnetProvider {
     mem_cache: Arc<tokio::sync::Mutex<HashMap<String, MemCacheEntry>>>,
     /// When set and in the future, the gateway has rate-limited us.
     rate_limited_until: Arc<tokio::sync::Mutex<Option<Instant>>>,
-    /// Per-capital observation cache.  Key: (lat.to_bits(), lon.to_bits()).
+    /// Per-location observation cache.  Key: (lat.to_bits(), lon.to_bits()).
     /// Value: points from that location's bbox query + the fetch instant.
-    capital_cache: ObsCache,
-    /// Same structure for major-city bbox queries (Phase 2a).
-    city_cache: ObsCache,
+    location_cache: ObsCache,
 }
 
 #[derive(Debug, Clone)]
@@ -150,8 +155,7 @@ impl EumetnetProvider {
             config,
             mem_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             rate_limited_until: Arc::new(tokio::sync::Mutex::new(None)),
-            capital_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            city_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            location_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -200,136 +204,124 @@ impl EumetnetProvider {
         let log = &self.dirs.log_path;
         let t_total = Instant::now();
 
-        // Station names (24 h disk cache).
-        let all_stations = self
-            .fetch_station_list(stations_cache_path, endpoint, collection_id, log)
-            .await;
-        let names: HashMap<String, String> = all_stations
-            .into_iter()
-            .map(|s| (s.wigos_id, s.name))
-            .collect();
+        // Try station names from the 24 h disk cache first so we don't block
+        // the entire pipeline on a network call.  On a cold cache the names
+        // HashMap is empty — stations will show their WIGOS ID until the
+        // background fetch completes and caches to disk for the next refresh.
+        let cached_stations = Self::load_disk_cache::<StationListEntry>(
+            stations_cache_path,
+            STATION_LIST_TTL.as_secs(),
+        )
+        .filter(|e| e.bounds.is_none() && !e.stations.is_empty());
 
-        // `seen_wigos` deduplicates stations across all three phases.
+        let names: HashMap<String, String> = cached_stations
+            .map(|e| {
+                e.stations
+                    .into_iter()
+                    .map(|s| (s.wigos_id, s.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // If the disk cache missed, fetch the station list in the background
+        // so capitals/cities can start loading immediately.
+        let station_list_fut = if names.is_empty() {
+            let provider = self.clone();
+            let sp = stations_cache_path.to_path_buf();
+            let ep = endpoint.to_string();
+            let cid = collection_id.to_string();
+            let log_p = log.to_path_buf();
+            Some(tokio::spawn(async move {
+                provider.fetch_station_list(&sp, &ep, &cid, &log_p).await
+            }))
+        } else {
+            None
+        };
+
+        // `seen_wigos` deduplicates stations across all phases.
         let mut seen_wigos: HashSet<String> = HashSet::new();
 
-        // ── Phase 1: all European capitals (always, per-capital 5-min cache) ──
-        self.fetch_location_batch(
-            endpoint,
-            collection_id,
-            EUROPEAN_CAPITALS,
-            "capitals",
-            &names,
-            log,
-            &point_tx,
-            &self.capital_cache,
-            &mut seen_wigos,
-        )
-        .await;
-        // Commit Phase 1 to the UI immediately so capitals appear fast.
-        let _ = flush_tx.send(());
+        // Spawn the viewport area query immediately so it runs concurrently
+        // with the location batch.  It's the slowest single request (the
+        // gateway can take ~40s to assemble a continent-wide area response)
+        // and covers the most important stations — those actually visible.
+        let viewport_task = if zoom >= CAPITALS_ZOOM_CUTOFF {
+            let provider = self.clone();
+            let ep = endpoint.to_string();
+            let cid = collection_id.to_string();
+            let cp = cache_path.to_path_buf();
+            let nms = names.clone();
+            let log_p = log.to_path_buf();
+            let fetch_bounds = bounds.map(|b| b.expanded(0.5));
+            Some(tokio::spawn(async move {
+                provider
+                    .fetch_viewport_points(&cp, &ep, &cid, fetch_bounds, &nms, &log_p)
+                    .await
+            }))
+        } else {
+            None
+        };
 
-        // ── Phase 2a: major cities (always, per-city 5-min cache) ──────────
-        // Provides more uniform station coverage across all zoom levels without
-        // the slowness of a full continent-wide area query.
-        self.fetch_location_batch(
-            endpoint,
-            collection_id,
-            EUROPEAN_MAJOR_CITIES,
-            "cities",
-            &names,
-            log,
-            &point_tx,
-            &self.city_cache,
-            &mut seen_wigos,
-        )
-        .await;
-        // Commit Phase 2a so cities appear before the full viewport loads.
-        let _ = flush_tx.send(());
+        // Merge capitals + major cities into one centre-sorted list so
+        // stations pop in from the viewport centre outward instead of in
+        // two neat capital-then-city waves.
+        let center = bounds
+            .map(|b| WorldPoint {
+                x: (b.min_x + b.max_x) * 0.5,
+                y: (b.min_y + b.max_y) * 0.5,
+            })
+            .unwrap_or_else(|| lat_lon_to_world(EUROPE_LAT, EUROPE_LON));
 
-        // ── Phase 2b: full viewport (only when zoomed in enough) ───────────
-        if zoom >= CAPITALS_ZOOM_CUTOFF {
-            let expanded_bounds = bounds.map(|b| b.expanded(0.5));
-
-            let cache_hit = {
-                let cache = self.mem_cache.lock().await;
-                cache.get(collection_id).and_then(|e| {
-                    if e.fetched_at.elapsed() < MEM_CACHE_TTL
-                        && bounds_covered(e.bounds, expanded_bounds)
-                    {
-                        Some(e.layer.points.clone())
-                    } else {
-                        None
-                    }
-                })
+        let mut all_locations: Vec<(f64, f64)> = EUROPEAN_CAPITALS
+            .iter()
+            .chain(EUROPEAN_MAJOR_CITIES.iter())
+            .copied()
+            .collect();
+        all_locations.sort_by(|&(la, lo_a), &(lb, lo_b)| {
+            let da = {
+                let w = lat_lon_to_world(la, lo_a);
+                (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
             };
+            let db = {
+                let w = lat_lon_to_world(lb, lo_b);
+                (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
+            };
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-            let viewport_points = if let Some(pts) = cache_hit {
-                write_log(
-                    log,
-                    format!("eumetnet: viewport mem cache hit ({} pts)", pts.len()),
-                );
-                pts
-            } else {
-                let disk_hit =
-                    Self::load_disk_cache::<DiskCacheEntry>(cache_path, MEM_CACHE_TTL.as_secs())
-                        .and_then(|e| {
-                            if bounds_covered(e.bounds, expanded_bounds) {
-                                Some(e.layer.points)
-                            } else {
-                                None
-                            }
-                        });
-                if let Some(pts) = disk_hit {
-                    write_log(
-                        log,
-                        format!("eumetnet: viewport disk cache hit ({} pts)", pts.len()),
-                    );
-                    pts
-                } else {
-                    let polygon = bounds_polygon(expanded_bounds);
-                    let pts = Self::fetch_area_points(
-                        &self.client,
-                        endpoint,
-                        collection_id,
-                        &polygon,
-                        &names,
-                        Arc::clone(&self.rate_limited_until),
-                        log,
-                    )
-                    .await;
-                    if !pts.is_empty() {
-                        let layer = ObservationLayer {
-                            points: pts.clone(),
-                            updated_at: Some(
-                                SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0),
-                            ),
-                        };
-                        if let Ok(json) = serde_json::to_vec(&DiskCacheEntry {
-                            bounds: expanded_bounds,
-                            layer: layer.clone(),
-                        }) {
-                            let _ = write_atomic(cache_path, &json);
-                        }
-                        let mut cache = self.mem_cache.lock().await;
-                        cache.insert(
-                            collection_id.to_string(),
-                            MemCacheEntry {
-                                fetched_at: Instant::now(),
-                                bounds: expanded_bounds,
-                                layer,
-                            },
-                        );
+        self.fetch_location_batch(
+            endpoint,
+            collection_id,
+            &all_locations,
+            "locations",
+            &names,
+            log,
+            &point_tx,
+            &flush_tx,
+            &self.location_cache,
+            &mut seen_wigos,
+        )
+        .await;
+
+        // Let the background station list fetch complete so it writes to
+        // disk cache for the next refresh.  The current refresh already
+        // used the disk-cached names (or WIGOS IDs on a cold cache).
+        if let Some(fut) = station_list_fut {
+            let _ = fut.await;
+        }
+
+        // Collect the pre-warmed viewport result and stream it.
+        if let Some(task) = viewport_task {
+            if let Ok(pts) = task.await {
+                let mut sent_any = false;
+                for pt in pts {
+                    if seen_wigos.insert(pt.station_id.clone()) {
+                        let _ = point_tx.send(pt);
+                        sent_any = true;
                     }
-                    pts
                 }
-            };
-
-            for pt in viewport_points {
-                if seen_wigos.insert(pt.station_id.clone()) {
-                    let _ = point_tx.send(pt);
+                if sent_any {
+                    let _ = flush_tx.send(());
                 }
             }
         }
@@ -342,6 +334,109 @@ impl EumetnetProvider {
             ),
         );
         Ok(())
+    }
+
+    /// Fetch viewport-area observation points using mem + disk caches.
+    /// `fetch_bounds` is the expanded area sent to the API; the cached result
+    /// is stored with these bounds so nearby viewports also hit the cache.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_viewport_points(
+        &self,
+        cache_path: &Path,
+        endpoint: &str,
+        collection_id: &str,
+        fetch_bounds: Option<Bounds>,
+        names: &HashMap<String, String>,
+        log: &Path,
+    ) -> Vec<ObservationPoint> {
+        let cache_hit = {
+            let cache = self.mem_cache.lock().await;
+            cache.get(collection_id).and_then(|e| {
+                if e.fetched_at.elapsed() < MEM_CACHE_TTL && bounds_covered(e.bounds, fetch_bounds)
+                {
+                    Some(e.layer.points.clone())
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some(pts) = cache_hit {
+            write_log(
+                log,
+                format!("eumetnet: viewport mem cache hit ({} pts)", pts.len()),
+            );
+            return pts;
+        }
+
+        let disk_hit = Self::load_disk_cache::<DiskCacheEntry>(cache_path, MEM_CACHE_TTL.as_secs())
+            .and_then(|e| {
+                if bounds_covered(e.bounds, fetch_bounds) {
+                    Some(e.layer.points)
+                } else {
+                    None
+                }
+            });
+        if let Some(pts) = disk_hit {
+            write_log(
+                log,
+                format!("eumetnet: viewport disk cache hit ({} pts)", pts.len()),
+            );
+            let mut cache = self.mem_cache.lock().await;
+            cache.insert(
+                collection_id.to_string(),
+                MemCacheEntry {
+                    fetched_at: Instant::now(),
+                    bounds: fetch_bounds,
+                    layer: ObservationLayer {
+                        points: pts.clone(),
+                        updated_at: None,
+                    },
+                },
+            );
+            return pts;
+        }
+
+        let polygon = bounds_polygon(fetch_bounds);
+        let pts = Self::fetch_area_points(
+            &self.client,
+            endpoint,
+            collection_id,
+            &polygon,
+            names,
+            Arc::clone(&self.rate_limited_until),
+            log,
+        )
+        .await;
+
+        if !pts.is_empty() {
+            let layer = ObservationLayer {
+                points: pts.clone(),
+                updated_at: Some(
+                    SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                ),
+            };
+            if let Ok(json) = serde_json::to_vec(&DiskCacheEntry {
+                bounds: fetch_bounds,
+                layer: layer.clone(),
+            }) {
+                let _ = write_atomic(cache_path, &json);
+            }
+            let mut cache = self.mem_cache.lock().await;
+            cache.insert(
+                collection_id.to_string(),
+                MemCacheEntry {
+                    fetched_at: Instant::now(),
+                    bounds: fetch_bounds,
+                    layer,
+                },
+            );
+        }
+
+        pts
     }
 
     /// Fetch observation data for a list of named geographic positions (capitals
@@ -359,6 +454,7 @@ impl EumetnetProvider {
         names: &HashMap<String, String>,
         log: &Path,
         point_tx: &tokio::sync::mpsc::UnboundedSender<ObservationPoint>,
+        flush_tx: &tokio::sync::mpsc::UnboundedSender<()>,
         cache: &ObsCache,
         seen_wigos: &mut HashSet<String>,
     ) {
@@ -408,6 +504,9 @@ impl EumetnetProvider {
             }
         }
 
+        // Flush any fresh cached entries so they appear immediately.
+        let _ = flush_tx.send(());
+
         if stale.is_empty() {
             return;
         }
@@ -434,52 +533,72 @@ impl EumetnetProvider {
             format!("POLYGON(({lon0} {lat0},{lon1} {lat0},{lon1} {lat1},{lon0} {lat1},{lon0} {lat0}))")
         }).collect();
 
-        let futs = polygons.iter().map(|poly| {
-            Self::fetch_area_values(&self.client, endpoint, collection_id, &datetime, poly, log)
-        });
-        let results = futures::future::join_all(futs).await;
+        let dt = &datetime;
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_LOCATIONS));
+        let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+        for (i, &(clat, clon)) in stale.iter().enumerate() {
+            let poly = &polygons[i];
+            let sem = Arc::clone(&sem);
+            futs.push(async move {
+                let _permit = sem.acquire().await;
+                let result =
+                    Self::fetch_area_values(&self.client, endpoint, collection_id, dt, poly, log)
+                        .await;
+                (clat, clon, result)
+            });
+        }
 
         let mut rate_limit_cooldown: Option<Duration> = None;
 
-        {
-            let mut cache = cache.lock().await;
-            for (fetch, &(clat, clon)) in results.into_iter().zip(stale.iter()) {
-                let key = (clat.to_bits(), clon.to_bits());
-                match fetch {
-                    AreaFetch::Ok(stations) => {
-                        let pts: Vec<ObservationPoint> = stations
-                            .into_iter()
-                            .map(|s| ObservationPoint {
-                                station_id: names
-                                    .get(&s.wigos_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| s.wigos_id.clone()),
-                                point: GeoPoint::new(s.lon, s.lat),
-                                world: lat_lon_to_world(s.lat, s.lon),
-                                temperature: s.values.get("air_temperature").copied(),
-                                wind_speed: s.values.get("wind_speed").copied(),
-                                wind_direction: s.values.get("wind_from_direction").copied(),
-                                humidity: s.values.get("relative_humidity").copied(),
-                                pressure: s.values.get("air_pressure_at_mean_sea_level").copied(),
-                            })
-                            .collect();
+        while let Some((clat, clon, fetch)) = futs.next().await {
+            if rate_limit_cooldown.is_some() {
+                break;
+            }
+
+            let key = (clat.to_bits(), clon.to_bits());
+            match fetch {
+                AreaFetch::Ok(stations) => {
+                    let pts: Vec<ObservationPoint> = stations
+                        .into_iter()
+                        .map(|s| ObservationPoint {
+                            station_id: names
+                                .get(&s.wigos_id)
+                                .cloned()
+                                .unwrap_or_else(|| s.wigos_id.clone()),
+                            point: GeoPoint::new(s.lon, s.lat),
+                            world: lat_lon_to_world(s.lat, s.lon),
+                            temperature: s.values.get("air_temperature").copied(),
+                            wind_speed: s.values.get("wind_speed").copied(),
+                            wind_direction: s.values.get("wind_from_direction").copied(),
+                            humidity: s.values.get("relative_humidity").copied(),
+                            pressure: s.values.get("air_pressure_at_mean_sea_level").copied(),
+                        })
+                        .collect();
+                    {
+                        let mut cache = cache.lock().await;
                         cache.insert(key, (pts.clone(), fetch_instant));
-                        for pt in pts {
-                            if seen_wigos.insert(pt.station_id.clone()) {
-                                let _ = point_tx.send(pt);
-                            }
+                    }
+                    let mut sent_any = false;
+                    for pt in pts {
+                        if seen_wigos.insert(pt.station_id.clone()) {
+                            let _ = point_tx.send(pt);
+                            sent_any = true;
                         }
                     }
-                    AreaFetch::Empty => {
-                        cache.insert(key, (Vec::new(), fetch_instant));
+                    if sent_any {
+                        let _ = flush_tx.send(());
                     }
-                    AreaFetch::RateLimited(reset) => {
-                        let cooldown = reset
-                            .map(Duration::from_secs)
-                            .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
-                            .min(RATE_LIMIT_MAX_COOLDOWN);
-                        rate_limit_cooldown = Some(cooldown);
-                    }
+                }
+                AreaFetch::Empty => {
+                    let mut cache = cache.lock().await;
+                    cache.insert(key, (Vec::new(), fetch_instant));
+                }
+                AreaFetch::RateLimited(reset) => {
+                    let cooldown = reset
+                        .map(Duration::from_secs)
+                        .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
+                        .min(RATE_LIMIT_MAX_COOLDOWN);
+                    rate_limit_cooldown = Some(cooldown);
                 }
             }
         }
