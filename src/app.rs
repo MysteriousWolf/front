@@ -8,6 +8,7 @@ use chrono::{DateTime, Local, Utc};
 use color_eyre::eyre::{Result, WrapErr};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -22,6 +23,8 @@ use crate::layers::{
     RenderMode, WarningLayer,
 };
 use crate::providers::eumetnet::EumetnetProvider;
+use crate::providers::geocode::{GeocodeProvider, Place};
+use crate::providers::location::{LocationArbiter, LocationFix, LocationSource};
 use crate::providers::maps::NaturalEarthProvider;
 use crate::providers::meteoalarm::MeteoAlarmProvider;
 use crate::providers::meteogate::MeteoGateProvider;
@@ -70,6 +73,122 @@ struct RadarPreloadResult {
     timestamp: i64,
     tile_zoom: u8,
     frame: RadarFrame,
+}
+
+/// How many uncached frames a single preload pass will pull in, nearest the
+/// playhead first.  Caps the work per trigger independently of how deep the
+/// history window is; the window re-centres as the playhead moves, so the rest
+/// of a 24 h timeline streams in as it is approached rather than all at once.
+const PRELOAD_WINDOW: usize = 36;
+
+/// Cap on decoded frames held in RAM, evicted by distance from the playhead.
+///
+/// `frame_cache` holds built tiles, ~5 MB per frame at zoom 7.  Without a cap
+/// it grows to the full timeline as the playhead sweeps: 24 h is 288 slots,
+/// about 1.4 GB.  The GeoTIFFs stay on disk, so an evicted frame reloads
+/// without touching the network — RAM holds a window, disk holds the day.
+const FRAME_CACHE_MAX: usize = 48;
+
+/// Steps between `index` and `playhead` along the timeline, the short way
+/// round.
+///
+/// The timeline is a ring, not a line: playback runs oldest → newest and then
+/// wraps straight back to the oldest, and `[`/`]` step across the same seam.
+/// So the oldest frame is one step from the newest, not `len - 1` steps.  A
+/// plain `abs_diff` ranks the frames just past the seam as the most distant on
+/// the timeline — precisely the ones about to be reached — which left preload
+/// skipping them and eviction dropping them first, stalling every lap at the
+/// wrap.
+///
+/// The metric is symmetric rather than looking only ahead of the playhead:
+/// stepping goes both ways, and frames behind the playhead are the ones the
+/// next lap replays.
+fn ring_distance(index: usize, playhead: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let raw = index.abs_diff(playhead);
+    raw.min(len - raw)
+}
+
+/// Which way a single step moves the playhead.  Index 0 is the newest frame,
+/// `len - 1` the oldest, so `Older` counts up and `Newer` counts down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Older,
+    Newer,
+}
+
+/// The index one step from `current` around a timeline of `len` slots, wrapping
+/// at both ends.  `None` when there is no timeline to step along.
+fn stepped_index(current: usize, len: usize, dir: Step) -> Option<usize> {
+    let oldest = len.checked_sub(1)?;
+    Some(match dir {
+        // `>=`, not `==`: a shrinking history window can leave the playhead
+        // past the end until the next redraw resettles it.
+        Step::Older if current >= oldest => 0,
+        Step::Older => current + 1,
+        Step::Newer if current == 0 => oldest,
+        Step::Newer => (current - 1).min(oldest),
+    })
+}
+
+/// Pick which cached frames to drop so at most `cap` remain.
+///
+/// Ranks by [`ring_distance`] from the playhead rather than by insert order:
+/// preload fills outward from the playhead, so the frames worth keeping are the
+/// ones it is about to reach, not the ones most recently decoded.  The
+/// displayed frame is at distance zero and is never evicted.  Frames no longer
+/// on the timeline rank last and go first.
+fn frames_to_evict(cached: &[i64], timestamps: &[i64], frame_index: usize, cap: usize) -> Vec<i64> {
+    if cached.len() <= cap {
+        return Vec::new();
+    }
+    let index: HashMap<i64, usize> = timestamps
+        .iter()
+        .enumerate()
+        .map(|(i, &ts)| (ts, i))
+        .collect();
+    let mut keys = cached.to_vec();
+    keys.sort_by_key(|ts| {
+        index
+            .get(ts)
+            .map(|&i| ring_distance(i, frame_index, timestamps.len()))
+            .unwrap_or(usize::MAX)
+    });
+    keys.split_off(cap)
+}
+
+/// Remove `req_ts` from `timestamps` and work out which index should stay
+/// displayed, or `None` when the slot wasn't on the timeline.
+///
+/// The viewer keeps looking at the same *time* across the removal rather
+/// than the same index, which would otherwise slide onto a neighbour.  If
+/// the viewed slot was the phantom itself, it falls back to the time the
+/// provider actually resolved to.
+fn timeline_without_phantom(
+    timestamps: &[i64],
+    frame_index: usize,
+    req_ts: i64,
+    resolved_ts: i64,
+    live: bool,
+) -> Option<(Vec<i64>, usize)> {
+    if !timestamps.contains(&req_ts) {
+        return None;
+    }
+    let viewing = timestamps.get(frame_index).copied();
+    let remaining: Vec<i64> = timestamps
+        .iter()
+        .copied()
+        .filter(|&t| t != req_ts)
+        .collect();
+    let index = if live {
+        0
+    } else {
+        let target = viewing.filter(|&t| t != req_ts).unwrap_or(resolved_ts);
+        remaining.iter().position(|&t| t == target).unwrap_or(0)
+    };
+    Some((remaining, index))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +253,13 @@ pub struct App {
     pub layers: LayerRegistry,
     pub borders: Option<BorderLayer>,
     pub timestamps: Vec<i64>,
+    /// Depth of radar history on the timeline, in hours.  Cycled with `i`
+    /// through [`HISTORY_OPTIONS`](crate::providers::meteogate::HISTORY_OPTIONS).
+    pub history_hours: u8,
+    /// Timestamps whose GeoTIFF is on disk.  A superset of `frame_cache` once
+    /// eviction starts: these still load without a fetch, so the timeline marks
+    /// them as available rather than missing.
+    pub disk_frames: HashSet<i64>,
     pub radar_frame: Option<RadarFrame>,
     pub border_mask_cache: Option<(BorderMaskStamp, BorderMask)>,
     /// Mask from the _previous_ resolution level, kept alive for one
@@ -153,8 +279,6 @@ pub struct App {
     frame_list_tx: UnboundedSender<Vec<i64>>,
     frame_list_rx: UnboundedReceiver<Vec<i64>>,
     pub braille_frame: BrailleFrame,
-    pub render_rows: Vec<ratatui::text::Line<'static>>,
-    pub frame_count: u64,
     pub frame_index: usize,
     pub playback_mode: PlaybackMode,
     pub playback_speed: PlaybackSpeed,
@@ -164,8 +288,15 @@ pub struct App {
     /// submenu hidden).  Toggled by Alt+← from the root list; set to true by
     /// any layer interaction.  True on startup.
     pub layer_panel_focused: bool,
-    pub location_label: String,
-    pub location_marker: Option<GeoPoint>,
+    /// Picks the winning fix out of the competing backend streams.
+    location: LocationArbiter,
+    /// The `/` prompt's buffer while open; `None` when the prompt is closed.
+    pub search_input: Option<String>,
+    /// Status line shown under the prompt: the matched place, "searching…",
+    /// or why the search failed.
+    pub search_status: Option<String>,
+    /// Where the search pin currently sits, if a search matched.
+    search_pin: Option<GeoPoint>,
     pub dirs: FrontDirs,
     pub config: Config,
     pub warning_layer: Option<WarningLayer>,
@@ -236,6 +367,17 @@ pub struct App {
     warn_rx: UnboundedReceiver<WarnRefreshResult>,
     warn_task: Option<JoinHandle<()>>,
     warn_refresh_id: u64,
+    /// Fixes from every location backend.  `None` when location is disabled
+    /// (`--no-location`) or fixed by `--lat/--lon`, in which case no backend
+    /// is ever started.
+    location_rx: Option<UnboundedReceiver<LocationFix>>,
+    geocode: Arc<GeocodeProvider>,
+    search_tx: UnboundedSender<SearchResult>,
+    search_rx: UnboundedReceiver<SearchResult>,
+    search_task: Option<JoinHandle<()>>,
+    /// Discriminates in-flight searches so a slow earlier query cannot
+    /// overwrite the pin set by a later one.
+    search_id: u64,
     /// Pre‑load border tasks (one per resolution).  Stored so they can
     /// be aborted on quit — they're not tied to a specific request.
     preload_tasks: Vec<JoinHandle<()>>,
@@ -281,11 +423,12 @@ impl App {
             .wrap_err("build HTTP client")?;
 
         write_log(&log, "boot: initial viewport");
-        let (viewport, location_label, location_marker) = initial_viewport(cli, &log).await;
+        let (viewport, location, location_rx) = initial_viewport(cli, &config, &log).await;
         let (refresh_tx, refresh_rx) = unbounded_channel();
         let (border_tx, border_rx) = unbounded_channel();
         let (obs_tx, obs_rx) = unbounded_channel();
         let (warn_tx, warn_rx) = unbounded_channel();
+        let (search_tx, search_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
         let (radar_preload_tx, radar_preload_rx) = unbounded_channel::<RadarPreloadResult>();
@@ -311,6 +454,8 @@ impl App {
             layers: LayerRegistry::new(),
             borders: None,
             timestamps: Vec::new(),
+            history_hours: crate::providers::meteogate::DEFAULT_HISTORY_HOURS,
+            disk_frames: HashSet::new(),
             radar_frame: None,
             border_mask_cache: None,
             fallback_mask_cache: None,
@@ -320,16 +465,25 @@ impl App {
             border_total_resolutions: 4,
             border_built_set: HashSet::new(),
             braille_frame: BrailleFrame::default(),
-            render_rows: Vec::new(),
-            frame_count: 0,
             frame_index: 0,
             playback_mode: PlaybackMode::Live,
             playback_speed: PlaybackSpeed::Normal,
             show_help: false,
             is_dragging: false,
             layer_panel_focused: false,
-            location_label,
-            location_marker,
+            location,
+            location_rx,
+            search_input: None,
+            search_status: None,
+            search_pin: None,
+            geocode: Arc::new(
+                GeocodeProvider::new(config.geocode.endpoint.clone())
+                    .wrap_err("build geocoding provider")?,
+            ),
+            search_tx,
+            search_rx,
+            search_task: None,
+            search_id: 0,
             warning_layer: None,
             obs_cache: None,
             obs_incoming: Vec::new(),
@@ -403,12 +557,33 @@ impl App {
         );
         app.request_border_refresh();
 
+        // Caches from builds that stored the source GeoTIFF are dead weight.
+        let freed = app.meteogate.purge_legacy_tiffs();
+        if freed > 0 {
+            write_log(
+                &log,
+                format!(
+                    "boot: freed {} MB of legacy geotiff cache",
+                    freed / 1_000_000
+                ),
+            );
+        }
+
+        // What the last session left on disk is already usable — show it on the
+        // timeline from the first render rather than after a fetch proves it.
+        app.disk_frames = app.meteogate.cached_timestamps();
+        write_log(
+            &log,
+            format!("boot: {} radar frames on disk", app.disk_frames.len()),
+        );
+
         // Launch radar frame list fetch in background.
         write_log(&log, "boot: spawning background frame list fetch");
         {
             let meteogate = app.meteogate.clone();
             let tx = app.frame_list_tx.clone();
             let task_tx = app.task_tx.clone();
+            let hours = app.history_hours;
             let task_id = next_task_id();
             let _ = task_tx.send(TaskMsg::Start {
                 id: task_id,
@@ -417,7 +592,7 @@ impl App {
             });
             let ll = log.clone();
             tokio::spawn(async move {
-                match meteogate.frame_list().await {
+                match meteogate.frame_list(hours).await {
                     Ok(ts) => {
                         write_log(&ll, format!("boot: got {} timestamps", ts.len()));
                         let _ = tx.send(ts);
@@ -830,7 +1005,7 @@ impl App {
     /// Keeps the user anchored: viewing the live frame follows the
     /// newest slot; viewing an older frame stays on that timestamp.
     pub fn poll_radar_timestamps(&mut self) -> bool {
-        let fresh = crate::providers::meteogate::compute_frame_list();
+        let fresh = crate::providers::meteogate::compute_frame_list(self.history_hours);
         if fresh.first() == self.timestamps.first() {
             return false;
         }
@@ -1151,38 +1326,22 @@ impl App {
                         self.radar_frame.as_ref().map(|f| f.time),
                     ) {
                         if actual_ts != req_ts {
-                            let before = self.timestamps.len();
-                            self.timestamps.retain(|&t| t != req_ts);
-                            if self.timestamps.len() != before {
-                                write_log(
-                                    &self.dirs.log_path,
-                                    format!(
-                                        "meteogate: removed phantom slot {req_ts} (resolved to {actual_ts})"
-                                    ),
-                                );
-                                self.frame_index = if self.playback_mode == PlaybackMode::Live {
-                                    0
-                                } else {
-                                    self.timestamps
-                                        .iter()
-                                        .position(|&t| t == actual_ts)
-                                        .unwrap_or(0)
-                                };
-                            }
+                            self.drop_phantom_slot(req_ts, actual_ts);
                         }
                     }
                     // Cache the completed frame and kick off preload for the rest.
-                    if let Some(ts) = self.radar_requested_ts {
+                    // Key by the frame's real time, not the requested slot, so a
+                    // resolved-elsewhere frame can't occupy two timeline slots.
+                    if let Some(f) = self.radar_frame.as_ref() {
+                        let ts = f.time;
                         let zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
-                        if zoom == self.frame_cache_zoom {
-                            if let Some(f) = self.radar_frame.as_ref() {
-                                self.frame_cache.insert(ts, f.clone());
-                                // Evict oldest entries beyond 6 to bound memory.
-                                if self.frame_cache.len() > 6 {
-                                    let evict_ts =
-                                        self.frame_cache.keys().copied().min().unwrap_or(ts);
-                                    self.frame_cache.remove(&evict_ts);
-                                }
+                        if zoom == self.frame_cache_zoom && self.timestamps.contains(&ts) {
+                            let f = f.clone();
+                            self.frame_cache.insert(ts, f);
+                            // Evict oldest entries beyond 6 to bound memory.
+                            if self.frame_cache.len() > 6 {
+                                let evict_ts = self.frame_cache.keys().copied().min().unwrap_or(ts);
+                                self.frame_cache.remove(&evict_ts);
                             }
                         }
                     }
@@ -1317,6 +1476,187 @@ impl App {
                     "frame_list: spawning first radar refresh",
                 );
                 self.request_meteogate_refresh(self.map_width, self.map_height);
+            }
+        }
+        changed
+    }
+
+    /// The current best-known position, or `None` if nothing has been fixed
+    /// yet.
+    pub fn location_fix(&self) -> Option<LocationFix> {
+        self.location.current()
+    }
+
+    /// Where the search pin sits, or `None` when nothing is pinned.
+    pub fn search_pin(&self) -> Option<GeoPoint> {
+        self.search_pin
+    }
+
+    /// Re-fetch everything that depends on the viewport.  Used after any jump
+    /// or pan, so a moved map does not keep showing the old area's data.
+    pub fn request_viewport_refresh(&mut self) {
+        self.request_meteogate_refresh(self.map_width, self.map_height);
+        self.request_border_refresh();
+        if self.any_obs_enabled() && !self.has_obs_task() {
+            self.request_obs_refresh();
+        }
+    }
+
+    // ── Place search (`/`) ─────────────────────────────────────────────
+
+    /// Open the `/` prompt with an empty buffer.
+    pub fn open_search(&mut self) {
+        self.search_input = Some(String::new());
+        self.search_status = None;
+    }
+
+    /// Close the prompt, discarding the buffer.  The pin itself is left alone
+    /// — Esc dismisses the prompt, it does not undo a previous search.
+    pub fn cancel_search(&mut self) {
+        self.search_input = None;
+        self.search_status = None;
+    }
+
+    pub fn search_is_open(&self) -> bool {
+        self.search_input.is_some()
+    }
+
+    pub fn search_push_char(&mut self, c: char) {
+        if let Some(buf) = self.search_input.as_mut() {
+            buf.push(c);
+        }
+    }
+
+    pub fn search_backspace(&mut self) {
+        if let Some(buf) = self.search_input.as_mut() {
+            buf.pop();
+        }
+    }
+
+    /// Drop the pin and turn the layer off again.
+    pub fn clear_search_pin(&mut self) {
+        self.search_pin = None;
+        self.layers.mode_state_mut().remove_all(LayerId::SearchPin);
+        self.layers.set_status(LayerId::SearchPin, LayerStatus::Idle);
+    }
+
+    /// Submit the prompt's buffer as a geocoding query.
+    ///
+    /// The prompt closes immediately and the lookup runs in the background,
+    /// so a slow Nominatim response never blocks the event loop.
+    pub fn submit_search(&mut self) {
+        let Some(query) = self.search_input.take() else {
+            return;
+        };
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.search_status = None;
+            return;
+        }
+
+        // Abort any in-flight search: only the latest query matters.
+        if let Some(task) = self.search_task.take() {
+            task.abort();
+        }
+        self.search_id = self.search_id.wrapping_add(1);
+        let id = self.search_id;
+
+        self.search_status = Some(format!("Searching for \"{query}\"…"));
+        self.layers
+            .set_status(LayerId::SearchPin, LayerStatus::Loading);
+
+        let geocode = self.geocode.clone();
+        let tx = self.search_tx.clone();
+        let log = self.dirs.log_path.clone();
+        self.search_task = Some(tokio::spawn(async move {
+            let outcome = geocode.search(&query, &log).await;
+            let _ = tx.send(SearchResult {
+                id,
+                query,
+                outcome: match outcome {
+                    Ok(Some(place)) => SearchOutcome::Found(place),
+                    Ok(None) => SearchOutcome::NoMatch,
+                    Err(e) => SearchOutcome::Error(e.to_string()),
+                },
+            });
+        }));
+    }
+
+    /// Drain finished searches, moving the pin and the viewport on a hit.
+    pub fn drain_search_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.search_rx.try_recv() {
+            // A superseded query — the user has already searched again.
+            if result.id != self.search_id {
+                continue;
+            }
+            changed = true;
+            match result.outcome {
+                SearchOutcome::Found(place) => {
+                    self.search_pin = Some(place.point);
+                    // A found place is only useful if you can see it, so jump
+                    // there — this is an explicit user request, unlike a
+                    // location fix arriving on its own.
+                    self.viewport = Viewport::from_lat_lon(
+                        place.point.lat,
+                        place.point.lon,
+                        self.viewport.zoom.max(SEARCH_MIN_ZOOM),
+                    );
+                    // Show the pin: the layer owns no mode until a hit.
+                    let modes = self.layers.mode_state_mut();
+                    if !modes.has_any(LayerId::SearchPin) {
+                        modes.toggle_overlay(RenderMode::Text, LayerId::SearchPin);
+                    }
+                    self.layers
+                        .set_status(LayerId::SearchPin, LayerStatus::Ready);
+                    self.search_status = Some(place.display_name);
+                    self.request_viewport_refresh();
+                }
+                SearchOutcome::NoMatch => {
+                    self.search_status = Some(format!("No match for \"{}\"", result.query));
+                    self.layers
+                        .set_status(LayerId::SearchPin, LayerStatus::Idle);
+                }
+                SearchOutcome::Error(e) => {
+                    self.search_status = Some(format!("Search failed: {e}"));
+                    self.layers
+                        .set_status(LayerId::SearchPin, LayerStatus::Error(e));
+                }
+            }
+        }
+        changed
+    }
+
+    /// Drain fixes from the location backends.
+    ///
+    /// Returns true only when the winning fix actually changed — losing fixes
+    /// (a coarse IP result arriving after GPS) are discarded without forcing a
+    /// redraw.  The viewport is never touched here; see `initial_viewport` for
+    /// why only the first fix re-centres.
+    pub fn drain_location_updates(&mut self) -> bool {
+        let Some(rx) = self.location_rx.as_mut() else {
+            return false;
+        };
+        let mut fixes = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(fix) => fixes.push(fix),
+                // All backends exited; stop polling a dead channel.
+                Err(TryRecvError::Disconnected) => {
+                    self.location_rx = None;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+
+        let mut changed = false;
+        for fix in fixes {
+            if self.location.offer(fix) {
+                changed = true;
+                write_log(&self.dirs.log_path, format!("location: fix {}", fix.label()));
+                self.layers
+                    .set_status(LayerId::Location, LayerStatus::Ready);
             }
         }
         changed
@@ -1617,21 +1957,34 @@ impl App {
         changed
     }
 
+    /// Step one frame toward older, wrapping past the oldest to the newest.
+    ///
+    /// Both step directions wrap around the current history window, over the
+    /// same seam [`Self::playback_step`] crosses — stepping and playing
+    /// traverse the range identically, and neither dead-ends at an edge.
     pub fn next_frame(&mut self) {
-        if !self.timestamps.is_empty() {
-            self.frame_index = (self.frame_index + 1).min(self.timestamps.len() - 1);
-            self.playback_mode = PlaybackMode::Paused;
+        if let Some(i) = stepped_index(self.frame_index, self.timestamps.len(), Step::Older) {
+            self.frame_index = i;
+            self.playback_mode = self.mode_for_index();
         }
     }
 
+    /// Step one frame toward newer, wrapping past the newest to the oldest.
     pub fn previous_frame(&mut self) {
-        self.frame_index = self.frame_index.saturating_sub(1);
-        // Stepping onto the newest frame re-enters live mode automatically.
-        self.playback_mode = if self.frame_index == 0 {
+        if let Some(i) = stepped_index(self.frame_index, self.timestamps.len(), Step::Newer) {
+            self.frame_index = i;
+            self.playback_mode = self.mode_for_index();
+        }
+    }
+
+    /// Landing on the newest frame re-enters live mode automatically, however
+    /// the playhead got there — including by wrapping.
+    fn mode_for_index(&self) -> PlaybackMode {
+        if self.frame_index == 0 {
             PlaybackMode::Live
         } else {
             PlaybackMode::Paused
-        };
+        }
     }
 
     /// Return to Live mode and snap to the newest frame.
@@ -1677,10 +2030,53 @@ impl App {
         self.playback_speed = self.playback_speed.slower();
     }
 
-    /// Spawn a background task that loads all uncached radar frames at the
-    /// current viewport in parallel.  Uses a small semaphore (2) so preload
-    /// doesn't steal HTTP/CPU resources from higher-priority work (borders,
-    /// current frame, observations).  Aborts any existing preload.
+    /// Advance to the next history depth (3 → 6 → 12 → 24 → 3 h) and rebuild
+    /// the timeline in place.
+    ///
+    /// The list is recomputed locally rather than refetched: the slot times are
+    /// pure arithmetic, and any frame already on disk stays cached, so
+    /// deepening the window costs nothing until those frames are actually
+    /// loaded.  The viewer keeps its current timestamp when the shorter window
+    /// still contains it, so cycling 24 → 3 h while parked on an old frame
+    /// lands on the nearest slot still in range rather than jumping to live.
+    pub fn cycle_history(&mut self) {
+        self.history_hours = crate::providers::meteogate::next_history_hours(self.history_hours);
+        let current_ts = self.timestamps.get(self.frame_index).copied();
+        self.timestamps = crate::providers::meteogate::compute_frame_list(self.history_hours);
+
+        self.frame_index = if self.playback_mode == PlaybackMode::Live {
+            0
+        } else {
+            match current_ts.and_then(|ts| self.timestamps.iter().position(|&t| t == ts)) {
+                Some(i) => i,
+                // The frame we were on fell outside the new window; park on the
+                // oldest slot that survives so the view stays as close in time
+                // as the window allows.
+                None => self.timestamps.len().saturating_sub(1),
+            }
+        };
+        // Frames outside the new window are dead weight in memory; the on-disk
+        // GeoTIFFs remain, so re-widening reloads them without touching S3.
+        let keep: HashSet<i64> = self.timestamps.iter().copied().collect();
+        self.frame_cache.retain(|ts, _| keep.contains(ts));
+        // A deeper window exposes older slots that earlier sessions may already
+        // have fetched; rescan so they show as available immediately.
+        self.disk_frames = self.meteogate.cached_timestamps();
+        write_log(
+            &self.dirs.log_path,
+            format!(
+                "history: {} h ({} slots)",
+                self.history_hours,
+                self.timestamps.len()
+            ),
+        );
+    }
+
+    /// Spawn a background task that loads uncached radar frames near the
+    /// playhead at the current viewport, in parallel.  Uses a small semaphore
+    /// (2) so preload doesn't steal HTTP/CPU resources from higher-priority
+    /// work (borders, current frame, observations).  Aborts any existing
+    /// preload.
     pub fn trigger_radar_preload(&mut self) {
         // Never preload mid-drag.  `request_meteogate_refresh` runs on
         // every mouse-move tick and, while the current frame still covers
@@ -1703,12 +2099,29 @@ impl App {
         let bounds = self.viewport.bounds(self.map_width, self.map_height);
         let fetch_bounds = bounds.expanded(0.5);
         let current_ts = self.timestamps.get(self.frame_index).copied();
-        let to_load: Vec<i64> = self
+        // Preload a window around the playhead rather than the whole timeline.
+        // At 24 h that would be 288 slots, and every zoom change clears
+        // `frame_cache` and re-decodes them: the GeoTIFFs come off disk, but
+        // each still costs a ~140 ms parse, so a full sweep would burn a minute
+        // of CPU per zoom.  The window re-centres as the playhead moves, so
+        // playback stays fed while the cost per trigger stays bounded.
+        //
+        // Distance is measured around the ring, so the window spans the wrap
+        // instead of stopping dead at either end: sitting on the newest frame
+        // preloads the oldest ones too, which is where the loop lands next.
+        let len = self.timestamps.len();
+        let mut by_distance: Vec<(usize, i64)> = self
             .timestamps
             .iter()
-            .copied()
-            .filter(|ts| !self.frame_cache.contains_key(ts) && Some(*ts) != current_ts)
+            .enumerate()
+            .filter(|(_, ts)| !self.frame_cache.contains_key(ts) && Some(**ts) != current_ts)
+            .map(|(i, &ts)| (ring_distance(i, self.frame_index, len), ts))
             .collect();
+        // Nearest the playhead first: those are the frames playback reaches
+        // soonest, and the truncation drops the most distant.
+        by_distance.sort_by_key(|&(d, _)| d);
+        by_distance.truncate(PRELOAD_WINDOW);
+        let to_load: Vec<i64> = by_distance.into_iter().map(|(_, ts)| ts).collect();
         if to_load.is_empty() {
             return;
         }
@@ -1748,10 +2161,75 @@ impl App {
             if !self.timestamps.contains(&result.timestamp) {
                 continue;
             }
-            self.frame_cache.insert(result.timestamp, result.frame);
+            // The provider resolves a requested slot to whatever is actually
+            // published, so key the cache by the time the frame really holds.
+            // Caching under the requested slot instead would show the same
+            // data on two timeline positions and mark both as loaded.
+            let actual_ts = result.frame.time;
+            if actual_ts != result.timestamp {
+                changed |= self.drop_phantom_slot(result.timestamp, actual_ts);
+                if !self.timestamps.contains(&actual_ts) {
+                    continue;
+                }
+            }
+            // Loading it wrote the GeoTIFF to disk, so it stays reloadable
+            // after `prune_frame_cache` drops it from RAM.
+            self.disk_frames.insert(actual_ts);
+            self.frame_cache.insert(actual_ts, result.frame);
             changed = true;
         }
+        self.prune_frame_cache();
         changed
+    }
+
+    /// How readily `ts` can be displayed: decoded in RAM, on disk needing only
+    /// a decode, or absent and needing a fetch.
+    pub fn slot_state(&self, ts: i64) -> crate::ui::SlotState {
+        if self.frame_cache.contains_key(&ts) {
+            crate::ui::SlotState::InRam
+        } else if self.disk_frames.contains(&ts) {
+            crate::ui::SlotState::OnDisk
+        } else {
+            crate::ui::SlotState::Missing
+        }
+    }
+
+    /// Evict cached frames furthest from the playhead once the cache exceeds
+    /// [`FRAME_CACHE_MAX`].
+    fn prune_frame_cache(&mut self) {
+        for ts in frames_to_evict(
+            &self.frame_cache.keys().copied().collect::<Vec<_>>(),
+            &self.timestamps,
+            self.frame_index,
+            FRAME_CACHE_MAX,
+        ) {
+            self.frame_cache.remove(&ts);
+        }
+    }
+
+    /// Drop a requested slot that the provider resolved to a different time.
+    ///
+    /// Such a slot is not actually published, so leaving it on the timeline
+    /// would render its neighbour's data a second time and report it as
+    /// loaded.  Returns `true` when the timeline changed.
+    fn drop_phantom_slot(&mut self, req_ts: i64, resolved_ts: i64) -> bool {
+        let Some((timestamps, frame_index)) = timeline_without_phantom(
+            &self.timestamps,
+            self.frame_index,
+            req_ts,
+            resolved_ts,
+            self.playback_mode == PlaybackMode::Live,
+        ) else {
+            return false;
+        };
+        self.timestamps = timestamps;
+        self.frame_index = frame_index;
+        self.frame_cache.remove(&req_ts);
+        write_log(
+            &self.dirs.log_path,
+            format!("meteogate: removed phantom slot {req_ts} (resolved to {resolved_ts})"),
+        );
+        true
     }
 
     fn merge_radar_frame(&mut self, frame: RadarFrame) {
@@ -1782,14 +2260,6 @@ impl App {
                 mode: RenderMode::Braille,
             });
         }
-        // Overlay braille (lightning) is saved with the same mode tag.
-        // load_state routes it back to braille_overlay by layer identity.
-        if let Some(id) = modes.braille_overlay {
-            render_modes.push(LayerRenderMode {
-                layer: id,
-                mode: RenderMode::Braille,
-            });
-        }
         if let Some(id) = modes.color {
             render_modes.push(LayerRenderMode {
                 layer: id,
@@ -1802,17 +2272,24 @@ impl App {
                 mode: RenderMode::Text,
             });
         }
+        // Overlays are saved with the same mode tag as the primary slot;
+        // load_state routes them back by layer identity via `overlay_modes`.
+        for &(mode, layer) in &modes.overlays {
+            render_modes.push(LayerRenderMode { layer, mode });
+        }
         let state = StateConfig {
             center_lat: center.lat,
             center_lon: center.lon,
             zoom: self.viewport.zoom,
             enabled_layers: self.layers.saved_enabled(),
+            known_layers: self.layers.known_layers(),
             selected_layer: self.layers.selected_layer(),
             render_modes,
             braille_layer: None,
             color_layer: None,
             text_layer: None,
             lightning_trail_minutes: Some(self.layers.lightning_trail_minutes),
+            history_hours: Some(self.history_hours),
         };
         let path = self.dirs.config_dir.join("state.toml");
         let _ = state.save(&path);
@@ -1830,19 +2307,34 @@ impl App {
         if let Some(minutes) = state.lightning_trail_minutes {
             self.layers.lightning_trail_minutes = minutes.clamp(1, 30);
         }
-        self.layers.restore_enabled(&state.enabled_layers);
+        // Ignore a depth that isn't one of the offered options, so a stale or
+        // hand-edited state.toml can't wedge the `i` cycle on a value it would
+        // never produce.
+        if let Some(hours) = state.history_hours {
+            if crate::providers::meteogate::HISTORY_OPTIONS.contains(&hours) {
+                self.history_hours = hours;
+            }
+        }
+        self.layers
+            .restore_enabled(&state.enabled_layers, &state.known_layers);
         self.layers.set_selected(state.selected_layer);
+        let known = LayerRegistry::known_from_state(&state.known_layers);
         let modes = self.layers.mode_state_mut();
         if !state.render_modes.is_empty() {
-            // New format: explicit (layer, mode) pairs.
-            // Lightning's braille is stored with RenderMode::Braille but goes
-            // into the overlay slot so it never evicts radar from primary.
+            // The saved file is authoritative for every layer it knew about,
+            // so clear those first: without this, a mode the user switched off
+            // is silently re-enabled by the constructor default on next boot.
+            // Layers the file never knew keep their default — that is what
+            // stops a newly added layer from booting up disabled.
+            for id in known {
+                modes.remove_all(id);
+            }
+            // Explicit (layer, mode) pairs.  Overlay layers (Lightning
+            // braille, Location text/background) are stored with the same mode
+            // tag but must go back to the overlay slot, or they would evict
+            // the primary owner on load.
             for entry in &state.render_modes {
-                if entry.mode == RenderMode::Braille && entry.layer.is_lightning() {
-                    modes.braille_overlay = Some(entry.layer);
-                } else {
-                    modes.assign(entry.mode, entry.layer);
-                }
+                modes.restore(entry.mode, entry.layer);
             }
         } else {
             // Backward compat: old state.toml with scalar braille/color/text fields.
@@ -1959,36 +2451,93 @@ enum ObsRefreshPayload {
     Done,
 }
 
-async fn initial_viewport(cli: &Cli, log_path: &Path) -> (Viewport, String, Option<GeoPoint>) {
+/// Zoom to at least this when jumping to a search hit, so a result found while
+/// looking at the whole continent is actually visible.
+const SEARCH_MIN_ZOOM: f64 = 7.0;
+
+/// A finished place search, tagged with the query that produced it.
+#[derive(Debug)]
+struct SearchResult {
+    id: u64,
+    query: String,
+    outcome: SearchOutcome,
+}
+
+#[derive(Debug)]
+enum SearchOutcome {
+    Found(Place),
+    /// The search ran but matched nothing — a typo, not a failure.
+    NoMatch,
+    Error(String),
+}
+
+/// How long boot waits for the first fix before falling back to the Europe
+/// view.  Backends keep running past this deadline — a slow fix still lands on
+/// the map, it just does not get to hold up the UI.
+const INITIAL_FIX_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Resolve the starting viewport and kick off location tracking.
+///
+/// `--lat/--lon` short-circuits everything: it produces a `Manual` fix and no
+/// backend is started, so nothing can move the marker afterwards.
+async fn initial_viewport(
+    cli: &Cli,
+    config: &Config,
+    log_path: &Path,
+) -> (Viewport, LocationArbiter, Option<UnboundedReceiver<LocationFix>>) {
+    let mut arbiter = LocationArbiter::new();
+
     if let (Some(lat), Some(lon)) = (cli.lat, cli.lon) {
-        let point = GeoPoint::new(lon, lat);
+        arbiter.offer(LocationFix::new(
+            GeoPoint::new(lon, lat),
+            None,
+            LocationSource::Manual,
+        ));
         return (
             Viewport::from_lat_lon(lat, lon, cli.zoom.unwrap_or(5.0)),
-            "CLI".to_string(),
-            Some(point),
+            arbiter,
+            None,
         );
     }
 
-    if !cli.no_location {
-        if let Ok(Some(fix)) = crate::providers::geoclue::locate(log_path).await {
-            let point = fix.point;
-            return (
-                Viewport::from_lat_lon(fix.point.lat, fix.point.lon, cli.zoom.unwrap_or(5.0)),
-                fix.label,
-                Some(point),
-            );
-        }
+    let europe = Viewport::from_lat_lon(
+        crate::geo::EUROPE_LAT,
+        crate::geo::EUROPE_LON,
+        cli.zoom.unwrap_or(crate::geo::EUROPE_ZOOM),
+    );
+
+    if cli.no_location {
+        return (europe, arbiter, None);
     }
 
-    (
-        Viewport::from_lat_lon(
-            crate::geo::EUROPE_LAT,
-            crate::geo::EUROPE_LON,
-            cli.zoom.unwrap_or(crate::geo::EUROPE_ZOOM),
-        ),
-        "Europe fallback".to_string(),
-        None,
-    )
+    let mut stream = crate::providers::location::spawn(&config.location, log_path);
+
+    // Only the first fix is allowed to move the viewport: once the map is up
+    // the user may have panned, and yanking the view out from under them
+    // because the GPS sharpened by 30 m would be hostile.  Later fixes move
+    // the marker only.
+    let first = tokio::time::timeout(INITIAL_FIX_TIMEOUT, stream.rx.recv()).await;
+    let viewport = match first {
+        Ok(Some(fix)) => {
+            write_log(log_path, format!("boot: initial fix from {}", fix.label()));
+            arbiter.offer(fix);
+            Viewport::from_lat_lon(fix.point.lat, fix.point.lon, cli.zoom.unwrap_or(5.0))
+        }
+        Ok(None) => {
+            // Every backend gave up (no GeoClue daemon, IP fallback off).
+            write_log(log_path, "boot: no location backend available");
+            europe
+        }
+        Err(_) => {
+            write_log(
+                log_path,
+                "boot: no fix within timeout, starting at Europe view",
+            );
+            europe
+        }
+    };
+
+    (viewport, arbiter, Some(stream.rx))
 }
 
 // ── Background task queue ───────────────────────────────────────────
@@ -2129,4 +2678,190 @@ fn spawn_tile_gen(
         }
         let _ = task_tx.send(TaskMsg::Complete { id: tile_task_id });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_cache_eviction_keeps_the_window_around_the_playhead() {
+        // A full 24 h timeline with every slot cached.
+        let timestamps: Vec<i64> = (0..288).map(|i| 1_000_000 - i * 300).collect();
+        let cached = timestamps.clone();
+        let playhead = 100;
+        let evicted = frames_to_evict(&cached, &timestamps, playhead, 48);
+
+        assert_eq!(evicted.len(), 288 - 48, "cache must be brought down to cap");
+        let kept: Vec<i64> = cached
+            .iter()
+            .copied()
+            .filter(|ts| !evicted.contains(ts))
+            .collect();
+        assert_eq!(kept.len(), 48);
+        // The displayed frame must survive — evicting it would blank the map.
+        assert!(kept.contains(&timestamps[playhead]));
+        // What survives is contiguous around the playhead, not scattered.
+        let kept_idx: Vec<usize> = kept
+            .iter()
+            .map(|ts| timestamps.iter().position(|t| t == ts).unwrap())
+            .collect();
+        let far = kept_idx.iter().map(|i| i.abs_diff(playhead)).max().unwrap();
+        assert!(
+            far <= 24,
+            "kept frames should hug the playhead, furthest={far}"
+        );
+    }
+
+    #[test]
+    fn frame_cache_eviction_drops_frames_no_longer_on_the_timeline_first() {
+        let timestamps: Vec<i64> = (0..4).map(|i| 1_000_000 - i * 300).collect();
+        // Two cached frames that fell off the timeline (e.g. after `i` narrowed
+        // the window) plus the four live ones.
+        let mut cached = vec![55_555, 66_666];
+        cached.extend(timestamps.iter().copied());
+        let evicted = frames_to_evict(&cached, &timestamps, 0, 4);
+        assert_eq!(
+            evicted.len(),
+            2,
+            "only the excess is dropped, not the whole tail"
+        );
+        assert!(evicted.contains(&55_555) && evicted.contains(&66_666));
+        for ts in &timestamps {
+            assert!(!evicted.contains(ts), "live timeline frames must be kept");
+        }
+    }
+
+    #[test]
+    fn ring_distance_measures_across_the_wrap() {
+        // 10 slots: index 0 is newest, 9 oldest, and playback joins them.
+        assert_eq!(ring_distance(0, 0, 10), 0);
+        assert_eq!(ring_distance(9, 0, 10), 1, "oldest is one step from newest");
+        assert_eq!(ring_distance(0, 9, 10), 1, "and symmetrically back");
+        assert_eq!(ring_distance(5, 0, 10), 5, "the far side stays far");
+        assert_eq!(ring_distance(8, 1, 10), 3);
+        assert_eq!(ring_distance(0, 0, 0), 0, "an empty timeline has no distance");
+    }
+
+    #[test]
+    fn eviction_keeps_the_frames_just_past_the_wrap() {
+        // Playhead on the newest frame, every slot cached, cap 48.  The next
+        // frames playback shows are the oldest ones, across the seam.
+        let timestamps: Vec<i64> = (0..288).map(|i| 1_000_000 - i * 300).collect();
+        let evicted = frames_to_evict(&timestamps, &timestamps, 0, 48);
+        let kept: Vec<i64> = timestamps
+            .iter()
+            .copied()
+            .filter(|ts| !evicted.contains(ts))
+            .collect();
+        assert_eq!(kept.len(), 48);
+        assert!(kept.contains(&timestamps[0]), "displayed frame survives");
+        // The oldest frames — one step away round the ring — must survive too.
+        assert!(
+            kept.contains(&timestamps[287]),
+            "the frame playback wraps onto was evicted"
+        );
+        assert!(kept.contains(&timestamps[286]));
+        // The genuinely distant middle of the timeline is what goes.
+        assert!(!kept.contains(&timestamps[144]));
+    }
+
+    #[test]
+    fn stepping_older_wraps_past_the_oldest_onto_the_newest() {
+        assert_eq!(stepped_index(0, 10, Step::Older), Some(1));
+        assert_eq!(stepped_index(8, 10, Step::Older), Some(9));
+        assert_eq!(
+            stepped_index(9, 10, Step::Older),
+            Some(0),
+            "past the oldest comes the newest, not a dead end"
+        );
+    }
+
+    #[test]
+    fn stepping_newer_wraps_past_the_newest_onto_the_oldest() {
+        assert_eq!(stepped_index(9, 10, Step::Newer), Some(8));
+        assert_eq!(stepped_index(1, 10, Step::Newer), Some(0));
+        assert_eq!(
+            stepped_index(0, 10, Step::Newer),
+            Some(9),
+            "past the newest comes the oldest"
+        );
+    }
+
+    #[test]
+    fn stepping_an_empty_timeline_does_nothing() {
+        assert_eq!(stepped_index(0, 0, Step::Older), None);
+        assert_eq!(stepped_index(0, 0, Step::Newer), None);
+    }
+
+    #[test]
+    fn stepping_a_single_frame_timeline_stays_put() {
+        assert_eq!(stepped_index(0, 1, Step::Older), Some(0));
+        assert_eq!(stepped_index(0, 1, Step::Newer), Some(0));
+    }
+
+    #[test]
+    fn stepping_from_a_stale_index_lands_back_in_range() {
+        // `i` narrowing the window can leave the playhead past the new end.
+        assert_eq!(stepped_index(50, 10, Step::Older), Some(0));
+        assert_eq!(stepped_index(50, 10, Step::Newer), Some(9));
+    }
+
+    #[test]
+    fn a_full_lap_of_steps_returns_to_where_it_started() {
+        let len = 7;
+        let mut i = 0;
+        for _ in 0..len {
+            i = stepped_index(i, len, Step::Older).unwrap();
+        }
+        assert_eq!(i, 0, "stepping older through every slot closes the loop");
+        for _ in 0..len {
+            i = stepped_index(i, len, Step::Newer).unwrap();
+        }
+        assert_eq!(i, 0, "and so does stepping back the other way");
+    }
+
+    #[test]
+    fn frame_cache_under_cap_is_left_alone() {
+        let timestamps: Vec<i64> = (0..10).map(|i| 1_000_000 - i * 300).collect();
+        assert!(frames_to_evict(&timestamps, &timestamps, 0, 48).is_empty());
+    }
+
+    #[test]
+    fn phantom_slot_is_removed_from_the_timeline() {
+        let ts = [500i64, 400, 300];
+        // 400 was requested but the provider served 300's data.
+        let (remaining, _) = timeline_without_phantom(&ts, 0, 400, 300, false).unwrap();
+        assert_eq!(remaining, vec![500, 300], "phantom slot must not remain");
+    }
+
+    #[test]
+    fn viewer_keeps_watching_the_same_time_across_a_removal() {
+        let ts = [500i64, 400, 300];
+        // Viewing 300 (index 2) while an earlier slot 400 turns out phantom.
+        // Index must follow the time, not stay at 2 (which no longer exists).
+        let (remaining, index) = timeline_without_phantom(&ts, 2, 400, 300, false).unwrap();
+        assert_eq!(remaining[index], 300, "must still display the same time");
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn viewing_the_phantom_itself_falls_back_to_the_resolved_time() {
+        let ts = [500i64, 400, 300];
+        let (remaining, index) = timeline_without_phantom(&ts, 1, 400, 300, false).unwrap();
+        assert_eq!(remaining[index], 300, "falls back to what was resolved");
+    }
+
+    #[test]
+    fn live_mode_snaps_back_to_the_newest_frame() {
+        let ts = [500i64, 400, 300];
+        let (_, index) = timeline_without_phantom(&ts, 2, 400, 300, true).unwrap();
+        assert_eq!(index, 0, "live always shows newest");
+    }
+
+    #[test]
+    fn unknown_slot_is_not_a_removal() {
+        let ts = [500i64, 400, 300];
+        assert!(timeline_without_phantom(&ts, 0, 999, 300, false).is_none());
+    }
 }

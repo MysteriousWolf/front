@@ -24,7 +24,32 @@ serde_json = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"], optional = true }
+zstd = "0.13.3"
+libc = "0.2.186"
+
+# Location backends are per-platform: GeoClue speaks D-Bus (Linux only),
+# Windows and macOS use their native OS location services.
+[target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Devices_Geolocation",
+    "Foundation",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-location = { version = "0.3", features = [
+    "CLLocation",
+    "CLLocationManager",
+    "CLLocationManagerDelegate",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSError",
+    "NSRunLoop",
+] }
 
 [features]
 default = ["mqtt", "lightning"]

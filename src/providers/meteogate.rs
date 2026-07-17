@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use chrono::Datelike;
 use color_eyre::eyre::{Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use tiff::decoder::{ifd, Decoder, DecodingResult};
 use tiff::tags::Tag;
@@ -16,6 +15,32 @@ use crate::cache::{read_if_exists, write_atomic, write_log, FrontDirs};
 use crate::config::MeteoGateConfig;
 use crate::geo::{world_to_lat_lon, Bounds, TileCoord, WorldPoint};
 use crate::layers::{RadarFrame, RadarRun, RadarTile, Rgb8};
+
+/// Cadence of the OPERA composite: one published slot every 5 minutes.
+pub const SLOT_SECS: i64 = 300;
+
+/// Selectable history depths, in hours.  The `openradar-24h` bucket retains a
+/// rolling 24 h (verified: the day before yesterday lists zero keys), so 24 is
+/// the deepest window it can serve.
+pub const HISTORY_OPTIONS: [u8; 4] = [3, 6, 12, 24];
+
+/// Default history depth in hours.
+pub const DEFAULT_HISTORY_HOURS: u8 = 3;
+
+/// Number of 5-minute slots spanning `hours` of history.
+pub fn frames_for_hours(hours: u8) -> usize {
+    (hours as usize) * 3600 / SLOT_SECS as usize
+}
+
+/// Next depth in the cycle, wrapping back to the shortest.
+pub fn next_history_hours(hours: u8) -> u8 {
+    let i = HISTORY_OPTIONS.iter().position(|&h| h == hours);
+    match i {
+        Some(i) => HISTORY_OPTIONS[(i + 1) % HISTORY_OPTIONS.len()],
+        // Unrecognised value (e.g. hand-edited state.toml): snap to default.
+        None => DEFAULT_HISTORY_HOURS,
+    }
+}
 
 const S3_PREFIX: &str = "OPERA/COMP";
 const PRODUCT: &str = "DBZH";
@@ -34,18 +59,90 @@ const LAEA_FALSE_N: f64 = -2_100_000.0;
 /// Minimum dBZ value (≈ 1 dBZ). Values below this are noise/undetect.
 const MIN_DBZ: f32 = 1.0;
 
+// ---------------------------------------------------------------------------
+// On-disk grid format (`.frd`)
+// ---------------------------------------------------------------------------
+//
+// The OPERA GeoTIFF is a transport format, not a good cache format.  It carries
+// two f32 bands — inflating one frame yields ~151 MB, of which we discard half
+// (only sample 0 is reflectivity) — and its deflate stream costs ~147 ms to
+// decode, which dominated frame loading whether the bytes came from S3 or disk.
+//
+// Band 0 is not really continuous: it is quantised to exact 0.5 dBZ steps, so
+// every value it holds fits a `u8` code *losslessly*.  Storing those codes under
+// zstd instead gives, per frame: 0.80 MB on disk (vs 2.82 MB), ~3 ms to decode
+// (vs ~198 ms), and a 16.7 MB grid in RAM (vs 66.9 MB).  Smaller, faster and
+// lighter at once, which is why the cache holds `.frd` and not the source TIFF.
+
+/// Magic + version.  Bumping the trailing byte invalidates old caches: readers
+/// reject unknown versions and the frame is refetched.
+const FRD_MAGIC: &[u8; 4] = b"FRD1";
+
+/// dBZ of code 1.  Code 0 is reserved for no-data/undetect.
+const DBZ_BASE: f32 = -32.0;
+
+/// dBZ per code step.  Matches the quantisation OPERA already applies; the
+/// writer verifies this rather than assuming it.
+const DBZ_STEP: f32 = 0.5;
+
+/// Values at or below this are the file's no-data sentinel (-9 999 000), not
+/// weak echo.
+const DBZ_SENTINEL_MAX: f32 = -1000.0;
+
+/// zstd level for grid payloads.  Level 1 is the sweet spot here: it matches
+/// level 9's size to within 7 % (0.80 vs 0.75 MB) while decompressing at
+/// ~6 GB/s, and compression happens once per frame on a background task.
+const FRD_ZSTD_LEVEL: i32 = 1;
+
+/// Encode one dBZ sample as a `u8` code, or `None` when it is no-data.
+///
+/// Returns `Err` when the value doesn't sit on the expected 0.5 dBZ grid or
+/// falls outside `u8` range.  That is deliberate: silently rounding to the
+/// nearest code would corrupt pixels invisibly if OPERA ever changed its
+/// quantisation, so the conversion fails loudly instead.
+fn dbz_to_code(v: f32) -> Result<u8> {
+    if !v.is_finite() || v <= DBZ_SENTINEL_MAX {
+        return Ok(0);
+    }
+    let step = ((v - DBZ_BASE) / DBZ_STEP).round();
+    let code = step + 1.0;
+    if !(1.0..=255.0).contains(&code) {
+        color_eyre::eyre::bail!("dBZ value {v} outside representable range");
+    }
+    let code = code as u8;
+    // Verify rather than trust: the round-trip must be exact.
+    if (code_to_dbz(code).unwrap_or(f32::NAN) - v).abs() > 1e-3 {
+        color_eyre::eyre::bail!("dBZ value {v} is not on the {DBZ_STEP} dBZ grid");
+    }
+    Ok(code)
+}
+
+/// Decode a `u8` code back to dBZ.  `None` for the no-data code.
+#[inline]
+fn code_to_dbz(code: u8) -> Option<f32> {
+    if code == 0 {
+        None
+    } else {
+        Some(DBZ_BASE + (f32::from(code) - 1.0) * DBZ_STEP)
+    }
+}
+
 /// Shared in-memory cache for decoded radar grids, keyed by timestamp.
 ///
-/// Grids are large (~63 MB each) but decoding one from the raw GeoTIFF
-/// is expensive (tens of ms), so a small LRU keeps the handful of frames
-/// touched during interaction (the current frame plus a couple being
-/// preloaded) resident instead of re-decoding them on every pan/zoom.
+/// A small LRU keeps the frames touched during interaction (the current one
+/// plus a couple being preloaded) resident instead of re-decoding on pan/zoom.
 type GridCache = Arc<tokio::sync::Mutex<Vec<(i64, Arc<RadarGrid>)>>>;
 
-/// Maximum number of decoded grids held in memory at once.  Sized to
-/// cover the interactive frame plus the two concurrent preload slots so
-/// none of them evicts the frame the user is actively viewing.
-const MAX_CACHED_GRIDS: usize = 3;
+/// Maximum number of decoded grids held in memory at once.
+///
+/// Each grid is ~16.7 MB of codes, so this is still among the larger resident
+/// costs.  It only pays off when the *same* timestamp is re-decoded — a zoom or
+/// pan of the frame on screen.  Preload streams distinct timestamps through it
+/// and never re-reads them, so extra slots buy almost nothing: measured over a
+/// session that decoded 144 frames, a 3-slot cache returned 1 hit.  Two slots
+/// keep the interactive frame resident against one concurrent preload; the rest
+/// is left to the on-disk `.frd` grids, which reload in ~3 ms.
+const MAX_CACHED_GRIDS: usize = 2;
 
 /// How long a negative HEAD result ("object not on S3 yet") is cached
 /// before the slot is probed again.
@@ -79,7 +176,7 @@ pub struct MeteoGateProvider {
     config: MeteoGateConfig,
     /// In-memory cache of the decoded LAEA radar grid.  Keyed by
     /// timestamp so zoom changes within the same frame don't re-decode
-    /// the ~63 MB float grid from the raw GeoTIFF on disk.
+    /// the grid from disk.
     grid_cache: GridCache,
     /// Cache of HEAD-probe results so timestamp resolution doesn't
     /// re-hit S3 on every viewport change.
@@ -124,32 +221,81 @@ impl MeteoGateProvider {
         )
     }
 
+    /// Path of the cached grid.  The source TIFF is never kept: it is converted
+    /// to `.frd` on arrival and only that is stored.
     fn cache_path(&self, timestamp: i64) -> PathBuf {
         self.dirs
             .radar_dir
-            .join(format!("meteogate/radar/{}.tiff", timestamp))
+            .join(format!("meteogate/radar/{}.frd", timestamp))
     }
 
-    /// Discover available frame timestamps (12 frames × 5 min = 1 hour).
-    /// Return the list of available radar frame timestamps, newest first.
+    /// Delete GeoTIFFs left by builds that cached the source format.
+    ///
+    /// They are never read again — the cache holds `.frd` now — and at ~2.8 MB
+    /// each they would otherwise sit on disk until the 24 h prune aged them out.
+    /// Returns the number of bytes reclaimed.
+    pub fn purge_legacy_tiffs(&self) -> u64 {
+        let dir = self.dirs.radar_dir.join("meteogate/radar");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut freed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "tiff") {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(&path).is_ok() {
+                    freed += size;
+                }
+            }
+        }
+        freed
+    }
+
+    /// Timestamps whose grid is already on disk.
+    ///
+    /// These load without touching the network, so the timeline can show them
+    /// as available rather than as slots that would need a fetch.  One readdir
+    /// of a few hundred entries; call it on timeline changes, not per render.
+    pub fn cached_timestamps(&self) -> HashSet<i64> {
+        let dir = self.dirs.radar_dir.join("meteogate/radar");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return HashSet::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension()? != "frd" {
+                    return None;
+                }
+                path.file_stem()?.to_str()?.parse::<i64>().ok()
+            })
+            .collect()
+    }
+
+    /// Return the list of available radar frame timestamps, newest first,
+    /// spanning `hours` of history at the 5-minute slot cadence.
     ///
     /// Probes S3 for the current boundary slot so the caller gets the
     /// absolute latest frame when it is already published.  Falls back to
     /// one slot back (`latest - 300`) — the same conservative value used
     /// by the synchronous [`compute_frame_list`] — if the boundary is not
     /// on S3 yet.  One HEAD request at most; result is probe-cached.
-    pub async fn frame_list(&self) -> Result<Vec<i64>> {
+    pub async fn frame_list(&self, hours: u8) -> Result<Vec<i64>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let latest = now - (now % 300);
+        let latest = now - (now % SLOT_SECS);
         let start = if self.probe_geotiff(latest).await.unwrap_or(false) {
             latest
         } else {
-            latest - 300
+            latest - SLOT_SECS
         };
-        Ok((0..12).map(|i| start - i * 300).collect())
+        Ok((0..frames_for_hours(hours) as i64)
+            .map(|i| start - i * SLOT_SECS)
+            .collect())
     }
 
     pub async fn frame(&self, timestamp: i64, bounds: Bounds, zoom: f64) -> Result<RadarFrame> {
@@ -181,18 +327,7 @@ impl MeteoGateProvider {
                 return Ok(g);
             }
         }
-        write_log(log, format!("meteogate: fetching geotiff ts={timestamp}"));
-        let bytes = self.fetch_geotiff(timestamp).await?;
-        write_log(
-            log,
-            format!("meteogate: got {} bytes, parsing", bytes.len()),
-        );
-        let g = Arc::new(
-            tokio::task::spawn_blocking(move || parse_geotiff(&bytes))
-                .await
-                .wrap_err("parse_geotiff task panicked")??,
-        );
-        write_log(log, "meteogate: grid parsed OK");
+        let g = Arc::new(self.load_grid_uncached(timestamp).await?);
         let mut cache = self.grid_cache.lock().await;
         // A concurrent caller may have decoded the same grid while we were
         // parsing; keep a single entry per timestamp.
@@ -327,13 +462,37 @@ impl MeteoGateProvider {
         }
     }
 
-    async fn fetch_geotiff(&self, timestamp: i64) -> Result<Vec<u8>> {
+    /// Produce the grid for `timestamp`, from the `.frd` cache when present and
+    /// otherwise by fetching the GeoTIFF and converting it.
+    ///
+    /// The cached path decompresses one zstd payload (~3 ms).  The cold path
+    /// still pays the GeoTIFF's ~150 ms inflate, but only ever once per frame:
+    /// the conversion is written out so no later load repeats it.
+    async fn load_grid_uncached(&self, timestamp: i64) -> Result<RadarGrid> {
         let log = &self.dirs.log_path;
         let path = self.cache_path(timestamp);
+
         if let Some(bytes) = read_if_exists(&path)? {
-            write_log(log, format!("meteogate: geotiff cache hit ts={timestamp}"));
-            return Ok(bytes);
+            let grid = tokio::task::spawn_blocking(move || decode_frd(&bytes))
+                .await
+                .wrap_err("decode_frd task panicked")?;
+            match grid {
+                Ok(g) => {
+                    write_log(log, format!("meteogate: frd cache hit ts={timestamp}"));
+                    return Ok(g);
+                }
+                // A truncated or older-format file: drop it and refetch rather
+                // than failing the frame.
+                Err(e) => {
+                    write_log(
+                        log,
+                        format!("meteogate: discarding unreadable frd ts={timestamp}: {e}"),
+                    );
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
+
         let url = self.s3_url(timestamp);
         write_log(log, format!("meteogate: downloading {url}"));
         let bytes = self
@@ -349,8 +508,27 @@ impl MeteoGateProvider {
             .wrap_err("read MeteoGate GeoTIFF")?
             .to_vec();
         write_log(log, format!("meteogate: downloaded {} bytes", bytes.len()));
-        write_atomic(&path, &bytes)?;
-        Ok(bytes)
+
+        let (grid, encoded) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let grid = parse_geotiff(&bytes)?;
+            let encoded = encode_frd(&grid)?;
+            Ok((grid, encoded))
+        })
+        .await
+        .wrap_err("parse_geotiff task panicked")??;
+
+        write_log(
+            log,
+            format!(
+                "meteogate: converted ts={timestamp} -> frd {} bytes",
+                encoded.len()
+            ),
+        );
+        // A failed write only costs a re-convert next time; don't fail the frame.
+        if let Err(e) = write_atomic(&path, &encoded) {
+            write_log(log, format!("meteogate: caching frd ts={timestamp}: {e}"));
+        }
+        Ok(grid)
     }
 
     /// Send a HEAD request with a short timeout; return `true` if the
@@ -389,7 +567,7 @@ impl MeteoGateProvider {
     /// backwards in 5‑min steps and return the newest that exists (up to
     /// 30 min / 7 attempts).
     /// Check whether the object for `ts` exists, consulting the probe
-    /// cache first.  A locally cached GeoTIFF counts as existing without
+    /// cache first.  A locally cached grid counts as existing without
     /// any network traffic.
     async fn probe_geotiff(&self, ts: i64) -> Result<bool> {
         {
@@ -419,29 +597,43 @@ impl MeteoGateProvider {
 
     async fn resolve_nearest_available(&self, timestamp: i64) -> Result<i64> {
         let log = &self.dirs.log_path;
-        let candidates: Vec<i64> = (0..=30).step_by(5).map(|o| timestamp - o * 60).collect();
 
-        // Fire all probes concurrently; the nearest existing timestamp
-        // wins.  This replaces 7 sequential 3-second HEAD requests
-        // (worst case 21s) with a single round of parallel probes.
-        let mut futs: FuturesUnordered<_> = candidates
-            .iter()
-            .map(|&ts| async move {
-                match self.probe_geotiff(ts).await {
-                    Ok(true) => Some(ts),
-                    _ => None,
-                }
-            })
-            .collect();
+        // Fast path: the requested slot itself is published in the common
+        // case, so check it alone before fanning out.  This also avoids
+        // spending six needless HEADs on every frame of the timeline.
+        if self.probe_geotiff(timestamp).await.unwrap_or(false) {
+            write_log(
+                log,
+                format!("meteogate: resolved ts={timestamp} -> nearest={timestamp}"),
+            );
+            return Ok(timestamp);
+        }
 
-        while let Some(result) = futs.next().await {
-            if let Some(ts) = result {
-                write_log(
-                    log,
-                    format!("meteogate: resolved ts={timestamp} -> nearest={ts}"),
-                );
-                return Ok(ts);
+        let candidates: Vec<i64> = (5..=30).step_by(5).map(|o| timestamp - o * 60).collect();
+
+        // Probe the fallback slots concurrently, but pick the winner by
+        // candidate order rather than completion order: a probe that resolves
+        // from cache finishes instantly and would otherwise beat a nearer slot
+        // still awaiting its HEAD, silently pulling the frame further back in
+        // time.  Waiting for the full round costs one 3 s timeout at worst.
+        let probes = candidates.iter().map(|&ts| async move {
+            match self.probe_geotiff(ts).await {
+                Ok(true) => Some(ts),
+                _ => None,
             }
+        });
+
+        if let Some(ts) = futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .next()
+        {
+            write_log(
+                log,
+                format!("meteogate: resolved ts={timestamp} -> nearest={ts}"),
+            );
+            return Ok(ts);
         }
         write_log(
             log,
@@ -459,26 +651,31 @@ impl MeteoGateProvider {
 // Grid representation
 // ---------------------------------------------------------------------------
 
-/// Compute the list of expected radar frame timestamps (12 frames ×
-/// 5 min = 1 hour), newest first.  Purely local — no network traffic —
-/// so the UI can poll it cheaply to detect when a new slot opens.
+/// Compute the list of expected radar frame timestamps spanning `hours` of
+/// history, newest first.  Purely local — no network traffic — so the UI can
+/// poll it cheaply to detect when a new slot opens.
 ///
 /// Starts one slot back from the current 5-min boundary: the boundary
 /// itself is the still-scanning slot and is never published yet, causing
 /// the two most recent entries to resolve to the same file on S3.
-pub fn compute_frame_list() -> Vec<i64> {
+pub fn compute_frame_list(hours: u8) -> Vec<i64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let latest = now - (now % 300);
-    (0..12).map(|i| latest - 300 - i * 300).collect()
+    let latest = now - (now % SLOT_SECS);
+    (0..frames_for_hours(hours) as i64)
+        .map(|i| latest - SLOT_SECS - i * SLOT_SECS)
+        .collect()
 }
 
 #[derive(Debug)]
 struct RadarGrid {
-    /// Row-major dBZ samples, `width * height` long.
-    data: Vec<f32>,
+    /// Row-major dBZ codes, `width * height` long.  Held as codes rather than
+    /// f32: a tile build samples ~1 M of the 16.7 M pixels, so decoding at
+    /// sample time is cheaper than expanding the whole grid, and keeps the
+    /// resident grid at 16.7 MB instead of 66.9 MB.
+    codes: Vec<u8>,
     width: u32,
     height: u32,
     /// LAEA easting of the top-left pixel centre.
@@ -514,13 +711,68 @@ impl RadarGrid {
 
     /// Sample dBZ value at (col, row). Returns `None` if the pixel is fill/no-data.
     fn sample(&self, col: usize, row: usize) -> Option<f32> {
-        let v = self.data[row * self.width as usize + col];
-        if v >= MIN_DBZ {
-            Some(v)
-        } else {
-            None
-        }
+        let code = self.codes[row * self.width as usize + col];
+        code_to_dbz(code).filter(|v| *v >= MIN_DBZ)
     }
+}
+
+// ---------------------------------------------------------------------------
+// `.frd` container
+// ---------------------------------------------------------------------------
+
+/// Serialise a grid: fixed header, then the zstd-compressed code plane.
+fn encode_frd(grid: &RadarGrid) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(grid.codes.len() / 16);
+    out.extend_from_slice(FRD_MAGIC);
+    out.extend_from_slice(&grid.width.to_le_bytes());
+    out.extend_from_slice(&grid.height.to_le_bytes());
+    out.extend_from_slice(&grid.tie_x.to_le_bytes());
+    out.extend_from_slice(&grid.tie_y.to_le_bytes());
+    out.extend_from_slice(&grid.scale_x.to_le_bytes());
+    out.extend_from_slice(&grid.scale_y.to_le_bytes());
+    let payload =
+        zstd::encode_all(grid.codes.as_slice(), FRD_ZSTD_LEVEL).wrap_err("compress radar grid")?;
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Header layout: magic(4) + width(4) + height(4) + 4×f64 geotransform.
+const FRD_HEADER_LEN: usize = 4 + 4 + 4 + 8 * 4;
+
+/// Parse a `.frd` produced by [`encode_frd`].
+///
+/// Rejects an unknown magic/version rather than guessing, so a cache written by
+/// an older build is refetched instead of misread.
+fn decode_frd(bytes: &[u8]) -> Result<RadarGrid> {
+    if bytes.len() < FRD_HEADER_LEN || &bytes[0..4] != FRD_MAGIC {
+        color_eyre::eyre::bail!("not an frd grid (bad magic)");
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    let f64_at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    let width = u32_at(4);
+    let height = u32_at(8);
+    let tie_x = f64_at(12);
+    let tie_y = f64_at(20);
+    let scale_x = f64_at(28);
+    let scale_y = f64_at(36);
+
+    let expected = (width as usize) * (height as usize);
+    let codes = zstd::decode_all(&bytes[FRD_HEADER_LEN..]).wrap_err("decompress radar grid")?;
+    if codes.len() != expected {
+        color_eyre::eyre::bail!(
+            "frd payload is {} codes, header declares {width}x{height}={expected}",
+            codes.len()
+        );
+    }
+    Ok(RadarGrid {
+        codes,
+        width,
+        height,
+        tie_x,
+        tie_y,
+        scale_x,
+        scale_y,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -629,16 +881,14 @@ fn parse_geotiff(bytes: &[u8]) -> Result<RadarGrid> {
         );
     }
 
-    let data: Vec<f32> = if stride == 1 {
-        let mut pixels = pixels;
-        pixels.truncate(npixels);
-        pixels
-    } else {
-        (0..npixels).map(|i| pixels[i * stride]).collect()
-    };
+    // Quantise straight to codes: only sample 0 of each pixel is reflectivity,
+    // so with stride 2 this also drops the band we never read.
+    let codes: Vec<u8> = (0..npixels)
+        .map(|i| dbz_to_code(pixels[i * stride]))
+        .collect::<Result<_>>()?;
 
     Ok(RadarGrid {
-        data,
+        codes,
         width,
         height,
         tie_x,
@@ -856,6 +1106,118 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn every_opera_dbz_step_round_trips_exactly() {
+        // OPERA quantises to 0.5 dBZ; the whole u8 range must survive a
+        // round-trip, since that exactness is what makes the format lossless
+        // rather than a cheap approximation.
+        for code in 1..=255u8 {
+            let dbz = code_to_dbz(code).expect("non-zero code has a value");
+            assert_eq!(dbz_to_code(dbz).unwrap(), code, "dBZ {dbz} lost its code");
+        }
+        assert_eq!(code_to_dbz(0), None, "code 0 is no-data");
+    }
+
+    #[test]
+    fn nodata_and_sentinel_encode_to_the_nodata_code() {
+        assert_eq!(dbz_to_code(f32::NAN).unwrap(), 0);
+        assert_eq!(dbz_to_code(-9_999_000.0).unwrap(), 0);
+        assert_eq!(dbz_to_code(f32::NEG_INFINITY).unwrap(), 0);
+    }
+
+    #[test]
+    fn off_grid_values_fail_loudly_rather_than_rounding() {
+        // A value between two steps would otherwise be silently snapped, which
+        // is how a quantisation change upstream would corrupt pixels unnoticed.
+        assert!(
+            dbz_to_code(10.25).is_err(),
+            "off-grid value must be rejected"
+        );
+        // Outside the representable range.
+        assert!(dbz_to_code(200.0).is_err());
+        assert!(dbz_to_code(-100.0).is_err());
+    }
+
+    #[test]
+    fn frd_round_trips_grid_and_geotransform() {
+        let mut codes = vec![0u8; 64 * 32];
+        for (i, c) in codes.iter_mut().enumerate() {
+            *c = (i % 256) as u8;
+        }
+        let grid = RadarGrid {
+            codes: codes.clone(),
+            width: 64,
+            height: 32,
+            tie_x: -500.5,
+            tie_y: 500.25,
+            scale_x: 1000.0,
+            scale_y: 2000.0,
+        };
+        let encoded = encode_frd(&grid).expect("encode");
+        let back = decode_frd(&encoded).expect("decode");
+        assert_eq!(back.codes, codes);
+        assert_eq!((back.width, back.height), (64, 32));
+        assert_eq!(back.tie_x, -500.5);
+        assert_eq!(back.tie_y, 500.25);
+        assert_eq!(back.scale_x, 1000.0);
+        assert_eq!(back.scale_y, 2000.0);
+    }
+
+    #[test]
+    fn frd_rejects_foreign_and_truncated_files() {
+        // A GeoTIFF (or anything else) must not be mistaken for an frd.
+        assert!(decode_frd(b"II*\0garbage").is_err());
+        assert!(decode_frd(b"").is_err());
+        // Right magic, payload shorter than the header claims.
+        let grid = RadarGrid {
+            codes: vec![7u8; 16],
+            width: 4,
+            height: 4,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+        };
+        let mut enc = encode_frd(&grid).unwrap();
+        enc.truncate(enc.len() - 1);
+        assert!(
+            decode_frd(&enc).is_err(),
+            "truncated payload must not decode"
+        );
+    }
+
+    #[test]
+    fn frd_payload_beats_the_source_geotiff_on_size() {
+        // Realistic shape: mostly no-data with banded echo, like a real sweep.
+        let (w, h) = (3800u32, 4400u32);
+        let mut codes = vec![0u8; (w * h) as usize];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                if (row / 40 + col / 40) % 7 == 0 {
+                    codes[row * w as usize + col] = 60 + (row % 32) as u8;
+                }
+            }
+        }
+        let grid = RadarGrid {
+            codes,
+            width: w,
+            height: h,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1000.0,
+            scale_y: 1000.0,
+        };
+        let encoded = encode_frd(&grid).expect("encode");
+        // Source frames measure ~2.8 MB; the point of the format is to land
+        // well under that while decoding ~60x faster.
+        assert!(
+            encoded.len() < 2_800_000,
+            "frd payload {} bytes should undercut the source geotiff",
+            encoded.len()
+        );
+        assert_eq!(decode_frd(&encoded).unwrap().codes, grid.codes);
+    }
+
     /// Verify that `lat_lon_to_uv` maps the LAEA origin (55°N, 10°E) to the
     /// centre of the grid (~pixel 1950, 2100) when accounting for false
     /// easting/northing.
@@ -863,7 +1225,7 @@ mod tests {
     fn lat_lon_to_uv_maps_origin_to_center() {
         // Build a minimal grid with parameters matching the real GeoTIFF.
         let grid = RadarGrid {
-            data: vec![0.0f32; 3800 * 4400],
+            codes: vec![0u8; 3800 * 4400],
             width: 3800,
             height: 4400,
             tie_x: -500.0, // CRS easting of pixel (0,0)
@@ -888,7 +1250,7 @@ mod tests {
     #[test]
     fn lat_lon_to_uv_outside_returns_none() {
         let grid = RadarGrid {
-            data: vec![0.0f32; 3800 * 4400],
+            codes: vec![0u8; 3800 * 4400],
             width: 3800,
             height: 4400,
             tie_x: -500.0,
@@ -968,14 +1330,37 @@ mod tests {
     }
 
     #[test]
-    fn compute_frame_list_returns_12_descending_5min_steps() {
-        let frames = compute_frame_list();
-        assert_eq!(frames.len(), 12);
+    fn compute_frame_list_returns_descending_5min_steps() {
+        let frames = compute_frame_list(DEFAULT_HISTORY_HOURS);
+        assert_eq!(frames.len(), 36, "3 h at 5-min cadence");
         // Each frame is 300 s before the previous.
         for w in frames.windows(2) {
             assert_eq!(w[0] - w[1], 300, "frames must be 5 min apart");
         }
         // Most recent frame is a multiple of 300.
         assert_eq!(frames[0] % 300, 0, "latest frame aligned to 5 min boundary");
+    }
+
+    #[test]
+    fn frame_list_length_tracks_history_depth() {
+        for hours in HISTORY_OPTIONS {
+            assert_eq!(
+                compute_frame_list(hours).len(),
+                frames_for_hours(hours),
+                "{hours} h list must span the requested depth"
+            );
+        }
+        assert_eq!(frames_for_hours(24), 288, "24 h is the bucket's retention");
+    }
+
+    #[test]
+    fn history_cycle_wraps_and_recovers_from_bogus_values() {
+        assert_eq!(next_history_hours(3), 6);
+        assert_eq!(next_history_hours(6), 12);
+        assert_eq!(next_history_hours(12), 24);
+        assert_eq!(next_history_hours(24), 3, "wraps back to the shortest");
+        // A value never offered (e.g. hand-edited state.toml) must not wedge
+        // the cycle — it snaps back to the default.
+        assert_eq!(next_history_hours(7), DEFAULT_HISTORY_HOURS);
     }
 }

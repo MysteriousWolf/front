@@ -1,7 +1,8 @@
 pub mod eumetnet;
-pub mod geoclue;
+pub mod geocode;
 #[cfg(feature = "lightning")]
 pub mod lightning;
+pub mod location;
 pub mod maps;
 pub mod meteoalarm;
 pub mod meteogate;

@@ -17,6 +17,9 @@ pub enum RenderMode {
 }
 
 impl RenderMode {
+    /// Every render mode, for iterating the primary/overlay slots.
+    pub const ALL: [RenderMode; 3] = [RenderMode::Braille, RenderMode::Color, RenderMode::Text];
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Braille => "b",
@@ -30,13 +33,18 @@ impl RenderMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderModeState {
     pub braille: Option<LayerId>,
-    /// Non-exclusive overlay braille.  Used by the Lightning layer so its
-    /// braille dots can coexist with another layer's primary braille mode.
-    /// Does not evict the primary `braille` owner when set.
-    #[serde(default)]
-    pub braille_overlay: Option<LayerId>,
     pub color: Option<LayerId>,
     pub text: Option<LayerId>,
+    /// Non-exclusive overlay owners, as (mode, layer) pairs.
+    ///
+    /// A *list*, not one slot per mode: several layers may overlay the same
+    /// mode at once and none of them evicts the primary owner. The location
+    /// marker and the search pin both overlay `Text`, and they answer
+    /// different questions — "where am I" versus "where is the place I
+    /// searched" — so a search must never blank the marker. Lightning's
+    /// braille dots sit in here alongside radar's primary braille.
+    #[serde(default)]
+    pub overlays: Vec<(RenderMode, LayerId)>,
 }
 
 impl Default for RenderModeState {
@@ -49,9 +57,9 @@ impl RenderModeState {
     pub fn new() -> Self {
         Self {
             braille: None,
-            braille_overlay: None,
             color: None,
             text: None,
+            overlays: Vec::new(),
         }
     }
 
@@ -65,33 +73,49 @@ impl RenderModeState {
         }
     }
 
+    /// Every layer overlaying `mode`, in the order they were switched on.
+    /// An overlay draws on top of the primary owner instead of evicting it.
+    pub fn overlays_for(&self, mode: RenderMode) -> impl Iterator<Item = LayerId> + '_ {
+        self.overlays
+            .iter()
+            .filter(move |(m, _)| *m == mode)
+            .map(|(_, l)| *l)
+    }
+
+    /// True when `layer` overlays `mode`.
+    pub fn has_overlay(&self, mode: RenderMode, layer: LayerId) -> bool {
+        self.overlays.contains(&(mode, layer))
+    }
+
+    /// Add `layer` as an overlay of `mode`, leaving other overlays and the
+    /// primary owner untouched.
+    pub fn set_overlay(&mut self, mode: RenderMode, layer: LayerId) {
+        if !self.has_overlay(mode, layer) {
+            self.overlays.push((mode, layer));
+        }
+    }
+
+    /// Remove `layer`'s overlay of `mode`, leaving other overlays alone.
+    pub fn clear_overlay(&mut self, mode: RenderMode, layer: LayerId) {
+        self.overlays.retain(|entry| *entry != (mode, layer));
+    }
+
     /// Returns `true` when `layer` owns `mode` (primary or overlay).
     pub fn has(&self, mode: RenderMode, layer: LayerId) -> bool {
-        self.get(mode) == Some(layer)
-            || (mode == RenderMode::Braille && self.braille_overlay == Some(layer))
+        self.get(mode) == Some(layer) || self.has_overlay(mode, layer)
     }
 
     /// Returns `true` when `layer` owns at least one mode (primary or overlay).
     pub fn has_any(&self, layer: LayerId) -> bool {
-        self.braille == Some(layer)
-            || self.braille_overlay == Some(layer)
-            || self.color == Some(layer)
-            || self.text == Some(layer)
+        RenderMode::ALL.iter().any(|&m| self.has(m, layer))
     }
 
     /// Returns all modes currently owned by `layer` (primary or overlay).
     pub fn modes_for(&self, layer: LayerId) -> Vec<RenderMode> {
-        let mut out = Vec::with_capacity(3);
-        if self.braille == Some(layer) || self.braille_overlay == Some(layer) {
-            out.push(RenderMode::Braille);
-        }
-        if self.color == Some(layer) {
-            out.push(RenderMode::Color);
-        }
-        if self.text == Some(layer) {
-            out.push(RenderMode::Text);
-        }
-        out
+        RenderMode::ALL
+            .into_iter()
+            .filter(|&m| self.has(m, layer))
+            .collect()
     }
 
     /// Assign `mode` to `layer`, removing it from any previous primary owner.
@@ -106,22 +130,47 @@ impl RenderModeState {
 
     /// Toggle overlay braille for `layer` without affecting the primary slot.
     pub fn toggle_braille_overlay(&mut self, layer: LayerId) {
-        if self.braille_overlay == Some(layer) {
-            self.braille_overlay = None;
+        self.toggle_overlay(RenderMode::Braille, layer);
+    }
+
+    /// Toggle `layer` as an overlay of `mode`, leaving the primary owner and
+    /// every other overlay untouched.
+    pub fn toggle_overlay(&mut self, mode: RenderMode, layer: LayerId) {
+        if self.has_overlay(mode, layer) {
+            self.clear_overlay(mode, layer);
         } else {
-            self.braille_overlay = Some(layer);
+            self.set_overlay(mode, layer);
         }
     }
 
     /// Toggle `mode` for `layer`: if `layer` already owns `mode` it is
-    /// removed; otherwise it is assigned (removed from the previous owner).
-    /// Returns the previous owner after the toggle, if any.
+    /// removed; otherwise it is assigned.
+    ///
+    /// Layers listed in `overlay_modes` for this mode go to the overlay slot,
+    /// so they never evict the primary owner — the Location marker must not
+    /// take Text away from the temperature layer just to draw one glyph.
+    /// Returns the previous primary owner, if any.
     pub fn toggle(&mut self, mode: RenderMode, layer: LayerId) -> Option<LayerId> {
+        if overlay_modes(layer).contains(&mode) {
+            self.toggle_overlay(mode, layer);
+            return None;
+        }
         if self.has(mode, layer) {
             self.unassign(mode);
             None
         } else {
             self.assign(mode, layer)
+        }
+    }
+
+    /// Put `layer` into the slot it belongs in for `mode` — overlay for the
+    /// declared exceptions, primary otherwise.  Used when loading state, where
+    /// both kinds are persisted with the same mode tag.
+    pub fn restore(&mut self, mode: RenderMode, layer: LayerId) {
+        if overlay_modes(layer).contains(&mode) {
+            self.set_overlay(mode, layer);
+        } else {
+            self.assign(mode, layer);
         }
     }
 
@@ -134,20 +183,15 @@ impl RenderModeState {
         }
     }
 
-    /// Remove all modes (primary and overlay) from `layer`.
+    /// Remove all modes (primary and overlay) from `layer`, leaving every
+    /// other layer's overlays in place.
     pub fn remove_all(&mut self, layer: LayerId) {
-        if self.braille == Some(layer) {
-            self.braille = None;
+        for mode in RenderMode::ALL {
+            if self.get(mode) == Some(layer) {
+                self.unassign(mode);
+            }
         }
-        if self.braille_overlay == Some(layer) {
-            self.braille_overlay = None;
-        }
-        if self.color == Some(layer) {
-            self.color = None;
-        }
-        if self.text == Some(layer) {
-            self.text = None;
-        }
+        self.overlays.retain(|(_, l)| *l != layer);
     }
 
     /// Try to find the "best" (highest-information) primary mode for `layer`
@@ -169,7 +213,25 @@ fn preferred_modes(id: LayerId) -> &'static [RenderMode] {
         LayerId::Radar => &[RenderMode::Braille, RenderMode::Color, RenderMode::Text],
         LayerId::MeteoAlarm => &[RenderMode::Color, RenderMode::Braille, RenderMode::Text],
         LayerId::Lightning => &[RenderMode::Braille, RenderMode::Color, RenderMode::Text],
+        // Text (the red `x`) first: it marks the spot without hiding the cell
+        // underneath the way the background does.
+        id if id.is_pin() => &[RenderMode::Text, RenderMode::Color],
         id if id.is_observation() => &[RenderMode::Text, RenderMode::Braille, RenderMode::Color],
+        _ => &[],
+    }
+}
+
+/// Modes a layer draws as a non-evicting *overlay* rather than claiming the
+/// exclusive primary slot.
+///
+/// These are the deliberate exceptions to "one layer per mode": Lightning's
+/// braille dots coexist with radar braille, and the Location marker is a
+/// single annotated cell that must not cost the map its temperature readings
+/// or radar colour.  Overlays draw on top of whatever owns the primary slot.
+fn overlay_modes(id: LayerId) -> &'static [RenderMode] {
+    match id {
+        LayerId::Lightning => &[RenderMode::Braille],
+        id if id.is_pin() => &[RenderMode::Text, RenderMode::Color],
         _ => &[],
     }
 }
@@ -245,6 +307,11 @@ impl Rgb8 {
     pub const GREEN: Self = Self::new(0, 255, 0);
     pub const RED: Self = Self::new(255, 0, 0);
     pub const AMBER: Self = Self::new(255, 191, 0);
+    /// The blue already used by the humidity and pressure ramps, promoted to a
+    /// named palette entry so the search pin matches the rest of the map
+    /// rather than introducing a tone of its own.  A pure (0,0,255) would pair
+    /// with `RED` on paper but is barely legible on the dark background.
+    pub const BLUE: Self = Self::new(70, 130, 215);
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -259,6 +326,8 @@ pub enum LayerId {
     SurfWind,
     SurfHumidity,
     SurfPressure,
+    Location,
+    SearchPin,
 }
 
 /// Top-level layer groups that contain sub-layers.
@@ -331,6 +400,8 @@ impl LayerId {
             Self::SurfWind => "Wind Speed",
             Self::SurfHumidity => "Humidity",
             Self::SurfPressure => "Pressure",
+            Self::Location => "My Location",
+            Self::SearchPin => "Search Pin",
         }
     }
 
@@ -369,8 +440,27 @@ impl LayerId {
         matches!(self, Self::Lightning)
     }
 
+    /// True for the "my location" marker layer.
+    pub fn is_location(self) -> bool {
+        matches!(self, Self::Location)
+    }
+
+    /// True for the single-cell map pins: the location marker and the search
+    /// pin.  They share rendering, options and overlay behaviour, differing
+    /// only in colour and where the point comes from.
+    pub fn is_pin(self) -> bool {
+        matches!(self, Self::Location | Self::SearchPin)
+    }
+
+    /// Layers with a plain enabled/disabled flag and no render-mode options.
+    /// Everything else is driven by the render-mode system, where "enabled"
+    /// means "owns a mode".
+    pub fn is_simple_toggle(self) -> bool {
+        self.is_geographic()
+    }
+
     pub fn is_rendered(self) -> bool {
-        !self.is_geographic()
+        !self.is_simple_toggle()
     }
 }
 
@@ -461,6 +551,16 @@ impl LayerRegistry {
             LayerId::Lightning,
             Self::layer_state(LayerId::Lightning, false, false),
         );
+        states.insert(
+            LayerId::Location,
+            Self::layer_state(LayerId::Location, true, false),
+        );
+        // The search pin has nothing to show until `/` finds a place, so it
+        // owns no mode until then; `App::set_search_pin` turns it on.
+        states.insert(
+            LayerId::SearchPin,
+            Self::layer_state(LayerId::SearchPin, false, false),
+        );
         // Temperature enabled by default: any_obs_enabled() must be true on
         // fresh installs so observation fetches trigger immediately.
         states.insert(
@@ -478,6 +578,9 @@ impl LayerRegistry {
         let mut render_modes = RenderModeState::new();
         render_modes.assign(RenderMode::Braille, LayerId::Radar);
         render_modes.assign(RenderMode::Text, LayerId::SurfTemp);
+        // The marker is on by default as a text overlay: it costs SurfTemp
+        // nothing and draws only once a fix arrives.
+        render_modes.set_overlay(RenderMode::Text, LayerId::Location);
 
         Self {
             states,
@@ -539,8 +642,10 @@ impl LayerRegistry {
     fn current_option_count(&self) -> usize {
         match Self::MAIN_ORDER[self.selected_main] {
             MainItem::Header(_) => 0,
-            MainItem::Single(id) if id.is_geographic() => 0,
+            MainItem::Single(id) if id.is_simple_toggle() => 0,
             MainItem::Single(id) if id.is_observation() => 1,
+            // Pins: text (coloured x) and background — no braille.
+            MainItem::Single(id) if id.is_pin() => 2,
             // Lightning has 3 render-mode toggles + 1 trail-duration range.
             MainItem::Single(id) if id.is_lightning() => 4,
             MainItem::Single(_) => 3,
@@ -629,7 +734,7 @@ impl LayerRegistry {
     /// In the main list: toggle a single layer or enter a group.
     /// In the options panel: apply the focused option.
     /// Returns the affected `LayerId` when a layer's state changed.
-    pub fn handle_space(&mut self) -> Option<LayerId> {
+    pub fn activate_selected(&mut self) -> Option<LayerId> {
         match self.focus {
             PanelFocus::Options(i) => {
                 let item = Self::MAIN_ORDER[self.selected_main];
@@ -652,7 +757,7 @@ impl LayerRegistry {
         }
     }
 
-    /// Apply the option at `index` for `item`.  Shared by `handle_space` and
+    /// Apply the option at `index` for `item`.  Shared by `activate_selected` and
     /// any future direct-click path.
     fn apply_option_at(&mut self, item: MainItem, index: usize) -> Option<LayerId> {
         match item {
@@ -664,6 +769,17 @@ impl LayerRegistry {
                 } else {
                     None
                 }
+            }
+            MainItem::Single(id) if id.is_pin() => {
+                // Both are overlays, so neither evicts the temperature or
+                // radar layers; `toggle` routes them by `overlay_modes`.
+                let mode = if index == 0 {
+                    RenderMode::Text
+                } else {
+                    RenderMode::Color
+                };
+                self.render_modes.toggle(mode, id);
+                Some(id)
             }
             MainItem::Single(id) if id.is_lightning() => match index {
                 0 => {
@@ -712,7 +828,7 @@ impl LayerRegistry {
     }
 
     fn activate(&mut self, id: LayerId) {
-        if id.is_geographic() {
+        if id.is_simple_toggle() {
             self.toggle(id);
         } else if id.is_observation() {
             // Observation layers: text mode only.  Space toggles Text
@@ -731,13 +847,14 @@ impl LayerRegistry {
                 }
                 self.render_modes.assign(RenderMode::Text, id);
             }
-        } else if id.is_lightning() {
-            // Lightning uses overlay braille by default so it never evicts radar.
-            // has_any checks overlay too, so this handles all active modes.
+        } else if !overlay_modes(id).is_empty() {
+            // Overlay layers (Lightning, Location) default to their first
+            // preferred mode in the overlay slot so they never evict radar or
+            // the temperature readings.  has_any checks overlays too.
             if self.render_modes.has_any(id) {
                 self.render_modes.remove_all(id);
-            } else {
-                self.render_modes.braille_overlay = Some(id);
+            } else if let Some(&mode) = preferred_modes(id).first() {
+                self.render_modes.toggle_overlay(mode, id);
             }
         } else if self.render_modes.has_any(id) {
             self.render_modes.remove_all(id);
@@ -787,7 +904,7 @@ impl LayerRegistry {
     }
 
     pub fn enabled(&self, id: LayerId) -> bool {
-        if id.is_geographic() {
+        if id.is_simple_toggle() {
             self.states
                 .get(&id)
                 .map(|state| state.enabled)
@@ -837,12 +954,53 @@ impl LayerRegistry {
     }
 
     /// Restore enabled states from saved data. Locked layers are preserved.
-    pub fn restore_enabled(&mut self, enabled: &[LayerId]) {
-        for state in self.states.values_mut() {
-            if !state.locked {
-                state.enabled = enabled.contains(&state.id);
-            }
+    /// Layer set as of the last state.toml format that had no `known_layers`
+    /// field.  Anything absent from this list postdates those files, so a
+    /// legacy state.toml says nothing about it and it must keep its default.
+    const LEGACY_KNOWN_LAYERS: [LayerId; 10] = [
+        LayerId::MapBorders,
+        LayerId::RegionBorders,
+        LayerId::MajorRoads,
+        LayerId::Radar,
+        LayerId::MeteoAlarm,
+        LayerId::Lightning,
+        LayerId::SurfTemp,
+        LayerId::SurfWind,
+        LayerId::SurfHumidity,
+        LayerId::SurfPressure,
+    ];
+
+    /// The layers a saved state file knew about.  An empty `known_layers`
+    /// means the file predates the field, so fall back to the layer set of
+    /// that era.
+    pub fn known_from_state(known: &[LayerId]) -> Vec<LayerId> {
+        if known.is_empty() {
+            Self::LEGACY_KNOWN_LAYERS.to_vec()
+        } else {
+            known.to_vec()
         }
+    }
+
+    /// Apply saved enabled flags.
+    ///
+    /// `known` lists the layers the saved file actually knew about; a layer
+    /// outside it keeps its default rather than being disabled for having been
+    /// absent from a file written before it existed.  Pass an empty `known`
+    /// for legacy files.
+    pub fn restore_enabled(&mut self, enabled: &[LayerId], known: &[LayerId]) {
+        let known = Self::known_from_state(known);
+        for state in self.states.values_mut() {
+            if state.locked || !known.contains(&state.id) {
+                continue;
+            }
+            state.enabled = enabled.contains(&state.id);
+        }
+    }
+
+    /// Every layer this build knows about — persisted as `known_layers` so a
+    /// future release can tell "off" from "did not exist".
+    pub fn known_layers(&self) -> Vec<LayerId> {
+        Self::ORDER.to_vec()
     }
 
     /// Return the list of enabled layer IDs for serialization.
@@ -861,7 +1019,7 @@ impl LayerRegistry {
     pub fn options_for_item(&self, item: MainItem) -> Vec<(&'static str, LayerOption)> {
         match item {
             MainItem::Header(_) => vec![],
-            MainItem::Single(id) if id.is_geographic() => vec![],
+            MainItem::Single(id) if id.is_simple_toggle() => vec![],
             MainItem::Single(id) if id.is_observation() => vec![(
                 "text",
                 LayerOption::Toggle {
@@ -873,6 +1031,30 @@ impl LayerRegistry {
                     ),
                 },
             )],
+            MainItem::Single(id) if id.is_pin() => vec![
+                (
+                    "text",
+                    LayerOption::Toggle {
+                        label: "Text",
+                        value: self.render_modes.has(RenderMode::Text, id),
+                        has_error: matches!(
+                            self.states.get(&id).map(|s| &s.status),
+                            Some(LayerStatus::Error(_))
+                        ),
+                    },
+                ),
+                (
+                    "background",
+                    LayerOption::Toggle {
+                        label: "Background",
+                        value: self.render_modes.has(RenderMode::Color, id),
+                        has_error: matches!(
+                            self.states.get(&id).map(|s| &s.status),
+                            Some(LayerStatus::Error(_))
+                        ),
+                    },
+                ),
+            ],
             MainItem::Single(id) if id.is_lightning() => vec![
                 (
                     "braille",
@@ -956,7 +1138,7 @@ impl LayerRegistry {
         }
     }
 
-    pub const MAIN_ORDER: [MainItem; 9] = [
+    pub const MAIN_ORDER: [MainItem; 11] = [
         // Weather layers first
         MainItem::Header("Weather"),
         MainItem::Single(LayerId::Radar),
@@ -965,12 +1147,14 @@ impl LayerRegistry {
         MainItem::Single(LayerId::Lightning),
         // Geography layers below — Roads on top, Countries fixed at bottom
         MainItem::Header("Geography"),
+        MainItem::Single(LayerId::Location),
+        MainItem::Single(LayerId::SearchPin),
         MainItem::Single(LayerId::MajorRoads),
         MainItem::Single(LayerId::RegionBorders),
         MainItem::Single(LayerId::MapBorders), // Countries — locked, not selectable
     ];
 
-    pub const ORDER: [LayerId; 10] = [
+    pub const ORDER: [LayerId; 12] = [
         LayerId::MapBorders,
         LayerId::RegionBorders,
         LayerId::MajorRoads,
@@ -981,6 +1165,8 @@ impl LayerRegistry {
         LayerId::SurfWind,
         LayerId::SurfHumidity,
         LayerId::SurfPressure,
+        LayerId::Location,
+        LayerId::SearchPin,
     ];
 
     pub fn ordered(&self) -> Vec<&LayerState> {
@@ -1353,12 +1539,6 @@ pub struct RadarRun {
     pub intensity: u8,
 }
 
-#[derive(Debug, Clone)]
-pub struct LocationFix {
-    pub point: GeoPoint,
-    pub label: String,
-}
-
 /// A single MeteoAlarm weather warning feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WarningFeature {
@@ -1475,7 +1655,7 @@ mod tests {
         state.assign(RenderMode::Braille, LayerId::Radar);
         state.assign(RenderMode::Color, LayerId::Radar);
         state.assign(RenderMode::Text, LayerId::Radar);
-        state.braille_overlay = Some(LayerId::Radar);
+        state.set_overlay(RenderMode::Braille, LayerId::Radar);
         state.remove_all(LayerId::Radar);
         assert!(!state.has_any(LayerId::Radar));
     }
@@ -1483,7 +1663,7 @@ mod tests {
     #[test]
     fn test_render_mode_state_has_any_braille_overlay() {
         let mut state = RenderModeState::new();
-        state.braille_overlay = Some(LayerId::Lightning);
+        state.set_overlay(RenderMode::Braille, LayerId::Lightning);
         assert!(state.has_any(LayerId::Lightning));
         assert!(state.has(RenderMode::Braille, LayerId::Lightning));
     }
@@ -1492,9 +1672,9 @@ mod tests {
     fn test_render_mode_state_toggle_braille_overlay_on_off() {
         let mut state = RenderModeState::new();
         state.toggle_braille_overlay(LayerId::Lightning);
-        assert_eq!(state.braille_overlay, Some(LayerId::Lightning));
+        assert!(state.has_overlay(RenderMode::Braille, LayerId::Lightning));
         state.toggle_braille_overlay(LayerId::Lightning);
-        assert_eq!(state.braille_overlay, None);
+        assert!(!state.has_overlay(RenderMode::Braille, LayerId::Lightning));
     }
 
     #[test]
@@ -1749,8 +1929,184 @@ mod tests {
         // Disable everything we can, then restore.
         reg.toggle(LayerId::RegionBorders);
         assert!(!reg.get_state(LayerId::RegionBorders).unwrap().enabled);
-        reg.restore_enabled(&saved);
+        let known = reg.known_layers();
+        reg.restore_enabled(&saved, &known);
         assert!(reg.get_state(LayerId::RegionBorders).unwrap().enabled);
+    }
+
+    /// The marker is one annotated cell — enabling it must never cost the map
+    /// its temperature readings, which own the exclusive Text slot.
+    #[test]
+    fn location_text_does_not_evict_the_temperature_layer() {
+        let mut reg = LayerRegistry::new();
+        // Location defaults to the text overlay; start from a clean slate.
+        reg.mode_state_mut().remove_all(LayerId::Location);
+        reg.mode_state_mut().assign(RenderMode::Text, LayerId::SurfTemp);
+        reg.mode_state_mut().toggle(RenderMode::Text, LayerId::Location);
+        assert!(reg.mode_state().has(RenderMode::Text, LayerId::Location));
+        assert!(
+            reg.mode_state().has(RenderMode::Text, LayerId::SurfTemp),
+            "SurfTemp must keep the primary Text slot"
+        );
+    }
+
+    /// The marker ships on, drawn as a text overlay, and must not have taken
+    /// the exclusive Text slot from the temperature readings to do it.
+    #[test]
+    fn location_is_a_text_overlay_by_default_and_temps_keep_primary_text() {
+        let reg = LayerRegistry::new();
+        assert!(reg.enabled(LayerId::Location), "marker on by default");
+        assert!(reg.mode_state().has_overlay(RenderMode::Text, LayerId::Location));
+        assert_eq!(reg.mode_state().text, Some(LayerId::SurfTemp));
+    }
+
+    /// The two pins answer different questions — "where am I" and "where is
+    /// the place I searched for" — so showing one must never hide the other.
+    #[test]
+    fn location_marker_and_search_pin_coexist() {
+        let mut modes = RenderModeState::new();
+        modes.toggle_overlay(RenderMode::Text, LayerId::Location);
+        modes.toggle_overlay(RenderMode::Text, LayerId::SearchPin);
+        assert!(
+            modes.has(RenderMode::Text, LayerId::Location),
+            "the location marker must survive a search"
+        );
+        assert!(modes.has(RenderMode::Text, LayerId::SearchPin));
+    }
+
+    /// …and the same for their backgrounds, alongside the primary owner.
+    #[test]
+    fn both_pins_overlay_color_without_evicting_radar() {
+        let mut modes = RenderModeState::new();
+        modes.assign(RenderMode::Color, LayerId::Radar);
+        modes.toggle_overlay(RenderMode::Color, LayerId::Location);
+        modes.toggle_overlay(RenderMode::Color, LayerId::SearchPin);
+        assert!(modes.has(RenderMode::Color, LayerId::Radar));
+        assert!(modes.has(RenderMode::Color, LayerId::Location));
+        assert!(modes.has(RenderMode::Color, LayerId::SearchPin));
+    }
+
+    /// Turning one pin off must leave the other alone.
+    #[test]
+    fn clearing_one_pin_leaves_the_other_showing() {
+        let mut modes = RenderModeState::new();
+        modes.toggle_overlay(RenderMode::Text, LayerId::Location);
+        modes.toggle_overlay(RenderMode::Text, LayerId::SearchPin);
+        modes.remove_all(LayerId::SearchPin);
+        assert!(modes.has(RenderMode::Text, LayerId::Location));
+        assert!(!modes.has(RenderMode::Text, LayerId::SearchPin));
+    }
+
+    /// Lightning's braille overlay must still coexist with the pins' modes.
+    #[test]
+    fn lightning_overlay_is_unaffected_by_the_pins() {
+        let mut modes = RenderModeState::new();
+        modes.assign(RenderMode::Braille, LayerId::Radar);
+        modes.toggle_overlay(RenderMode::Braille, LayerId::Lightning);
+        modes.toggle_overlay(RenderMode::Text, LayerId::Location);
+        modes.toggle_overlay(RenderMode::Text, LayerId::SearchPin);
+        assert!(modes.has(RenderMode::Braille, LayerId::Lightning));
+        assert!(modes.has(RenderMode::Braille, LayerId::Radar));
+    }
+
+    /// Likewise the red background must not take Color away from radar.
+    #[test]
+    fn location_background_does_not_evict_the_color_owner() {
+        let mut reg = LayerRegistry::new();
+        reg.mode_state_mut().assign(RenderMode::Color, LayerId::Radar);
+        reg.mode_state_mut().toggle(RenderMode::Color, LayerId::Location);
+        assert!(reg.mode_state().has(RenderMode::Color, LayerId::Location));
+        assert!(
+            reg.mode_state().has(RenderMode::Color, LayerId::Radar),
+            "Radar must keep the primary Color slot"
+        );
+    }
+
+    #[test]
+    fn location_modes_toggle_off_again() {
+        let mut reg = LayerRegistry::new();
+        reg.mode_state_mut().toggle(RenderMode::Color, LayerId::Location);
+        assert!(reg.mode_state().has(RenderMode::Color, LayerId::Location));
+        reg.mode_state_mut().toggle(RenderMode::Color, LayerId::Location);
+        assert!(!reg.mode_state().has(RenderMode::Color, LayerId::Location));
+    }
+
+    /// Both pins persist as `Text` entries, so the load path must keep them
+    /// both rather than letting the second win.
+    #[test]
+    fn both_pins_survive_a_save_load_round_trip() {
+        let mut saved = RenderModeState::new();
+        saved.assign(RenderMode::Text, LayerId::SurfTemp);
+        saved.set_overlay(RenderMode::Text, LayerId::Location);
+        saved.set_overlay(RenderMode::Text, LayerId::SearchPin);
+
+        // What save_state writes: primaries, then every overlay pair.
+        let mut persisted: Vec<(RenderMode, LayerId)> = Vec::new();
+        for mode in RenderMode::ALL {
+            if let Some(id) = saved.get(mode) {
+                persisted.push((mode, id));
+            }
+        }
+        persisted.extend(saved.overlays.iter().copied());
+
+        // What load_state does: clear the known layers, then restore.
+        let mut loaded = RenderModeState::new();
+        for id in LayerRegistry::ORDER {
+            loaded.remove_all(id);
+        }
+        for (mode, layer) in persisted {
+            loaded.restore(mode, layer);
+        }
+
+        assert!(loaded.has(RenderMode::Text, LayerId::SurfTemp), "primary");
+        assert!(loaded.has(RenderMode::Text, LayerId::Location));
+        assert!(loaded.has(RenderMode::Text, LayerId::SearchPin));
+    }
+
+    /// Overlays are persisted with the same mode tag as primaries, so the
+    /// load path must route them back to the overlay slot rather than
+    /// evicting whoever owns the primary.
+    #[test]
+    fn restoring_an_overlay_layer_does_not_evict_the_primary_owner() {
+        let mut modes = RenderModeState::new();
+        modes.restore(RenderMode::Text, LayerId::SurfTemp);
+        modes.restore(RenderMode::Text, LayerId::Location);
+        assert_eq!(modes.text, Some(LayerId::SurfTemp));
+        assert!(modes.has_overlay(RenderMode::Text, LayerId::Location));
+
+        modes.restore(RenderMode::Braille, LayerId::Radar);
+        modes.restore(RenderMode::Braille, LayerId::Lightning);
+        assert_eq!(modes.braille, Some(LayerId::Radar));
+        assert!(modes.has_overlay(RenderMode::Braille, LayerId::Lightning));
+    }
+
+    /// A state.toml written before a layer existed must not switch it off:
+    /// `Location` is absent from every legacy file but defaults to on.
+    #[test]
+    fn test_layer_absent_from_legacy_state_keeps_its_default() {
+        let mut reg = LayerRegistry::new();
+        assert!(reg.enabled(LayerId::Location), "on by default");
+        // A legacy file: no known_layers, and Location predates it.
+        let legacy_enabled = vec![LayerId::MapBorders, LayerId::RegionBorders, LayerId::Radar];
+        reg.restore_enabled(&legacy_enabled, &[]);
+        assert!(
+            reg.enabled(LayerId::Location),
+            "legacy state.toml says nothing about Location, so it stays on"
+        );
+    }
+
+    /// Once a file does know about a layer, "off" must be honoured.
+    /// `MajorRoads` is a simple-toggle layer, so `enabled` tracks the flag.
+    #[test]
+    fn test_layer_known_to_state_file_can_be_restored_disabled() {
+        let mut reg = LayerRegistry::new();
+        let known = reg.known_layers();
+        assert!(reg.enabled(LayerId::RegionBorders), "on by default");
+        reg.restore_enabled(&[LayerId::MapBorders], &known);
+        assert!(
+            !reg.enabled(LayerId::RegionBorders),
+            "the file knew RegionBorders and left it out, so it is genuinely off"
+        );
     }
 
     // ── RadarFrame::covers_bounds ──────────────────────────────────────

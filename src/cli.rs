@@ -15,6 +15,7 @@ pub struct Cli {
     #[arg(long)]
     pub zoom: Option<f64>,
 
+    /// Disable every location source: no OS lookup, no IP fallback.
     #[arg(long)]
     pub no_location: bool,
 

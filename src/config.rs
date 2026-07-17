@@ -24,6 +24,43 @@ pub struct Config {
     /// EUMETNET surface observation data.
     #[serde(default)]
     pub eumetnet: EumetnetConfig,
+    /// Location acquisition.
+    #[serde(default)]
+    pub location: LocationConfig,
+    /// Place-name search (the `/` prompt).
+    #[serde(default)]
+    pub geocode: GeocodeConfig,
+}
+
+/// Place-name search via OpenStreetMap Nominatim.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GeocodeConfig {
+    /// Nominatim search endpoint. Point this at your own instance if you make
+    /// heavy use of search — the public one is a donated service with a strict
+    /// usage policy.
+    #[serde(default = "default_geocode_endpoint")]
+    pub endpoint: String,
+}
+
+/// How the app figures out where you are.
+///
+/// The OS location service (GeoClue / Windows Geolocator / CoreLocation) needs
+/// no configuration and is always used when available. These settings only
+/// govern the IP-address fallback, which is the one source that leaves the
+/// machine unprompted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LocationConfig {
+    /// Look up a coarse position from this machine's IP address when the OS
+    /// location service is unavailable or still converging.
+    ///
+    /// This discloses your IP address to `ip_endpoint`. Set to `false` to keep
+    /// location strictly on-device; `--no-location` disables every source.
+    #[serde(default = "default_ip_fallback")]
+    pub ip_fallback: bool,
+    /// Service queried for IP-based geolocation. Must return JSON with
+    /// `lat`/`lon` (or `latitude`/`longitude`) fields.
+    #[serde(default = "default_ip_endpoint")]
+    pub ip_endpoint: String,
 }
 
 /// Default viewport position on first launch (no persisted state).
@@ -132,6 +169,34 @@ impl Default for EumetnetConfig {
     }
 }
 
+impl Default for LocationConfig {
+    fn default() -> Self {
+        Self {
+            ip_fallback: default_ip_fallback(),
+            ip_endpoint: default_ip_endpoint(),
+        }
+    }
+}
+
+impl Default for GeocodeConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_geocode_endpoint(),
+        }
+    }
+}
+
+fn default_geocode_endpoint() -> String {
+    "https://nominatim.openstreetmap.org/search".to_string()
+}
+
+fn default_ip_fallback() -> bool {
+    true
+}
+fn default_ip_endpoint() -> String {
+    "https://ipwho.is/".to_string()
+}
+
 fn default_s3_endpoint() -> String {
     "https://s3.waw3-1.cloudferro.com".to_string()
 }
@@ -170,6 +235,15 @@ pub struct StateConfig {
     pub enabled_layers: Vec<LayerId>,
     pub selected_layer: LayerId,
 
+    /// Every layer that existed when this file was written, enabled or not.
+    ///
+    /// Without this, `enabled_layers` is ambiguous: a layer missing from it
+    /// could mean "the user turned it off" or "it did not exist yet", and
+    /// treating the second as the first silently disables every newly added
+    /// layer for existing users. Absent in files written before this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_layers: Vec<LayerId>,
+
     /// Render-mode assignments (replaces the scalar braille/color/text fields).
     /// Each entry records which layer owns which render mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -188,6 +262,10 @@ pub struct StateConfig {
     /// Lightning trail duration in minutes (1–30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lightning_trail_minutes: Option<u8>,
+
+    /// Radar history depth in hours (3 / 6 / 12 / 24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_hours: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +386,53 @@ impl StateConfig {
 mod tests {
     use super::*;
 
+    /// Existing installs have a config.toml written before `[location]`
+    /// existed; it must keep loading with the section defaulted in.
+    #[test]
+    fn test_config_without_location_section_still_loads() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [viewport]
+            lat = 46.05
+            lon = 14.51
+            zoom = 5.0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.viewport.lat, 46.05);
+        assert!(cfg.location.ip_fallback);
+        assert!(!cfg.location.ip_endpoint.is_empty());
+    }
+
+    #[test]
+    fn test_config_without_geocode_section_still_loads() {
+        let cfg: Config = toml::from_str("[viewport]\nlat = 46.05\n").unwrap();
+        assert!(cfg.geocode.endpoint.contains("nominatim"));
+    }
+
+    #[test]
+    fn test_config_geocode_section_roundtrips() {
+        let mut original = Config::default();
+        original.geocode.endpoint = "https://nominatim.example.invalid/search".to_string();
+        let text = toml::to_string_pretty(&original).unwrap();
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            loaded.geocode.endpoint,
+            "https://nominatim.example.invalid/search"
+        );
+    }
+
+    #[test]
+    fn test_config_location_section_roundtrips() {
+        let mut original = Config::default();
+        original.location.ip_fallback = false;
+        original.location.ip_endpoint = "https://example.invalid/json".to_string();
+        let text = toml::to_string_pretty(&original).unwrap();
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert!(!loaded.location.ip_fallback);
+        assert_eq!(loaded.location.ip_endpoint, "https://example.invalid/json");
+    }
+
     #[test]
     fn test_config_default_viewport_matches_constants() {
         let cfg = Config::default();
@@ -323,6 +448,7 @@ mod tests {
             center_lon: 14.51,
             zoom: 5.0,
             enabled_layers: vec![LayerId::Radar, LayerId::MapBorders],
+            known_layers: vec![LayerId::Radar, LayerId::MapBorders],
             selected_layer: LayerId::Radar,
             render_modes: vec![LayerRenderMode {
                 layer: LayerId::Radar,
@@ -332,6 +458,7 @@ mod tests {
             color_layer: None,
             text_layer: None,
             lightning_trail_minutes: Some(10),
+            history_hours: Some(6),
         };
         let toml_str = toml::to_string_pretty(&original).expect("serialize");
         let loaded: StateConfig = toml::from_str(&toml_str).expect("deserialize");
@@ -339,6 +466,7 @@ mod tests {
         assert!((loaded.center_lon - original.center_lon).abs() < 1e-9);
         assert_eq!(loaded.selected_layer, original.selected_layer);
         assert_eq!(loaded.lightning_trail_minutes, Some(10));
+        assert_eq!(loaded.history_hours, Some(6));
         assert_eq!(loaded.render_modes.len(), 1);
         assert_eq!(loaded.render_modes[0].layer, LayerId::Radar);
         assert_eq!(loaded.render_modes[0].mode, RenderMode::Braille);

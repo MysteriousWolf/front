@@ -33,7 +33,7 @@ cargo build                    # debug build
 cargo build --release          # optimised release build
 cargo run                      # run with debug build
 cargo run -- --lat 46.0 --lon 14.5 --zoom 6.0   # start at specific location
-cargo run -- --no-location     # skip GeoClue location lookup
+cargo run -- --no-location     # disable all location acquisition
 cargo run -- --clear-cache     # wipe on-disk caches and restart
 
 cargo test                     # run all tests
@@ -49,7 +49,7 @@ The `mqtt` feature (enabled by default) adds MQTT live-update support for MeteoA
 
 `main.rs` → `App::boot()` → `ui::run()`
 
-`App::boot` constructs providers, resolves the initial viewport (CLI args → GeoClue D-Bus → Europe fallback), spawns background tasks for border pre-loading and the radar frame list, then returns the fully initialised `App`. `ui::run` takes over and drives the event loop.
+`App::boot` constructs providers, resolves the initial viewport (CLI args → first location fix, 2 s timeout → Europe fallback), spawns background tasks for border pre-loading and the radar frame list, then returns the fully initialised `App`. `ui::run` takes over and drives the event loop.
 
 ### App struct (`src/app.rs`)
 
@@ -76,6 +76,42 @@ Border lines are rasterised into a `BorderMask` (a flat cell grid) which is cach
 - `MapBorders` — Natural Earth GeoJSON country/region/road borders
 - `MeteoAlarm` — warning polygons
 - `SurfTemp` / `SurfWind` / `SurfHumidity` / `SurfPressure` — EUMETNET surface obs
+- `Location` — "you are here" marker (`Text` = red `x`, `Color` = red cell background)
+- `SearchPin` — where the `/` search landed; identical rendering in `Rgb8::BLUE`
+
+Most layers are driven by the render-mode system, where "enabled" means "owns a
+render mode". `LayerId::is_simple_toggle()` marks the exceptions — the
+geographic layers — which use a plain on/off `enabled` flag and expose no
+render-mode options.
+
+#### Overlay modes — the exception to "one layer per mode"
+
+`RenderModeState` holds one exclusive primary slot per mode plus an
+`overlays: Vec<(RenderMode, LayerId)>` **list**. `overlay_modes(id)` declares
+which layers draw as overlays: they render on top of the primary owner instead
+of evicting it, and — because the overlays are a list, not one slot per mode —
+any number of them can share a mode without evicting *each other*. The location
+marker and the search pin both overlay `Text` and must both stay visible.
+
+| Layer | Overlay modes | Why |
+|---|---|---|
+| `Lightning` | `Braille` | Strike dots coexist with radar braille. |
+| `Location` / `SearchPin` | `Text`, `Color` | One annotated cell must not cost the map its temperature readings or radar colour. |
+
+Both pins render through `raster_pin`, differing only in colour and which layer
+owns the modes (`LayerId::is_pin()`). The `Text` glyph is nudged to the nearest
+free cell (`nearest_free_cell`) so it never blanks a city name or a reading;
+the `Color` background only tints, so it stays on the true cell.
+
+`toggle()` and `restore()` route by `overlay_modes`, so callers never pick a
+slot themselves. Overlays persist to `state.toml` with the same mode tag as a
+primary and are routed back on load by layer identity.
+
+**Adding a layer:** `state.toml` records `known_layers`. On load, layers listed
+there are cleared and re-applied from the file (so "off" persists); a layer the
+file never knew keeps its constructor default. That is what stops a newly added
+layer from silently booting up disabled for existing users —
+`LEGACY_KNOWN_LAYERS` covers files written before the field existed.
 
 ### Providers (`src/providers/`)
 
@@ -85,7 +121,52 @@ Border lines are rasterised into a `BorderMask` (a flat cell grid) which is cach
 | `maps.rs` | Natural Earth GeoJSON download and border tile generation. `BorderResolution` (Low110m → Regional10m) selected by zoom level. |
 | `meteoalarm.rs` | MeteoAlarm EDR API + optional MQTT live updates. |
 | `eumetnet.rs` | EUMETNET surface observations. Fetches in three phases (capitals → major cities → full viewport) sending `PartialCommit` between phases for progressive display. |
-| `geoclue.rs` | One-shot GeoClue2 D-Bus location query used at startup. |
+| `geocode.rs` | Place-name search via OSM Nominatim, backing the `/` prompt. Enforces the service's 1 req/s policy and identifying `User-Agent` internally. `cargo run --example geocode_probe` runs real queries. |
+| `location/` | Platform-agnostic location. See below. |
+
+### Location (`src/providers/location/`)
+
+Every backend is an independent task pushing `LocationFix` values into one
+shared mpsc channel; `App::drain_location_updates` drains it each tick. A
+backend failing (no GeoClue daemon, denied permission, offline) never stops the
+others — the app simply falls back to the Europe view.
+
+| Backend | Platform | Notes |
+|---|---|---|
+| `geoclue.rs` | Linux | Subscribes to the `LocationUpdated` D-Bus signal, so refinements stream in. |
+| `windows.rs` | Windows | `Geolocator` + `PositionChanged`. Type-checked only — never run on hardware. |
+| `macos.rs` | macOS | `CLLocationManager` on a dedicated thread (CoreLocation needs a run loop). Type-checked only. |
+| `ip.rs` | any | Coarse city-level fallback over HTTP. Opt-out via `location.ip_fallback`. |
+
+`LocationArbiter` picks the winner: a fix is accepted when it is strictly more
+accurate, refreshes the same source, or the incumbent has gone stale (5 min).
+`--lat/--lon` produces a `Manual` fix that nothing can override, and starts no
+backend at all. Only the **first** fix moves the viewport — later ones move the
+marker only, so a refinement never yanks the map away from a user who has
+panned.
+
+`cargo run --example location_probe` prints every fix as it arrives and shows
+which one the arbiter picks — useful for checking a backend on a new platform.
+
+### Place search (`/`)
+
+`/` opens a prompt that takes over the footer row. While `App::search_input` is
+`Some`, the event loop routes **every** printable key into the buffer before
+`keys::resolve` runs — otherwise typing "quit" would quit. Enter geocodes via
+`providers::geocode`, jumps the viewport to the hit (min zoom
+`SEARCH_MIN_ZOOM`), and turns on `SearchPin`. Esc closes the prompt but leaves
+an existing pin alone. Toggling the `SearchPin` layer off is how you clear a
+pin — that calls `App::clear_search_pin`, which drops the point rather than
+just hiding it.
+
+### City name labels
+
+Capital names are drawn by `raster_capital_names` at the city's own hardcoded
+lat/lon, **never** at a nearby weather station. Anchoring them to stations put
+names up to 100 km off and made them vanish when the closest station reported no
+data; upstream station metadata is also unreliable (Tallinn's nearest station is
+named "Abidjan Plateau Mairie"). Readings stay at their stations; the two are
+independent. `CITY_MATCH_KM` (100 km) now only gates *visibility* at low zoom.
 
 ### Coordinate system (`src/geo.rs`)
 

@@ -9,8 +9,11 @@ pub const EUROPE_ZOOM: f64 = 4.0;
 pub const MIN_VIEW_ZOOM: f64 = 1.0;
 pub const MAX_VIEW_ZOOM: f64 = 12.0;
 
-/// Approximate km radius used to classify a station as "near" a city.
+/// Approximate km radius used to classify a station as "near" a city, for
+/// deciding which stations are worth showing at low zoom.  Deliberately
+/// generous: it only gates visibility, never naming.
 pub const CITY_MATCH_KM: f64 = 100.0;
+
 
 /// City names matching `EUROPEAN_CAPITALS` (same order).
 pub const EUROPEAN_CAPITAL_NAMES: &[&str] = &[

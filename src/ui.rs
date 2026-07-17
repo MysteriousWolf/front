@@ -13,7 +13,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
+use rayon::prelude::*;
+
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
@@ -26,9 +29,10 @@ use crate::app::{
 };
 use crate::cache::write_log;
 use crate::geo::{
-    lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, WorldPoint, CITY_MATCH_KM,
+    lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, CITY_MATCH_KM,
     EUROPEAN_CAPITALS, EUROPEAN_CAPITAL_NAMES, EUROPEAN_MAJOR_CITIES,
 };
+use crate::keys::{self, Action, Category};
 use crate::layers::{
     BorderLine, BorderLineKind, BorderResolution, LayerId, LayerOption, LayerRegistry, LayerStatus,
     MainItem, ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
@@ -142,29 +146,53 @@ fn is_capital_station(lat: f64, lon: f64) -> bool {
 /// within `CITY_MATCH_KM` and map it to the hardcoded capital name.  Only that
 /// station gets a name label, and the label shows the capital name (not the
 /// obscure station name returned by the API).
-fn capital_name_labels(
-    points: &[crate::layers::ObservationPoint],
-) -> std::collections::HashMap<usize, &'static str> {
-    let threshold_sq = (CITY_MATCH_KM / 111.0_f64).powi(2);
-    let mut labels: std::collections::HashMap<usize, &'static str> =
-        std::collections::HashMap::new();
+/// Draw each European capital's name at the city's own coordinates.
+///
+/// The name marks *the city*, so it is positioned from the hardcoded
+/// lat/lon — never from a nearby weather station.  Stations can sit tens of km
+/// away (and the upstream metadata sometimes names an Estonian station
+/// "Abidjan"), so anchoring the name to one put city names in the wrong place
+/// or dropped them entirely when the close station had no data.  The
+/// temperature readings stay at their own stations; the two are independent.
+fn raster_capital_names(cells: &mut [RasterCell], bounds: Bounds, width: u16, height: u16) {
+    const NAME_COLOR: Rgb8 = Rgb8::new(105, 105, 105);
+    let sub_width = u32::from(width) * 2;
+    let sub_height = u32::from(height) * 4;
+
     for (&(clat, clon), &name) in CAPITALS.iter().zip(EUROPEAN_CAPITAL_NAMES.iter()) {
-        let cos_lat = clat.to_radians().cos();
-        let best = points
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, pt)| {
-                let dlat = pt.point.lat - clat;
-                let dlon = (pt.point.lon - clon) * cos_lat;
-                let d2 = dlat * dlat + dlon * dlon;
-                (d2 < threshold_sq).then_some((idx, d2))
-            })
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if let Some((idx, _)) = best {
-            labels.entry(idx).or_insert(name);
+        let world = lat_lon_to_world(clat, clon);
+        if world.x < bounds.min_x
+            || world.x > bounds.max_x
+            || world.y < bounds.min_y
+            || world.y > bounds.max_y
+        {
+            continue;
+        }
+        let sx = ((world.x - bounds.min_x) / bounds.width().max(f64::EPSILON)
+            * f64::from(sub_width))
+        .floor()
+        .clamp(0.0, f64::from(sub_width.saturating_sub(1))) as u32;
+        let sy = ((world.y - bounds.min_y) / bounds.height().max(f64::EPSILON)
+            * f64::from(sub_height))
+        .floor()
+        .clamp(0.0, f64::from(sub_height.saturating_sub(1))) as u32;
+
+        // One row below the city so the name never covers the marker or a
+        // reading sitting on the city itself.
+        let name_sy = (sy / 4 + 1) * 4;
+        let name_cell_x = (sx / 2) as usize;
+        let name_cell_y = (name_sy / 4) as usize;
+        if name_cell_y >= usize::from(height) {
+            continue;
+        }
+        let row_base = name_cell_y * usize::from(width);
+        let end = (name_cell_x + name.len()).min(usize::from(width));
+        let cells_free = (name_cell_x..end)
+            .all(|cx| cells.get(row_base + cx).is_some_and(|c| c.glyph.is_none()));
+        if cells_free {
+            write_obs_str(cells, width, sx, name_sy, name, NAME_COLOR, false);
         }
     }
-    labels
 }
 
 /// Show station name labels (capitals only) when sufficiently zoomed in.
@@ -183,6 +211,22 @@ const DATA_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Minimum time between state.toml writes (state is also saved on exit).
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Ceiling on redraw rate.  Background results (notably lightning, which
+/// streams strikes continuously) each mark the UI dirty, so without a cap
+/// a busy feed would drive a full re-raster per arrival.  Coalescing to
+/// 30 fps bounds that cost while staying well above what reads as smooth.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Redraw cadence for fast animations (spinners, lightning impact flash).
+const ANIM_FAST: Duration = Duration::from_millis(50);
+
+/// Redraw cadence for slow animations (lightning trails fading over minutes).
+const ANIM_SLOW: Duration = Duration::from_millis(250);
+
+/// Longest the event loop will block when nothing is animating.  Bounds how
+/// long a background result waits to be drained; input wakes `poll` at once.
+const IDLE_POLL: Duration = Duration::from_millis(100);
 
 pub async fn run(mut app: App) -> Result<()> {
     enable_raw_mode()?;
@@ -218,6 +262,98 @@ pub async fn run(mut app: App) -> Result<()> {
     result
 }
 
+/// A time-based visual that needs periodic redrawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Anim {
+    /// How often it must be redrawn to look smooth.
+    interval: Duration,
+    /// Whether the *map* changes with time, or only the surrounding chrome
+    /// (header, layer list, task overlay).  Chrome-only animations reuse the
+    /// cached raster, which is what makes them nearly free.
+    needs_raster: bool,
+}
+
+/// What is currently animating and how often it must redraw, or `None` when
+/// the display is fully static and no redraw is needed at all.
+///
+/// Only genuinely time-based visuals belong here.  Everything driven by data
+/// or input already sets `dirty` at its source.
+fn animation_interval(app: &App) -> Option<Anim> {
+    // Strike impact flash — brief, fast, and drawn on the map.
+    if app.has_lightning_impact() {
+        return Some(Anim {
+            interval: ANIM_FAST,
+            needs_raster: true,
+        });
+    }
+    // Trails fade over `lightning_trail_minutes`; a few frames a second is
+    // far more than enough to make a minutes-long fade look smooth.
+    if !app.lightning_strikes.is_empty() {
+        return Some(Anim {
+            interval: ANIM_SLOW,
+            needs_raster: true,
+        });
+    }
+    // Spinners and progress bars live in the chrome.  The map data they are
+    // waiting on arrives through the drains, which mark the map dirty itself.
+    if app.layers.any_loading() || !app.active_tasks.is_empty() {
+        return Some(Anim {
+            interval: ANIM_FAST,
+            needs_raster: false,
+        });
+    }
+    // The live indicator pulses on a 2 s cosine, and the timeline bar fills
+    // in as frames cache.  Both are header-only.
+    if app.playback_mode == PlaybackMode::Live {
+        return Some(Anim {
+            interval: ANIM_FAST,
+            needs_raster: false,
+        });
+    }
+    None
+}
+
+/// How long to block waiting for input.
+///
+/// This is the loop's idle cost: `event::poll` returns the instant input
+/// arrives, so a longer timeout never adds input latency — it only bounds
+/// how long a background result can sit in its channel before being
+/// drained.  When nothing is animating the loop idles at `IDLE_POLL`
+/// instead of spinning at 60 Hz.
+fn poll_timeout(
+    app: &App,
+    dirty: bool,
+    last_render: Instant,
+    last_playback_step: Instant,
+    next_interaction_refresh: Option<Instant>,
+    next_zoom_refresh: Option<Instant>,
+) -> Duration {
+    // A pending redraw was held back by the frame cap — wait out the
+    // remainder and nothing longer.
+    if dirty {
+        return MIN_FRAME_INTERVAL.saturating_sub(last_render.elapsed());
+    }
+
+    let mut timeout = IDLE_POLL;
+
+    if let Some(anim) = animation_interval(app) {
+        timeout = timeout.min(anim.interval.saturating_sub(last_render.elapsed()));
+    }
+    if app.playback_mode == PlaybackMode::Playing && !app.timestamps.is_empty() {
+        let base = Duration::from_millis(app.playback_speed.interval_ms());
+        let interval = if app.frame_index == 0 { base * 3 } else { base };
+        timeout = timeout.min(interval.saturating_sub(last_playback_step.elapsed()));
+    }
+    let now = Instant::now();
+    for deadline in [next_interaction_refresh, next_zoom_refresh]
+        .into_iter()
+        .flatten()
+    {
+        timeout = timeout.min(deadline.saturating_duration_since(now));
+    }
+    timeout
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -234,25 +370,18 @@ async fn run_loop(
     let mut last_state_save = Instant::now();
     let mut last_playback_step = Instant::now();
     loop {
-        if app.drain_refresh_results() {
-            dirty = true;
-        }
-        if app.drain_preload_results() {
-            dirty = true;
-        }
-        if app.drain_frame_list() {
-            dirty = true;
-        }
-        if app.drain_task_messages() {
-            dirty = true;
-        }
-        if app.drain_obs_results() {
-            dirty = true;
-        }
-        if app.drain_warning_results() {
-            dirty = true;
-        }
-        if app.drain_lightning_results() {
+        // Any of these can change what the map shows, so a redraw they cause
+        // must re-rasterise rather than reuse the cached frame.
+        let drained = app.drain_refresh_results()
+            | app.drain_preload_results()
+            | app.drain_frame_list()
+            | app.drain_task_messages()
+            | app.drain_obs_results()
+            | app.drain_warning_results()
+            | app.drain_lightning_results()
+            | app.drain_location_updates()
+            | app.drain_search_results();
+        if drained {
             dirty = true;
         }
         if app.pending_warning_refresh {
@@ -345,19 +474,30 @@ async fn run_loop(
             next_zoom_refresh = None;
             dirty = true;
         }
-        if dirty {
-            terminal.draw(|frame| render(frame, app))?;
+        if dirty && last_render.elapsed() >= MIN_FRAME_INTERVAL {
+            // State changed — always re-rasterise.
+            terminal.draw(|frame| render(frame, app, false))?;
             dirty = false;
             last_render = Instant::now();
-        } else if (app.layers.any_loading()
-            || !app.active_tasks.is_empty()
-            || app.has_lightning_impact()
-            || app.playback_mode == PlaybackMode::Live)
-            && last_render.elapsed() >= Duration::from_millis(50)
-        {
-            dirty = true;
+        } else if !dirty {
+            // Nothing changed, but a time-based visual may be due a frame.
+            // A chrome-only animation redraws over the cached map raster,
+            // which is what keeps the live pulse essentially free.
+            if let Some(anim) = animation_interval(app) {
+                if last_render.elapsed() >= anim.interval {
+                    terminal.draw(|frame| render(frame, app, !anim.needs_raster))?;
+                    last_render = Instant::now();
+                }
+            }
         }
-        if !event::poll(Duration::from_millis(16))? {
+        if !event::poll(poll_timeout(
+            app,
+            dirty,
+            last_render,
+            last_playback_step,
+            next_interaction_refresh,
+            next_zoom_refresh,
+        ))? {
             continue;
         }
         let area = terminal.size()?;
@@ -376,175 +516,161 @@ async fn run_loop(
         let mut events_processed = 0u32;
         loop {
             match event::read()? {
+                // While the search prompt is open it owns the keyboard: every
+                // printable key is query text, so this must run before
+                // `keys::resolve` or typing "quit" would quit.
+                Event::Key(key) if key.kind == KeyEventKind::Press && app.search_is_open() => {
+                    match key.code {
+                        KeyCode::Esc => app.cancel_search(),
+                        KeyCode::Enter => app.submit_search(),
+                        KeyCode::Backspace => app.search_backspace(),
+                        // Ctrl-C must still quit even mid-query.
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.shutdown();
+                            quit = true;
+                            break;
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.search_push_char(c);
+                        }
+                        _ => {}
+                    }
+                    dirty = true;
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        match key.code {
-                            KeyCode::Up => {
-                                app.layer_panel_focused = true;
-                                app.layers.select_previous();
-                                dirty = true;
-                            }
-                            KeyCode::Down => {
-                                app.layer_panel_focused = true;
-                                app.layers.select_next();
-                                dirty = true;
-                            }
-                            _ => {}
+                    // Set a render mode on the selected layer, if it accepts one.
+                    let set_mode = |app: &mut App, mode: RenderMode, refresh: &mut bool| {
+                        app.layer_panel_focused = true;
+                        let id = app.layers.selected_layer();
+                        let allowed = id.is_rendered()
+                            && (mode == RenderMode::Text || !id.is_observation())
+                            // The marker is one cell: braille would be a
+                            // single dot, so it offers text and background only.
+                            && (mode != RenderMode::Braille || !id.is_location());
+                        if allowed {
+                            app.layers.mode_state_mut().toggle(mode, id);
+                            handle_layer_enable(app, id, refresh);
+                            return true;
                         }
-                    } else if key.modifiers.contains(KeyModifiers::ALT) {
-                        match key.code {
-                            KeyCode::Up => {
-                                app.layer_panel_focused = true;
-                                app.layers.select_previous();
+                        false
+                    };
+                    // An unbound key falls through to the batch bookkeeping
+                    // below: skipping it would block on the next `read` with
+                    // the rest of the batch still unrendered.
+                    if let Some(action) = keys::resolve(key) {
+                    match action {
+                        Action::Quit => {
+                            if app.show_help {
+                                app.show_help = false;
                                 dirty = true;
+                            } else {
+                                app.shutdown();
+                                quit = true;
+                                break;
                             }
-                            KeyCode::Down => {
-                                app.layer_panel_focused = true;
-                                app.layers.select_next();
-                                dirty = true;
-                            }
-                            // Enhanced terminals send Alt+arrow; Terminal.app sends ESC+f/b.
-                            KeyCode::Right | KeyCode::Char('f') => {
-                                app.layer_panel_focused = true;
-                                dirty |= app.layers.enter_options();
-                            }
-                            // Alt+Left: exit options → defocus root list → refocus.
-                            KeyCode::Left | KeyCode::Char('b') => {
-                                if !app.layer_panel_focused {
-                                    // Panel was defocused — refocus it.
-                                    app.layer_panel_focused = true;
-                                    dirty = true;
-                                } else if app.layers.is_in_options() {
-                                    dirty |= app.layers.exit_options();
-                                } else {
-                                    // Already at root list — defocus the panel.
-                                    app.layer_panel_focused = false;
-                                    dirty = true;
-                                }
-                            }
-                            _ => {}
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                if app.show_help {
-                                    app.show_help = false;
-                                    dirty = true;
-                                } else {
-                                    app.shutdown();
-                                    quit = true;
-                                    break;
-                                }
-                            }
-                            KeyCode::Char(' ') => {
-                                app.layer_panel_focused = true;
-                                if let Some(id) = app.layers.handle_space() {
-                                    handle_layer_enable(app, id, &mut refresh);
-                                }
-                                dirty = true;
-                            }
-                            KeyCode::Char('b') => {
-                                app.layer_panel_focused = true;
-                                let id = app.layers.selected_layer();
-                                if id.is_rendered() && !id.is_observation() {
-                                    app.layers.mode_state_mut().toggle(RenderMode::Braille, id);
-                                    handle_layer_enable(app, id, &mut refresh);
-                                    dirty = true;
-                                }
-                            }
-                            KeyCode::Char('c') => {
-                                app.layer_panel_focused = true;
-                                let id = app.layers.selected_layer();
-                                if id.is_rendered() && !id.is_observation() {
-                                    app.layers.mode_state_mut().toggle(RenderMode::Color, id);
-                                    handle_layer_enable(app, id, &mut refresh);
-                                    dirty = true;
-                                }
-                            }
-                            KeyCode::Char('l') => {
-                                app.layer_panel_focused = true;
-                                let id = app.layers.selected_layer();
-                                if id.is_rendered() {
-                                    app.layers.mode_state_mut().toggle(RenderMode::Text, id);
-                                    handle_layer_enable(app, id, &mut refresh);
-                                    dirty = true;
-                                }
-                            }
-                            KeyCode::Char('m') => {
-                                app.request_border_refetch();
-                                dirty = true;
-                            }
-                            // Zoom / pan — defocus the panel so the map fills the screen.
-                            KeyCode::Char('+') | KeyCode::Char('=') => {
-                                app.layer_panel_focused = false;
-                                app.viewport.zoom_by(0.25);
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Char('-') => {
-                                app.layer_panel_focused = false;
-                                app.viewport.zoom_by(-0.25);
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Left => {
-                                app.layer_panel_focused = false;
-                                app.viewport.pan(-1.0, 0.0);
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Right => {
-                                app.layer_panel_focused = false;
-                                app.viewport.pan(1.0, 0.0);
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Up => {
-                                app.layer_panel_focused = false;
-                                app.viewport.pan(0.0, -1.0);
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Down => {
-                                app.layer_panel_focused = false;
-                                app.viewport.pan(0.0, 1.0);
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Char(']') => {
-                                app.previous_frame();
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Char('[') => {
-                                app.next_frame();
-                                refresh = true;
-                                dirty = true;
-                            }
-                            KeyCode::Char('p') => {
-                                app.toggle_play_pause();
-                                last_playback_step = Instant::now();
-                                dirty = true;
-                            }
-                            KeyCode::Char('0') => {
-                                app.jump_to_live();
-                                app.request_meteogate_refresh(app.map_width, app.map_height);
-                                dirty = true;
-                            }
-                            KeyCode::Char('.') => {
-                                app.speed_faster();
-                                dirty = true;
-                            }
-                            KeyCode::Char(',') => {
-                                app.speed_slower();
-                                dirty = true;
-                            }
-                            KeyCode::Char('?') => {
-                                app.show_help = !app.show_help;
-                                dirty = true;
-                            }
-                            _ => {}
+                        Action::ToggleHelp => {
+                            app.show_help = !app.show_help;
+                            dirty = true;
                         }
+                        Action::ToggleLayer => {
+                            app.layer_panel_focused = true;
+                            if let Some(id) = app.layers.activate_selected() {
+                                handle_layer_enable(app, id, &mut refresh);
+                            }
+                            dirty = true;
+                        }
+                        Action::ModeBraille => dirty |= set_mode(app, RenderMode::Braille, &mut refresh),
+                        Action::ModeColor => dirty |= set_mode(app, RenderMode::Color, &mut refresh),
+                        Action::ModeText => dirty |= set_mode(app, RenderMode::Text, &mut refresh),
+                        Action::SelectPrevious => {
+                            app.layer_panel_focused = true;
+                            app.layers.select_previous();
+                            dirty = true;
+                        }
+                        Action::SelectNext => {
+                            app.layer_panel_focused = true;
+                            app.layers.select_next();
+                            dirty = true;
+                        }
+                        Action::EnterGroup => {
+                            app.layer_panel_focused = true;
+                            dirty |= app.layers.enter_options();
+                        }
+                        // Exit options → defocus the root list → refocus.
+                        Action::ExitGroup => {
+                            if !app.layer_panel_focused {
+                                app.layer_panel_focused = true;
+                                dirty = true;
+                            } else if app.layers.is_in_options() {
+                                dirty |= app.layers.exit_options();
+                            } else {
+                                app.layer_panel_focused = false;
+                                dirty = true;
+                            }
+                        }
+                        Action::RefetchMap => {
+                            app.request_border_refetch();
+                            dirty = true;
+                        }
+                        Action::OpenSearch => {
+                            app.open_search();
+                            dirty = true;
+                        }
+                        // Zoom / pan — defocus the panel so the map fills the screen.
+                        Action::ZoomIn | Action::ZoomOut => {
+                            app.layer_panel_focused = false;
+                            let delta = if action == Action::ZoomIn { 0.25 } else { -0.25 };
+                            app.viewport.zoom_by(delta);
+                            refresh = true;
+                            dirty = true;
+                        }
+                        Action::PanLeft | Action::PanRight | Action::PanUp | Action::PanDown => {
+                            app.layer_panel_focused = false;
+                            let (dx, dy) = match action {
+                                Action::PanLeft => (-1.0, 0.0),
+                                Action::PanRight => (1.0, 0.0),
+                                Action::PanUp => (0.0, -1.0),
+                                _ => (0.0, 1.0),
+                            };
+                            app.viewport.pan(dx, dy);
+                            refresh = true;
+                            dirty = true;
+                        }
+                        Action::FrameBack => {
+                            app.previous_frame();
+                            refresh = true;
+                            dirty = true;
+                        }
+                        Action::FrameForward => {
+                            app.next_frame();
+                            refresh = true;
+                            dirty = true;
+                        }
+                        Action::TogglePlayback => {
+                            app.toggle_play_pause();
+                            last_playback_step = Instant::now();
+                            dirty = true;
+                        }
+                        Action::JumpToLive => {
+                            app.jump_to_live();
+                            app.request_meteogate_refresh(app.map_width, app.map_height);
+                            dirty = true;
+                        }
+                        Action::SpeedFaster => {
+                            app.speed_faster();
+                            dirty = true;
+                        }
+                        Action::SpeedSlower => {
+                            app.speed_slower();
+                            dirty = true;
+                        }
+                        Action::CycleHistory => {
+                            app.cycle_history();
+                            refresh = true;
+                            dirty = true;
+                        }
+                    }
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
@@ -659,11 +785,7 @@ async fn run_loop(
         }
         state_dirty = true;
         if refresh {
-            app.request_meteogate_refresh(map_area.width, map_area.height);
-            app.request_border_refresh();
-            if (app.any_obs_enabled()) && !app.has_obs_task() {
-                app.request_obs_refresh();
-            }
+            app.request_viewport_refresh();
             dirty = true;
         }
     }
@@ -671,73 +793,148 @@ async fn run_loop(
     Ok(())
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
-    app.frame_count = app.frame_count.wrapping_add(1);
+/// Draw a frame.  `reuse_raster` skips re-rasterising the map and redraws
+/// the cached cell grid instead — valid only when the caller knows nothing
+/// affecting the map has changed since the last frame.
+fn render(frame: &mut ratatui::Frame<'_>, app: &mut App, reuse_raster: bool) {
     let chunks = app_areas(frame.area());
 
     render_header(frame, chunks[0], app);
-    render_map(frame, chunks[1], app);
-    render_footer(frame, chunks[2], app);
+    render_map(frame, chunks[1], app, reuse_raster);
+    // The search prompt takes over the footer line while it is open or has
+    // something to report, like a shell's `/` prompt.
+    if app.search_is_open() || app.search_status.is_some() {
+        render_search_prompt(frame, chunks[2], app);
+    } else {
+        render_footer(frame, chunks[2], app);
+    }
 
     if app.show_help {
         render_help(frame, frame.area());
     }
 }
 
-fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let header = |t: &str| {
-        TextLine::from(Span::styled(
-            format!("  {t}"),
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        ))
-    };
-    let entry = |key: &str, desc: &str| TextLine::from(format!("    {key:<12}{desc}"));
+/// A keystroke, as shown in the footer and help.
+///
+/// Emphasis is carried by weight and colour rather than a background badge: a
+/// `bg(DarkGray)` chip lands too close to the surrounding background on most
+/// terminal themes to read as a key at all.  Bold on the default foreground
+/// inherits whatever contrast the user's theme already guarantees.
+fn key_span(key: &str) -> Span<'static> {
+    Span::styled(
+        key.to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )
+}
 
-    let content = vec![
+/// The description paired with a [`key_span`], set back so the keys lead.
+fn desc_span(desc: &str) -> Span<'static> {
+    Span::styled(
+        desc.to_string(),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC),
+    )
+}
+
+/// Build the help modal's lines from the keybinding registry.
+///
+/// Every row comes from [`keys::BINDINGS`], so a binding added there appears
+/// here automatically.  The key and name columns are each padded to their
+/// widest entry, so all three columns line up across all four sections.
+fn help_lines() -> Vec<TextLine<'static>> {
+    let rows = || keys::BINDINGS.iter().filter(|b| b.help_keys.is_some());
+    let key_w = rows()
+        .filter_map(|b| b.help_keys)
+        .map(|k| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let name_w = rows()
+        .map(|b| b.name.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = vec![
         TextLine::from(Span::styled(
-            "  Fancy Radar ObservatioN Tool",
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("  front {}", env!("CARGO_PKG_VERSION")),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
-        TextLine::from("  European weather radar in your terminal"),
-        TextLine::from(""),
-        header("Navigation"),
-        entry("arrows", "Pan map"),
-        entry("drag", "Pan map"),
-        entry("scroll", "Zoom in/out"),
-        entry("+ / -", "Zoom in/out"),
-        TextLine::from(""),
-        header("Timeline"),
-        entry("[ / ]", "Step frame back/forward"),
-        entry("p", "Play/pause"),
-        entry("0", "Jump to live"),
-        entry(", / .", "Playback speed"),
-        TextLine::from(""),
-        header("Layers"),
-        entry("space", "Toggle layer"),
-        entry("b / c / l", "Braille/color/text mode"),
-        entry("Shift+↑/↓", "Select layer"),
-        entry("Alt+←/→", "Navigate layer group"),
-        TextLine::from(""),
-        header("Other"),
-        entry("?", "Toggle help"),
-        entry("q / Esc", "Quit"),
-        entry("m", "Refetch map data"),
-        TextLine::from(""),
-        TextLine::from("  Press ? or Esc to close."),
+        TextLine::from(Span::styled(
+            "  Fancy Radar ObservatioN Tool — European weather radar in your terminal",
+            Style::default().fg(Color::Gray),
+        )),
     ];
 
+    for category in Category::ORDER {
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(Span::styled(
+            format!("  {}", category.title().to_uppercase()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (k, name, desc) in keys::help_rows(category) {
+            lines.push(TextLine::from(vec![
+                Span::raw("    "),
+                key_span(k),
+                Span::raw(" ".repeat(key_w - k.chars().count() + 2)),
+                Span::raw(name.to_string()),
+                Span::raw(" ".repeat(name_w - name.chars().count() + 2)),
+                Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(Span::styled(
+        "  ? or esc to close",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    lines
+}
+
+fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let content = help_lines();
+
+    // `Clear` resets the cells the modal covers, so the block needs no fill of
+    // its own — it inherits the terminal's own background, whatever that is.
     let block = Block::default()
         .title(" Help ")
         .title_alignment(ratatui::layout::Alignment::Center)
         .borders(Borders::ALL)
         .border_set(border::ROUNDED)
-        .border_style(Color::Cyan)
-        .style(Style::default().bg(Color::Black));
+        .border_style(Color::Cyan);
 
-    let inner = block.inner(area);
-    frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(block, area);
+    // Size to the content and centre it, rather than covering the whole map.
+    // Two columns of padding on the right keep descriptions off the border.
+    let content_w = content
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum())
+        .max()
+        .unwrap_or(0) as u16;
+    let panel = centered_rect(content_w + 4, content.len() as u16 + 2, area);
+
+    let inner = block.inner(panel);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(block, panel);
     frame.render_widget(Paragraph::new(content), inner);
+}
+
+/// Centre a `width` × `height` rect inside `area`, shrinking to fit when the
+/// terminal is too small to hold it.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn app_areas(area: Rect) -> std::rc::Rc<[Rect]> {
@@ -794,9 +991,36 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+/// Narrowest useful timeline bar; below this the bar is dropped entirely
+/// rather than rendered as a stub.
+const TIMELINE_BAR_MIN: usize = 12;
+
+/// Widest the bar is allowed to grow.  Deeper windows map several slots per
+/// cell instead of stretching: 288 cells (24 h) would not fit any header.
+const TIMELINE_BAR_MAX: usize = 48;
+
+/// Width of the timeline bar in cells, or `None` when there isn't room.
+///
+/// Sized from the *nominal* slot count for the selected history depth, never
+/// from how many frames happen to be loaded — that quantity changes as the
+/// list arrives and as unpublished slots are pruned, which is what made the
+/// bar collapse mid-session.  For a given depth and terminal width the result
+/// is constant.
+///
+/// Each cell carries two slots, since [`timeline_bar_spans`] splits it into
+/// half-cells: asking for one cell per slot would leave every second half-cell
+/// empty and render the bar as a dither of track and data.
+fn timeline_bar_width(hours: u8, space: usize) -> Option<usize> {
+    if space < TIMELINE_BAR_MIN {
+        return None;
+    }
+    let cells = crate::providers::meteogate::frames_for_hours(hours).div_ceil(2);
+    Some(cells.clamp(TIMELINE_BAR_MIN, TIMELINE_BAR_MAX).min(space))
+}
+
 /// Build the compact timeline right-aligned in the header.
 ///
-/// Format: `● 13:50 ···░░░█░░`  (icon · sp · time · sp · one-char-per-frame bar)
+/// Format: `● 13:50 ···░░░█░░`  (icon · sp · time · sp · fixed-width frame bar)
 /// When playing: speed label appended after the bar (`▶ 13:50 ···░░░█░░ 2×`).
 fn timeline_line(app: &App, avail: u16) -> TextLine<'static> {
     let frame_count = app.timestamps.len();
@@ -849,19 +1073,29 @@ fn timeline_line(app: &App, avail: u16) -> TextLine<'static> {
     spans.push(Span::raw(" "));
     spans.push(Span::styled(time_str, Style::default().fg(time_color)));
 
-    // One character per frame, no brackets.
-    if frame_count > 0 && avail >= min_w + 1 + frame_count as u16 {
-        let cached: Vec<bool> = app
+    // Frames are mapped onto the bar. It is drawn even with none loaded yet, so
+    // the header width doesn't jump once the frame list arrives.  The depth
+    // label trails it so `i` has visible feedback.
+    let hours_label = format!("{}h", app.history_hours);
+    let trailer = hours_label.len() as u16 + 1; // label + its leading space
+    let space = avail.saturating_sub(min_w + 1 + trailer) as usize;
+    if let Some(bar_width) = timeline_bar_width(app.history_hours, space) {
+        let states: Vec<SlotState> = app
             .timestamps
             .iter()
-            .map(|ts| app.frame_cache.contains_key(ts))
+            .map(|ts| app.slot_state(*ts))
             .collect();
         spans.push(Span::raw(" "));
         spans.extend(timeline_bar_spans(
             frame_count,
             app.frame_index,
-            &cached,
-            frame_count,
+            &states,
+            bar_width,
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            hours_label,
+            Style::default().fg(Color::DarkGray),
         ));
     }
 
@@ -881,61 +1115,164 @@ fn frame_to_bar_pos(i: usize, frame_count: usize, bar_width: usize) -> usize {
     pos.min(bar_width - 1)
 }
 
-/// Build colored spans for the timeline bar.
+/// Nothing available here: no slot, or a slot not downloaded yet.
 ///
-/// `·` uncached frame  `░` cached/ready  `█` current  `─` track background
+/// The two cases were once separate greys, but "no data" and "no data yet" look
+/// the same to the eye and the distinction only appears before the frame list
+/// arrives — one colour says it.
+const BAR_MISSING: Color = Color::Rgb(96, 96, 96);
+/// A slot whose grid is on disk.  This is the bar's "full" state: everything
+/// downloaded reads as a solid white run.
+const BAR_DOWNLOADED: Color = Color::Rgb(230, 230, 230);
+/// Stipple marking slots also decoded in RAM.
+///
+/// In-RAM implies on-disk, so these dots always land on [`BAR_DOWNLOADED`];
+/// drawing them dark makes RAM read as texture over the white rather than as a
+/// third colour competing with it.
+const BAR_RAM_DOTS: Color = Color::Rgb(78, 78, 78);
+/// The playhead.  Amber rather than a grey so it stays findable against a bar
+/// that is otherwise monochrome.
+const BAR_PLAYHEAD: Color = Color::Rgb(255, 200, 60);
+
+/// Braille dot bits per column, top row first.  Standard U+28xx layout: the
+/// left column is dots 1,2,3,7 and the right column dots 4,5,6,8.
+const BRAILLE_COL_BITS: [[u8; 4]; 2] = [[0, 1, 2, 6], [3, 4, 5, 7]];
+
+/// Dot rows available per braille column — the sub-resolution the stipple buys.
+const BRAILLE_ROWS: u16 = 4;
+
+/// Braille glyph whose two columns are filled from the bottom to `heights`
+/// dots each (0..=4).
+fn braille_columns(heights: [u16; 2]) -> char {
+    let mut bits = 0u8;
+    for (col, &h) in heights.iter().enumerate() {
+        // Fill upward from the bottom row so partial columns sit on the
+        // baseline and read as a level rather than floating.
+        for row in (BRAILLE_ROWS - h.min(BRAILLE_ROWS))..BRAILLE_ROWS {
+            bits |= 1 << BRAILLE_COL_BITS[col][row as usize];
+        }
+    }
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
+
+/// Availability of one radar slot, cheapest to costliest to display.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SlotState {
+    /// Neither in RAM nor on disk — displaying it needs a fetch.
+    Missing,
+    /// GeoTIFF on disk: no fetch, but still a decode.
+    OnDisk,
+    /// Decoded and ready.
+    InRam,
+}
+
+/// The slots falling under one braille column (half a terminal cell).
+#[derive(Clone, Copy, Default)]
+struct SubCol {
+    total: u16,
+    downloaded: u16,
+    in_ram: u16,
+    playhead: bool,
+}
+
+impl SubCol {
+    /// The one colour this column paints.
+    ///
+    /// Deliberately discrete: a column that is part downloaded resolves to
+    /// whichever state most of it is in, rather than to a blended grey.  An
+    /// in-between shade carries no meaning a reader can name — it just looks
+    /// like a third kind of slot — and boundaries are better shown by splitting
+    /// the cell than by mixing the colour.
+    fn paint(self) -> Color {
+        if self.playhead {
+            BAR_PLAYHEAD
+        } else if self.total > 0 && self.downloaded * 2 >= self.total {
+            BAR_DOWNLOADED
+        } else {
+            BAR_MISSING
+        }
+    }
+
+    /// Dots to raise for this column: the share of its slots held in RAM.
+    fn ram_height(self) -> u16 {
+        if self.total == 0 || self.in_ram == 0 {
+            return 0;
+        }
+        let filled = f64::from(self.in_ram) / f64::from(self.total) * f64::from(BRAILLE_ROWS);
+        // Never round a non-empty column down to nothing — one cached frame in
+        // a busy column should still show.
+        (filled.round() as u16).clamp(1, BRAILLE_ROWS)
+    }
+}
+
+/// Build coloured spans for the timeline bar.
+///
+/// The bar shows two facts with four colours and no shades in between:
+///
+/// * **Background** — downloaded ([`BAR_DOWNLOADED`]) or not ([`BAR_MISSING`]),
+///   with the playhead ([`BAR_PLAYHEAD`]) overriding its own half-cell.
+/// * **Braille dots** ([`BAR_RAM_DOTS`]) — what is additionally decoded in RAM.
+///   Two columns of four dots per cell, so the stipple resolves at twice the
+///   cell count and shows how *much* of a column is resident rather than merely
+///   whether any of it is.  That matters at depth: 24 h is 288 slots over at
+///   most 48 cells.
+///
+/// Where a cell's two halves disagree — a download boundary, or the playhead —
+/// it is drawn as `▌` split between the two colours instead of blending them.
+/// The split cell gives up its dots, but there is only ever a handful of them,
+/// and a sharp edge reads as a boundary where a mixed grey reads as a third
+/// kind of slot.
 fn timeline_bar_spans(
     frame_count: usize,
     frame_index: usize,
-    cached: &[bool],
+    states: &[SlotState],
     bar_width: usize,
 ) -> Vec<Span<'static>> {
     if bar_width == 0 {
         return vec![];
     }
-    if frame_count == 0 {
-        return vec![Span::styled(
-            "─".repeat(bar_width),
-            Style::default().fg(Color::DarkGray),
-        )];
-    }
 
-    // Build character array: background `─`, then stamp each frame tick.
-    let mut cells: Vec<char> = vec!['─'; bar_width];
+    let sub_count = bar_width * 2;
+    let mut subs = vec![SubCol::default(); sub_count];
     for i in 0..frame_count {
-        let pos = frame_to_bar_pos(i, frame_count, bar_width);
-        if cells[pos] != '█' {
-            cells[pos] = if i == frame_index {
-                '█'
-            } else if cached.get(i).copied().unwrap_or(false) {
-                '░'
-            } else {
-                '·'
-            };
+        let pos = frame_to_bar_pos(i, frame_count, sub_count);
+        let state = states.get(i).copied().unwrap_or(SlotState::Missing);
+        let s = &mut subs[pos];
+        s.total += 1;
+        // In-RAM implies downloaded, so it counts toward both layers.
+        if matches!(state, SlotState::OnDisk | SlotState::InRam) {
+            s.downloaded += 1;
+        }
+        if state == SlotState::InRam {
+            s.in_ram += 1;
         }
     }
-    // Current marker always wins a collision at its position.
-    let cur_pos = frame_to_bar_pos(frame_index, frame_count, bar_width);
-    cells[cur_pos] = '█';
+    if frame_count > 0 {
+        subs[frame_to_bar_pos(frame_index, frame_count, sub_count)].playhead = true;
+    }
 
-    // Emit grouped runs of same-style characters.
-    let style_of = |c: char| -> Style {
-        match c {
-            '█' => Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            '░' => Style::default().fg(Color::White),
-            _ => Style::default().fg(Color::DarkGray), // '·' and '─'
+    // Merge neighbours that resolve to the same glyph and style so the line
+    // stays a handful of spans rather than one per cell.
+    let cell = |i: usize| -> (char, Style) {
+        let (l, r) = (subs[i * 2], subs[i * 2 + 1]);
+        let (lp, rp) = (l.paint(), r.paint());
+        if lp == rp {
+            // Uniform: the whole cell is one colour, free to carry dots.
+            let glyph = braille_columns([l.ram_height(), r.ram_height()]);
+            (glyph, Style::default().fg(BAR_RAM_DOTS).bg(lp))
+        } else {
+            // Split: `▌` paints the left half in fg and the right half in bg.
+            ('▌', Style::default().fg(lp).bg(rp))
         }
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut i = 0;
     while i < bar_width {
-        let style = style_of(cells[i]);
+        let (glyph, style) = cell(i);
         let mut run = String::new();
-        while i < bar_width && style_of(cells[i]) == style {
-            run.push(cells[i]);
+        while i < bar_width && cell(i) == (glyph, style) {
+            run.push(glyph);
             i += 1;
         }
         spans.push(Span::styled(run, style));
@@ -943,7 +1280,28 @@ fn timeline_bar_spans(
     spans
 }
 
-fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, reuse_raster: bool) {
+    let width = area.width.max(1);
+    let height = area.height.max(1);
+
+    // A chrome-only animation frame: the map is unchanged, so redraw the
+    // cells computed last frame instead of rasterising them again.  Guard on
+    // the grid matching the current area — a resize invalidates it.
+    if reuse_raster && app.braille_frame.cells().len() == usize::from(width) * usize::from(height) {
+        blit_cells(
+            app.braille_frame.cells(),
+            area,
+            width,
+            height,
+            frame.buffer_mut(),
+        );
+        if !app.is_dragging {
+            render_layer_list(frame, area, app);
+            render_task_queue(frame, area, app);
+        }
+        return;
+    }
+
     let bounds = app.viewport.bounds(area.width, area.height);
 
     let stamp = BorderMaskStamp {
@@ -1031,7 +1389,6 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         })
         .unwrap_or((0, 0));
     let mut braille_frame = std::mem::take(&mut app.braille_frame);
-    let mut render_rows = std::mem::take(&mut app.render_rows);
     raster_map_rows(
         app,
         bounds,
@@ -1039,11 +1396,15 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         area.height,
         offset,
         &mut braille_frame,
-        &mut render_rows,
+    );
+    blit_cells(
+        braille_frame.cells(),
+        area,
+        area.width.max(1),
+        area.height.max(1),
+        frame.buffer_mut(),
     );
     app.braille_frame = braille_frame;
-    frame.render_widget(Paragraph::new(&render_rows[..]), area);
-    app.render_rows = render_rows;
     if !app.is_dragging {
         render_layer_list(frame, area, app);
         render_task_queue(frame, area, app);
@@ -1228,7 +1589,7 @@ impl BrailleFrame {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RasterCell {
     bits: u8,
     color: Option<Rgb8>,
@@ -1290,6 +1651,12 @@ fn handle_layer_enable(app: &mut App, id: LayerId, refresh: &mut bool) {
                 app.lightning_strikes.clear();
             }
         }
+        // Switching the pin off is how you clear a search, so drop the point
+        // and its footer line rather than just hiding them — otherwise
+        // toggling back on would resurrect a stale pin.
+        LayerId::SearchPin if !app.layers.enabled(LayerId::SearchPin) => {
+            app.clear_search_pin();
+        }
         id if (id.is_observation()) && app.layers.enabled(id) => {
             app.request_obs_refresh();
         }
@@ -1304,7 +1671,6 @@ fn raster_map_rows(
     height: u16,
     mask_offset: (i32, i32),
     braille_frame: &mut BrailleFrame,
-    render_rows: &mut Vec<TextLine<'static>>,
 ) {
     let width = width.max(1);
     let height = height.max(1);
@@ -1359,28 +1725,147 @@ fn raster_map_rows(
 
     raster_lightning(cells, app, bounds, width, height);
 
-    if let Some(location) = app.location_marker {
-        let point = location.to_world();
-        if point.x >= bounds.min_x
-            && point.x <= bounds.max_x
-            && point.y >= bounds.min_y
-            && point.y <= bounds.max_y
-        {
-            let x = ((point.x - bounds.min_x) / bounds.width().max(f64::EPSILON) * f64::from(width))
-                .floor()
-                .clamp(0.0, f64::from(width.saturating_sub(1))) as u16;
-            let y = ((point.y - bounds.min_y) / bounds.height().max(f64::EPSILON)
-                * f64::from(height))
-            .floor()
-            .clamp(0.0, f64::from(height.saturating_sub(1))) as u16;
-            let cell = &mut cells[usize::from(y) * usize::from(width) + usize::from(x)];
-            cell.glyph = Some('x');
-            cell.color = Some(Rgb8::WHITE);
-            cell.bg = Some(Rgb8::RED);
+    if let Some(fix) = app.location_fix() {
+        raster_pin(
+            cells,
+            fix.point,
+            bounds,
+            width,
+            height,
+            modes,
+            LayerId::Location,
+            Rgb8::RED,
+        );
+    }
+
+    if let Some(pin) = app.search_pin() {
+        raster_pin(
+            cells,
+            pin,
+            bounds,
+            width,
+            height,
+            modes,
+            LayerId::SearchPin,
+            Rgb8::BLUE,
+        );
+    }
+}
+
+/// How far to look for a free cell when the `x` would land on existing text.
+/// Beyond a couple of cells the marker would no longer read as marking *this*
+/// spot, so it is better to overwrite than to drift.
+const PIN_NUDGE_RADIUS: u16 = 3;
+
+/// Draw a map pin: an `x` glyph and/or a coloured cell background.
+///
+/// Both modes are overlays, so they annotate the cell without taking a render
+/// mode away from radar or the temperature readings:
+/// - `Text` — a coloured `x`, leaving the cell's background alone.
+/// - `Color` — a coloured background, leaving the foreground alone so radar
+///   braille underneath still reads through.
+///
+/// Shared by the "you are here" marker and the search pin, which differ only
+/// in colour and which layer owns the modes.
+#[allow(clippy::too_many_arguments)]
+fn raster_pin(
+    cells: &mut [RasterCell],
+    point: GeoPoint,
+    bounds: Bounds,
+    width: u16,
+    height: u16,
+    modes: &RenderModeState,
+    layer: LayerId,
+    color: Rgb8,
+) {
+    let text = modes.has(RenderMode::Text, layer);
+    let background = modes.has(RenderMode::Color, layer);
+    if !text && !background {
+        return;
+    }
+    let world = point.to_world();
+    if world.x < bounds.min_x
+        || world.x > bounds.max_x
+        || world.y < bounds.min_y
+        || world.y > bounds.max_y
+    {
+        return;
+    }
+    let x = ((world.x - bounds.min_x) / bounds.width().max(f64::EPSILON) * f64::from(width))
+        .floor()
+        .clamp(0.0, f64::from(width.saturating_sub(1))) as u16;
+    let y = ((world.y - bounds.min_y) / bounds.height().max(f64::EPSILON) * f64::from(height))
+        .floor()
+        .clamp(0.0, f64::from(height.saturating_sub(1))) as u16;
+
+    // The background marks the true cell: it only tints, so it can never
+    // erase a city name or a reading and never needs to move.
+    if background {
+        let idx = usize::from(y) * usize::from(width) + usize::from(x);
+        if let Some(cell) = cells.get_mut(idx) {
+            cell.bg = Some(color);
         }
     }
 
-    raster_rows_into(braille_frame.cells(), width, height, render_rows);
+    if text {
+        // The glyph *does* overwrite, so nudge it to the nearest free cell
+        // rather than blanking a city name or a temperature reading.
+        let (gx, gy) = nearest_free_cell(cells, width, height, x, y).unwrap_or((x, y));
+        let idx = usize::from(gy) * usize::from(width) + usize::from(gx);
+        if let Some(cell) = cells.get_mut(idx) {
+            cell.glyph = Some('x');
+            cell.color = Some(color);
+        }
+    }
+}
+
+/// Find the closest cell to (`x`, `y`) that holds no glyph, searching outward
+/// to `PIN_NUDGE_RADIUS`.
+///
+/// Returns `(x, y)` itself when already free, and `None` when everything
+/// within the radius is occupied — the caller then overwrites, since a marker
+/// that silently vanishes is worse than one that covers a label.
+fn nearest_free_cell(
+    cells: &[RasterCell],
+    width: u16,
+    height: u16,
+    x: u16,
+    y: u16,
+) -> Option<(u16, u16)> {
+    let free = |cx: u16, cy: u16| -> bool {
+        cells
+            .get(usize::from(cy) * usize::from(width) + usize::from(cx))
+            .is_some_and(|c| c.glyph.is_none())
+    };
+    if free(x, y) {
+        return Some((x, y));
+    }
+    let mut best: Option<(u16, u16, u32)> = None;
+    for r in 1..=PIN_NUDGE_RADIUS {
+        for cy in y.saturating_sub(r)..=(y + r).min(height.saturating_sub(1)) {
+            for cx in x.saturating_sub(r)..=(x + r).min(width.saturating_sub(1)) {
+                // Only the ring at distance r — inner cells were checked already.
+                if x.abs_diff(cx) != r && y.abs_diff(cy) != r {
+                    continue;
+                }
+                if !free(cx, cy) {
+                    continue;
+                }
+                // Squared cell distance; columns are ~half as wide as rows are
+                // tall, so weight y to keep the nudge visually shortest.
+                let dx = u32::from(x.abs_diff(cx));
+                let dy = u32::from(y.abs_diff(cy)) * 2;
+                let d2 = dx * dx + dy * dy;
+                if best.is_none_or(|(_, _, bd)| d2 < bd) {
+                    best = Some((cx, cy, d2));
+                }
+            }
+        }
+        if let Some((bx, by, _)) = best {
+            return Some((bx, by));
+        }
+    }
+    None
 }
 
 fn desired_border_resolution(app: &App) -> BorderResolution {
@@ -1489,100 +1974,147 @@ fn raster_radar(
     }
 
     // Full path: braille + optional color/text overlays.
-    for tile in &radar.tiles {
-        let tb = tile_bounds(tile.coord);
-        if !bounds.intersects(tb) {
-            continue;
-        }
-
-        let tile_world_width = tb.max_x - tb.min_x;
-        let tile_world_height = tb.max_y - tb.min_y;
-        let inv_size = 1.0 / f64::from(tile.size);
-
-        for (row_index, runs) in tile.rows.iter().enumerate() {
-            let world_y_start = tb.min_y + row_index as f64 * inv_size * tile_world_height;
-            let world_y_end = tb.min_y + (row_index + 1) as f64 * inv_size * tile_world_height;
-
-            let start_sy = ((world_y_start - min_y) * sy_scale).floor() as i32;
-            let end_sy = ((world_y_end - min_y) * sy_scale).ceil() as i32;
-            let start_sy = start_sy.clamp(0, sub_height as i32) as u32;
-            let end_sy = end_sy.clamp(0, sub_height as i32) as u32;
-            if start_sy >= end_sy {
+    //
+    // Split into horizontal bands of terminal rows.  Each band owns a
+    // disjoint slice of `cells`, so bands can run in parallel without
+    // synchronisation, and within a band tiles/rows/runs are still visited
+    // in the original order — so the output is identical either way.  Rows
+    // outside a band are rejected before touching that row's runs, which is
+    // where nearly all the work is.
+    let draw_band = |band: &mut [RasterCell], cy_lo: usize| {
+        let cy_hi = cy_lo + band.len() / w_usize;
+        for tile in &radar.tiles {
+            let tb = tile_bounds(tile.coord);
+            if !bounds.intersects(tb) {
                 continue;
             }
 
-            for run in runs {
-                let world_x_start = tb.min_x + f64::from(run.start_x) * inv_size * tile_world_width;
-                let world_x_end = tb.min_x + f64::from(run.end_x) * inv_size * tile_world_width;
+            let tile_world_width = tb.max_x - tb.min_x;
+            let tile_world_height = tb.max_y - tb.min_y;
+            let inv_size = 1.0 / f64::from(tile.size);
 
-                let start_sx = ((world_x_start - min_x) * sx_scale).floor() as i32;
-                let end_sx = ((world_x_end - min_x) * sx_scale).ceil() as i32;
-                let start_sx = start_sx.clamp(0, sub_width as i32) as u32;
-                let end_sx = end_sx.clamp(0, sub_width as i32) as u32;
-                if start_sx >= end_sx {
+            // Radar rows map linearly onto subcell-Y, so derive the window of
+            // rows that can touch this band rather than scanning them all —
+            // otherwise every band pays for every row of every tile.  The
+            // window is deliberately loose (±1 row); the per-row band check
+            // below stays the authority on what actually gets drawn.
+            let rows_len = tile.rows.len();
+            let sy_per_row = inv_size * tile_world_height * sy_scale;
+            let sy_row0 = (tb.min_y - min_y) * sy_scale;
+            let (i_lo, i_hi) = if sy_per_row > 0.0 {
+                let lo = (((cy_lo * 4) as f64 - sy_row0) / sy_per_row).floor() as i64 - 1;
+                let hi = (((cy_hi * 4) as f64 - sy_row0) / sy_per_row).ceil() as i64 + 1;
+                let max = rows_len as i64;
+                (lo.clamp(0, max) as usize, hi.clamp(0, max) as usize)
+            } else {
+                (0, rows_len)
+            };
+
+            for (row_index, runs) in tile.rows.iter().enumerate().take(i_hi).skip(i_lo) {
+                let world_y_start = tb.min_y + row_index as f64 * inv_size * tile_world_height;
+                let world_y_end = tb.min_y + (row_index + 1) as f64 * inv_size * tile_world_height;
+
+                let start_sy = ((world_y_start - min_y) * sy_scale).floor() as i32;
+                let end_sy = ((world_y_end - min_y) * sy_scale).ceil() as i32;
+                let start_sy = start_sy.clamp(0, sub_height as i32) as u32;
+                let end_sy = end_sy.clamp(0, sub_height as i32) as u32;
+                if start_sy >= end_sy {
                     continue;
                 }
 
-                let color = run.color;
-                let intensity = run.intensity;
-
-                // Iterate terminal cells, not subcells: a run spans up to
-                // 8 subcells per cell, so accumulating the braille bits per
-                // cell (rather than one write per dot) cuts the inner loop
-                // ~8× while producing byte-identical output.
-                let glyph = in_text.then(|| radar_glyph(intensity));
                 let cy_start = (start_sy / 4) as usize;
                 let cy_end = ((end_sy - 1) / 4) as usize;
-                let cx_start = (start_sx / 2) as usize;
-                let cx_end = ((end_sx - 1) / 2) as usize;
+                // This row lands entirely outside the band — skip its runs.
+                if cy_end < cy_lo || cy_start >= cy_hi {
+                    continue;
+                }
 
-                for cy in cy_start..=cy_end {
-                    // Braille bit masks for the left/right columns, ORed
-                    // over this cell's covered sub-rows.
-                    let (mut col0, mut col1) = (0u8, 0u8);
-                    if in_braille {
-                        let cell_sy0 = cy as u32 * 4;
-                        let sy_lo = start_sy.max(cell_sy0);
-                        let sy_hi = end_sy.min(cell_sy0 + 4);
-                        for sy in sy_lo..sy_hi {
-                            let r = sy & 3;
-                            col0 |= braille_bit(0, r);
-                            col1 |= braille_bit(1, r);
-                        }
+                for run in runs {
+                    let world_x_start =
+                        tb.min_x + f64::from(run.start_x) * inv_size * tile_world_width;
+                    let world_x_end = tb.min_x + f64::from(run.end_x) * inv_size * tile_world_width;
+
+                    let start_sx = ((world_x_start - min_x) * sx_scale).floor() as i32;
+                    let end_sx = ((world_x_end - min_x) * sx_scale).ceil() as i32;
+                    let start_sx = start_sx.clamp(0, sub_width as i32) as u32;
+                    let end_sx = end_sx.clamp(0, sub_width as i32) as u32;
+                    if start_sx >= end_sx {
+                        continue;
                     }
-                    let row_base = cy * w_usize;
-                    for cx in cx_start..=cx_end {
-                        let idx = row_base + cx;
-                        if idx >= cells_len {
-                            continue;
-                        }
-                        let cell = &mut cells[idx];
+
+                    let color = run.color;
+                    let intensity = run.intensity;
+
+                    // Iterate terminal cells, not subcells: a run spans up to
+                    // 8 subcells per cell, so accumulating the braille bits per
+                    // cell (rather than one write per dot) cuts the inner loop
+                    // ~8× while producing byte-identical output.
+                    let glyph = in_text.then(|| radar_glyph(intensity));
+                    let cx_start = (start_sx / 2) as usize;
+                    let cx_end = ((end_sx - 1) / 2) as usize;
+
+                    for cy in cy_start.max(cy_lo)..=cy_end.min(cy_hi.saturating_sub(1)) {
+                        // Braille bit masks for the left/right columns, ORed
+                        // over this cell's covered sub-rows.
+                        let (mut col0, mut col1) = (0u8, 0u8);
                         if in_braille {
-                            let cell_sx0 = cx as u32 * 2;
-                            let mut bits = 0u8;
-                            if cell_sx0 >= start_sx && cell_sx0 < end_sx {
-                                bits |= col0;
+                            let cell_sy0 = cy as u32 * 4;
+                            let sy_lo = start_sy.max(cell_sy0);
+                            let sy_hi = end_sy.min(cell_sy0 + 4);
+                            for sy in sy_lo..sy_hi {
+                                let r = sy & 3;
+                                col0 |= braille_bit(0, r);
+                                col1 |= braille_bit(1, r);
                             }
-                            if cell_sx0 + 1 >= start_sx && cell_sx0 + 1 < end_sx {
-                                bits |= col1;
+                        }
+                        let row_base = (cy - cy_lo) * w_usize;
+                        for cx in cx_start..=cx_end {
+                            let idx = row_base + cx;
+                            if cx >= w_usize || idx >= band.len() {
+                                continue;
                             }
-                            cell.bits |= bits;
-                            if intensity >= cell.intensity {
+                            let cell = &mut band[idx];
+                            if in_braille {
+                                let cell_sx0 = cx as u32 * 2;
+                                let mut bits = 0u8;
+                                if cell_sx0 >= start_sx && cell_sx0 < end_sx {
+                                    bits |= col0;
+                                }
+                                if cell_sx0 + 1 >= start_sx && cell_sx0 + 1 < end_sx {
+                                    bits |= col1;
+                                }
+                                cell.bits |= bits;
+                                if intensity >= cell.intensity {
+                                    cell.color = Some(color);
+                                    cell.intensity = intensity;
+                                }
+                            }
+                            if in_color {
+                                cell.bg = Some(color);
+                            }
+                            if in_text {
+                                cell.glyph = glyph;
                                 cell.color = Some(color);
-                                cell.intensity = intensity;
                             }
-                        }
-                        if in_color {
-                            cell.bg = Some(color);
-                        }
-                        if in_text {
-                            cell.glyph = glyph;
-                            cell.color = Some(color);
                         }
                     }
                 }
             }
         }
+    };
+
+    // One band per worker, but never thinner than a few rows — below that the
+    // per-band tile/row rescan costs more than the parallelism returns.
+    const MIN_BAND_ROWS: usize = 4;
+    let threads = rayon::current_num_threads();
+    let rows_per_band = (usize::from(height).div_ceil(threads)).max(MIN_BAND_ROWS);
+    if threads == 1 || usize::from(height) <= MIN_BAND_ROWS {
+        draw_band(cells, 0);
+    } else {
+        cells
+            .par_chunks_mut(w_usize * rows_per_band)
+            .enumerate()
+            .for_each(|(i, band)| draw_band(band, i * rows_per_band));
     }
 }
 
@@ -2076,14 +2608,6 @@ fn raster_observations(
     let show_names = show_station_names(app.viewport.zoom);
     let obs_mode = obs_display_mode(app.viewport.zoom);
 
-    // One representative station per capital (closest within CITY_MATCH_KM).
-    // The label shows the hardcoded capital name, not the API station name.
-    let capital_labels = if show_names {
-        capital_name_labels(&obs.points)
-    } else {
-        std::collections::HashMap::new()
-    };
-
     for id in crate::layers::LayerRegistry::ORDER {
         if !id.is_observation() {
             continue;
@@ -2100,7 +2624,7 @@ fn raster_observations(
         // their cells — they're then the last to be dropped by the declutter as
         // the view gets denser.
         for capitals_first in [true, false] {
-            for (point_idx, point) in obs.points.iter().enumerate() {
+            for point in &obs.points {
                 let (lat, lon) = (point.point.lat, point.point.lon);
                 let is_capital = is_capital_station(lat, lon);
                 if is_capital != capitals_first {
@@ -2155,26 +2679,12 @@ fn raster_observations(
 
                 let (text, color) = obs_display_text(property, point);
                 write_obs_str(cells, width, sx, sy, &text, color, false);
-
-                // Show the capital name one row below — only if those cells are free.
-                if let Some(&cap_name) = capital_labels.get(&point_idx) {
-                    const NAME_COLOR: Rgb8 = Rgb8::new(105, 105, 105);
-                    let name_sy = (sy / 4 + 1) * 4;
-                    let name_cell_y = (name_sy / 4) as usize;
-                    let name_cell_x = (sx / 2) as usize;
-                    let name_row_base = name_cell_y * usize::from(width);
-                    let name_end = (name_cell_x + cap_name.len()).min(usize::from(width));
-                    let cells_free = (name_cell_x..name_end).all(|cx| {
-                        cells
-                            .get(name_row_base + cx)
-                            .is_some_and(|c| c.glyph.is_none())
-                    });
-                    if cells_free {
-                        write_obs_str(cells, width, sx, name_sy, cap_name, NAME_COLOR, false);
-                    }
-                }
             }
         }
+    }
+
+    if show_names {
+        raster_capital_names(cells, bounds, width, height);
     }
 
     // Placeholder dots for European capitals whose bbox query returned no
@@ -2404,41 +2914,32 @@ fn braille_bit(x: u32, y: u32) -> u8 {
     }
 }
 
-fn raster_rows_into(
-    cells: &[RasterCell],
-    width: u16,
-    height: u16,
-    out: &mut Vec<TextLine<'static>>,
-) {
-    out.clear();
-    out.reserve(usize::from(height));
+/// Blit the rasterised cell grid straight into the terminal buffer.
+///
+/// The grid already holds exactly one entry per terminal cell, so going via
+/// `Paragraph` would mean allocating a `String` and a `Vec<Span>` per row,
+/// every frame, only for ratatui to copy the glyphs back out into this same
+/// buffer.  Writing the cells directly makes the map path allocation-free.
+fn blit_cells(cells: &[RasterCell], area: Rect, width: u16, height: u16, buf: &mut Buffer) {
     let w = usize::from(width);
     for y in 0..height {
-        let mut spans: Vec<Span> = Vec::with_capacity(4);
-        let mut text = String::with_capacity(w);
-        let mut style = Style::default();
-        let row = &cells[y as usize * w..y as usize * w + w];
-        for cell in row {
+        let row = &cells[usize::from(y) * w..usize::from(y) * w + w];
+        for (x, cell) in row.iter().enumerate() {
+            let Ok(x) = u16::try_from(x) else { continue };
+            let Some(buf_cell) = buf.cell_mut((area.x + x, area.y + y)) else {
+                continue;
+            };
             let packed = cell.packed();
-            let next_style = match packed.fg {
-                Some(fg) => Style::default().fg(to_terminal_color(fg)),
-                None => Style::default(),
-            };
-            let next_style = match packed.bg {
-                Some(bg) => next_style.bg(to_terminal_color(bg)),
-                None => next_style,
-            };
-            let next_style = next_style.add_modifier(packed.modifier);
-            if !text.is_empty() && next_style != style {
-                spans.push(Span::styled(std::mem::take(&mut text), style));
+            let mut style = Style::default();
+            if let Some(fg) = packed.fg {
+                style = style.fg(to_terminal_color(fg));
             }
-            style = next_style;
-            text.push(raster_glyph(packed));
+            if let Some(bg) = packed.bg {
+                style = style.bg(to_terminal_color(bg));
+            }
+            buf_cell.set_char(raster_glyph(packed));
+            buf_cell.set_style(style.add_modifier(packed.modifier));
         }
-        if !text.is_empty() {
-            spans.push(Span::styled(text, style));
-        }
-        out.push(TextLine::from(spans));
     }
 }
 
@@ -2853,7 +3354,7 @@ fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     Some(LayerStatus::Error(_)) => " !",
                     _ => "",
                 };
-                if id.is_geographic() {
+                if id.is_simple_toggle() {
                     let enabled = app.layers.enabled(*id);
                     let locked = app.layers.get_state(*id).is_some_and(|s| s.locked);
                     if locked {
@@ -3059,30 +3560,76 @@ fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let hints = TextLine::from(vec![
-        Span::styled(" q ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" quit  "),
-        Span::styled(" arrows ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" pan  "),
-        Span::styled(" +/- ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" zoom  "),
-        Span::styled(" [/] ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" frame  "),
-        Span::styled(" p ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" play  "),
-        Span::styled(" 0 ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" live  "),
-        Span::styled(" space ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" toggle  "),
-        Span::styled(" ? ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" help  "),
-    ]);
+/// The footer hint strip, fitted to `width`.
+///
+/// Hints come from the registry ranked by how much a new user needs them, and
+/// whole hints are dropped from the right until the strip fits — a narrow
+/// terminal loses `history` before it loses `quit`, and never shows a hint
+/// sliced down the middle.
+fn footer_hint_spans(width: u16) -> Vec<Span<'static>> {
+    const GAP: &str = "   ";
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for h in keys::footer_hints() {
+        let text = format!(" {}{GAP}", h.label);
+        let cost = h.keys.chars().count() + text.chars().count();
+        if used + cost > width as usize {
+            continue;
+        }
+        used += cost;
+        spans.push(key_span(h.keys));
+        spans.push(desc_span(&text));
+    }
+    spans
+}
 
-    // " zoom " badge (6) + " X.X" value (5) = 11 chars, always fixed
+/// The `/` prompt: the query being typed, or the last search's outcome.
+///
+/// Takes the footer's row rather than floating over the map — a place search
+/// is a one-line interaction and a modal box would hide the very map the
+/// result lands on.
+fn render_search_prompt(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let mut spans = Vec::new();
+    match &app.search_input {
+        Some(query) => {
+            spans.push(key_span("/"));
+            spans.push(Span::raw(query.clone()));
+            // A block shows the caret without needing real cursor placement.
+            spans.push(Span::styled(
+                "▏",
+                Style::default().add_modifier(Modifier::SLOW_BLINK),
+            ));
+            spans.push(desc_span("   enter"));
+            spans.push(desc_span(" pin   esc"));
+            spans.push(desc_span(" cancel"));
+        }
+        None => {
+            let failed = matches!(
+                app.layers.get_state(LayerId::SearchPin).map(|s| &s.status),
+                Some(LayerStatus::Error(_))
+            ) || app
+                .search_status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("No match"));
+            let style = if failed {
+                Style::default().fg(Color::Rgb(Rgb8::AMBER.r, Rgb8::AMBER.g, Rgb8::AMBER.b))
+            } else {
+                Style::default().fg(Color::Rgb(Rgb8::BLUE.r, Rgb8::BLUE.g, Rgb8::BLUE.b))
+            };
+            spans.push(Span::styled("pin ", style));
+            spans.push(Span::raw(app.search_status.clone().unwrap_or_default()));
+        }
+    }
+    frame.render_widget(Paragraph::new(TextLine::from(spans)), area);
+}
+
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    // Built from the registry, so the footer can never drift from the help.
+
+    // "zoom" (4) + " X.X" value (5) + trailing space = 10 chars, always fixed
     let zoom_line = TextLine::from(vec![
-        Span::styled(" zoom ", Style::default().bg(Color::DarkGray)),
-        Span::raw(format!(" {:4.1}", app.viewport.zoom)),
+        key_span("zoom"),
+        Span::raw(format!(" {:4.1} ", app.viewport.zoom)),
     ]);
 
     let scale = render_scale_bar(app);
@@ -3092,12 +3639,15 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Fill(1),
-            Constraint::Length(11),
+            Constraint::Length(10),
             Constraint::Length(scale_w),
         ])
         .split(area);
 
-    frame.render_widget(Paragraph::new(hints), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(TextLine::from(footer_hint_spans(chunks[0].width))),
+        chunks[0],
+    );
     frame.render_widget(Paragraph::new(zoom_line), chunks[1]);
     frame.render_widget(
         Paragraph::new(TextLine::from(scale)).alignment(ratatui::layout::Alignment::Right),
@@ -3233,6 +3783,743 @@ fn braille_bar(fraction: f64, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::layers::{RadarRun, RadarTile};
+
+    // ── Capital name labels ────────────────────────────────────────────
+
+    /// Read back the text a `raster_capital_names` pass wrote, as
+    /// (row, col, string) per contiguous run — enough to assert placement.
+    fn rendered_names(bounds: Bounds, width: u16, height: u16) -> Vec<(usize, usize, String)> {
+        let mut cells = vec![RasterCell::default(); usize::from(width) * usize::from(height)];
+        raster_capital_names(&mut cells, bounds, width, height);
+        let mut out = Vec::new();
+        for row in 0..usize::from(height) {
+            let mut col = 0usize;
+            while col < usize::from(width) {
+                if cells[row * usize::from(width) + col].glyph.is_some() {
+                    let start = col;
+                    let mut s = String::new();
+                    while col < usize::from(width) {
+                        match cells[row * usize::from(width) + col].glyph {
+                            Some(c) => {
+                                s.push(c);
+                                col += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    out.push((row, start, s));
+                } else {
+                    col += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Bounds tight around Ljubljana (46.05, 14.51).
+    fn ljubljana_bounds() -> Bounds {
+        let c = lat_lon_to_world(46.05, 14.51);
+        Bounds {
+            min_x: c.x - 0.01,
+            max_x: c.x + 0.01,
+            min_y: c.y - 0.01,
+            max_y: c.y + 0.01,
+        }
+    }
+
+    /// The name marks the city, so it must be anchored to the city's own
+    /// coordinates — not to whatever weather station happens to be nearby.
+    #[test]
+    fn capital_name_is_drawn_at_the_citys_own_position() {
+        let bounds = ljubljana_bounds();
+        let (w, h) = (80u16, 40u16);
+        let names = rendered_names(bounds, w, h);
+        let (row, col, text) = names
+            .iter()
+            .find(|(_, _, s)| s.contains("Ljubljana"))
+            .expect("Ljubljana must be drawn");
+        // City is centred in these bounds, so the name sits at mid-width and
+        // one row below mid-height.
+        assert_eq!(*col, usize::from(w) / 2, "anchored at the city's column");
+        assert_eq!(*row, usize::from(h) / 2 + 1, "one row below the city");
+        assert_eq!(text.trim(), "Ljubljana");
+    }
+
+    /// Names must not depend on observation data at all: this pass runs with
+    /// no stations whatsoever and still labels the city.
+    #[test]
+    fn capital_names_render_without_any_observation_data() {
+        let names = rendered_names(ljubljana_bounds(), 80, 40);
+        assert!(
+            names.iter().any(|(_, _, s)| s.contains("Ljubljana")),
+            "city names must not vanish when no station reports"
+        );
+    }
+
+    #[test]
+    fn capitals_outside_the_viewport_are_not_drawn() {
+        let names = rendered_names(ljubljana_bounds(), 80, 40);
+        assert!(
+            !names.iter().any(|(_, _, s)| s.contains("Reykjavik")),
+            "only capitals inside the viewport are drawn, got {names:?}"
+        );
+    }
+
+    // ── Location marker ────────────────────────────────────────────────
+
+    /// Viewport covering the whole world, so world coords map linearly onto
+    /// the 10×10 cell grid used by the marker tests.
+    const WORLD_BOUNDS: Bounds = Bounds {
+        min_x: 0.0,
+        max_x: 1.0,
+        min_y: 0.0,
+        max_y: 1.0,
+    };
+
+    fn location_modes(text: bool, background: bool) -> RenderModeState {
+        let mut modes = RenderModeState::new();
+        if text {
+            modes.set_overlay(RenderMode::Text, LayerId::Location);
+        }
+        if background {
+            modes.set_overlay(RenderMode::Color, LayerId::Location);
+        }
+        modes
+    }
+
+    fn search_pin_modes() -> RenderModeState {
+        let mut modes = RenderModeState::new();
+        modes.set_overlay(RenderMode::Text, LayerId::SearchPin);
+        modes
+    }
+
+    fn marker_grid(point: GeoPoint, modes: &RenderModeState) -> Vec<RasterCell> {
+        let mut cells = vec![RasterCell::default(); 100];
+        raster_pin(&mut cells, point, WORLD_BOUNDS, 10, 10, modes, LayerId::Location, Rgb8::RED);
+        cells
+    }
+
+    /// Text mode marks the spot with a red `x` and must leave the cell's
+    /// background alone, so whatever is underneath still shows.
+    #[test]
+    fn location_text_mode_draws_a_red_x_without_touching_the_background() {
+        // lat/lon 0,0 is the centre of the world in Mercator space.
+        let cells = marker_grid(GeoPoint::new(0.0, 0.0), &location_modes(true, false));
+        let marked: Vec<&RasterCell> = cells.iter().filter(|c| c.glyph.is_some()).collect();
+        assert_eq!(marked.len(), 1, "exactly one cell is marked");
+        assert_eq!(marked[0].glyph, Some('x'));
+        assert_eq!(marked[0].color, Some(Rgb8::RED));
+        assert_eq!(marked[0].bg, None, "text mode must not set a background");
+    }
+
+    /// Background mode paints the cell red but must not touch the foreground —
+    /// that is what lets radar braille read through the marker.
+    #[test]
+    fn location_background_mode_sets_red_bg_and_leaves_the_foreground() {
+        let mut cells = vec![RasterCell::default(); 100];
+        let centre = 5 * 10 + 5;
+        cells[centre].glyph = Some('@');
+        cells[centre].color = Some(Rgb8::GREEN);
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &location_modes(false, true),
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        assert_eq!(cells[centre].bg, Some(Rgb8::RED));
+        assert_eq!(cells[centre].glyph, Some('@'), "foreground untouched");
+        assert_eq!(cells[centre].color, Some(Rgb8::GREEN), "colour untouched");
+    }
+
+    #[test]
+    fn location_marker_is_not_drawn_when_it_owns_no_mode() {
+        let cells = marker_grid(GeoPoint::new(0.0, 0.0), &location_modes(false, false));
+        assert!(cells.iter().all(|c| c.glyph.is_none() && c.bg.is_none()));
+    }
+
+    // ── Pin collision nudging ──────────────────────────────────────────
+
+    /// The `x` must not blank a city name or a reading it lands on.
+    #[test]
+    fn pin_glyph_moves_to_a_free_cell_instead_of_erasing_text() {
+        let mut cells = vec![RasterCell::default(); 100];
+        let centre = 5 * 10 + 5;
+        cells[centre].glyph = Some('L'); // e.g. the "Ljubljana" label
+        cells[centre].color = Some(Rgb8::GRAY);
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &location_modes(true, false),
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        assert_eq!(cells[centre].glyph, Some('L'), "existing label survives");
+        let pin = cells.iter().position(|c| c.glyph == Some('x'));
+        assert!(pin.is_some(), "the marker is still drawn somewhere");
+        let idx = pin.unwrap();
+        let (px, py) = ((idx % 10) as i32, (idx / 10) as i32);
+        assert!(
+            (px - 5).abs() <= 1 && (py - 5).abs() <= 1,
+            "nudged to an adjacent cell, got ({px},{py})"
+        );
+    }
+
+    /// The background only tints, so it never needs to move — it must stay on
+    /// the true cell even when a label sits there.
+    #[test]
+    fn pin_background_stays_put_when_the_cell_holds_text() {
+        let mut cells = vec![RasterCell::default(); 100];
+        let centre = 5 * 10 + 5;
+        cells[centre].glyph = Some('L');
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &location_modes(false, true),
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        assert_eq!(cells[centre].bg, Some(Rgb8::RED), "tint on the true cell");
+        assert_eq!(cells[centre].glyph, Some('L'));
+    }
+
+    /// With everything nearby taken, drawing over a label beats vanishing.
+    #[test]
+    fn pin_glyph_overwrites_when_no_free_cell_is_within_reach() {
+        let mut cells = vec![RasterCell::default(); 100];
+        for c in cells.iter_mut() {
+            c.glyph = Some('#');
+        }
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &location_modes(true, false),
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        assert_eq!(cells[5 * 10 + 5].glyph, Some('x'), "drawn at the true cell");
+    }
+
+    #[test]
+    fn nearest_free_cell_returns_the_cell_itself_when_free() {
+        let cells = vec![RasterCell::default(); 100];
+        assert_eq!(nearest_free_cell(&cells, 10, 10, 4, 6), Some((4, 6)));
+    }
+
+    /// Columns are about half as wide as rows are tall, so a horizontal nudge
+    /// is visually shorter than a vertical one of the same cell count.
+    #[test]
+    fn nearest_free_cell_prefers_a_horizontal_nudge() {
+        let mut cells = vec![RasterCell::default(); 100];
+        cells[5 * 10 + 5].glyph = Some('#');
+        // Both (4,5)/(6,5) and (5,4)/(5,6) are one cell away.
+        let (x, y) = nearest_free_cell(&cells, 10, 10, 5, 5).unwrap();
+        assert_eq!(y, 5, "stays on the same row");
+        assert!(x == 4 || x == 6, "moved sideways, got x={x}");
+    }
+
+    #[test]
+    fn nearest_free_cell_gives_up_when_everything_is_occupied() {
+        let mut cells = vec![RasterCell::default(); 100];
+        for c in cells.iter_mut() {
+            c.glyph = Some('#');
+        }
+        assert_eq!(nearest_free_cell(&cells, 10, 10, 5, 5), None);
+    }
+
+    /// The search pin renders through the same path, in blue.
+    #[test]
+    fn search_pin_draws_a_blue_x() {
+        let mut cells = vec![RasterCell::default(); 100];
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &search_pin_modes(),
+            LayerId::SearchPin,
+            Rgb8::BLUE,
+        );
+        let marked: Vec<&RasterCell> = cells.iter().filter(|c| c.glyph.is_some()).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].glyph, Some('x'));
+        assert_eq!(marked[0].color, Some(Rgb8::BLUE));
+    }
+
+    /// End to end: both pins on one map, each in its own colour. Searching
+    /// must not blank the "you are here" marker.
+    #[test]
+    fn both_pins_render_together_in_their_own_colours() {
+        let mut modes = RenderModeState::new();
+        modes.set_overlay(RenderMode::Text, LayerId::Location);
+        modes.set_overlay(RenderMode::Text, LayerId::SearchPin);
+        let mut cells = vec![RasterCell::default(); 100];
+        // Two clearly separate points inside the world bounds.
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(-60.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &modes,
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(60.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &modes,
+            LayerId::SearchPin,
+            Rgb8::BLUE,
+        );
+        let drawn: Vec<Rgb8> = cells
+            .iter()
+            .filter(|c| c.glyph == Some('x'))
+            .filter_map(|c| c.color)
+            .collect();
+        assert_eq!(drawn.len(), 2, "both pins drawn");
+        assert!(drawn.contains(&Rgb8::RED), "location marker still there");
+        assert!(drawn.contains(&Rgb8::BLUE), "search pin there too");
+    }
+
+    /// When both pins land on the same cell the nudge keeps them both
+    /// visible instead of one silently replacing the other.
+    #[test]
+    fn overlapping_pins_do_not_erase_each_other() {
+        let mut modes = RenderModeState::new();
+        modes.set_overlay(RenderMode::Text, LayerId::Location);
+        modes.set_overlay(RenderMode::Text, LayerId::SearchPin);
+        let mut cells = vec![RasterCell::default(); 100];
+        let same = GeoPoint::new(0.0, 0.0);
+        raster_pin(
+            &mut cells, same, WORLD_BOUNDS, 10, 10, &modes, LayerId::Location, Rgb8::RED,
+        );
+        raster_pin(
+            &mut cells, same, WORLD_BOUNDS, 10, 10, &modes, LayerId::SearchPin, Rgb8::BLUE,
+        );
+        let drawn: Vec<Rgb8> = cells
+            .iter()
+            .filter(|c| c.glyph == Some('x'))
+            .filter_map(|c| c.color)
+            .collect();
+        assert_eq!(drawn.len(), 2, "both pins survive an exact overlap");
+        assert!(drawn.contains(&Rgb8::RED) && drawn.contains(&Rgb8::BLUE));
+    }
+
+    /// The two pins are independent: the location marker must not appear just
+    /// because the search pin owns a mode.
+    #[test]
+    fn a_pin_only_draws_when_its_own_layer_owns_a_mode() {
+        let mut cells = vec![RasterCell::default(); 100];
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &search_pin_modes(),
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        assert!(cells.iter().all(|c| c.glyph.is_none()));
+    }
+
+    #[test]
+    fn location_marker_lands_in_the_cell_matching_its_coordinates() {
+        let cells = marker_grid(GeoPoint::new(0.0, 0.0), &location_modes(true, false));
+        let idx = cells.iter().position(|c| c.glyph.is_some()).unwrap();
+        // Centre of a 10×10 grid.
+        assert_eq!((idx % 10, idx / 10), (5, 5));
+    }
+
+    #[test]
+    fn location_marker_outside_the_viewport_is_not_drawn() {
+        let bounds = Bounds {
+            min_x: 0.0,
+            max_x: 0.1,
+            min_y: 0.0,
+            max_y: 0.1,
+        };
+        let mut cells = vec![RasterCell::default(); 100];
+        // Ljubljana — well outside the top-left corner of the world.
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(14.5, 46.05),
+            bounds,
+            10,
+            10,
+            &location_modes(true, true),
+            LayerId::Location,
+            Rgb8::RED,
+        );
+        assert!(cells.iter().all(|c| c.glyph.is_none() && c.bg.is_none()));
+    }
+
+    /// Flatten bar spans into one (char, style) per rendered cell.
+    fn bar_cells(spans: &[Span<'static>]) -> Vec<(char, Style)> {
+        spans
+            .iter()
+            .flat_map(|s| s.content.chars().map(|c| (c, s.style)))
+            .collect()
+    }
+
+    #[test]
+    fn bar_width_is_stable_regardless_of_how_many_frames_loaded() {
+        // The collapse this replaced: width tracked the loaded frame count.
+        let space = 200;
+        // Two slots per cell: 36 slots over 18 cells is 36 half-cells.
+        assert_eq!(timeline_bar_width(3, space), Some(18));
+        assert_eq!(timeline_bar_width(6, space), Some(36));
+        // Deeper windows cap rather than stretch.
+        assert_eq!(timeline_bar_width(24, space), Some(TIMELINE_BAR_MAX));
+        assert_eq!(timeline_bar_width(12, space), Some(TIMELINE_BAR_MAX));
+        // Cramped terminals shrink, then drop the bar entirely.
+        assert_eq!(timeline_bar_width(24, 20), Some(20));
+        assert_eq!(timeline_bar_width(24, TIMELINE_BAR_MIN - 1), None);
+    }
+
+    #[test]
+    fn bar_has_no_empty_gaps_at_any_history_depth() {
+        // Every half-cell must carry a slot, at every offered depth. Sizing the
+        // bar one cell per slot (rather than per half-cell) left every second
+        // half-cell on the track colour, dithering the bar instead of filling
+        // it.
+        for hours in crate::providers::meteogate::HISTORY_OPTIONS {
+            let slots = crate::providers::meteogate::frames_for_hours(hours);
+            let width = timeline_bar_width(hours, 200).expect("bar fits");
+            let states = vec![SlotState::InRam; slots];
+            let spans = timeline_bar_spans(slots, 0, &states, width);
+            let empty: Vec<Color> = bar_cells(&spans)
+                .iter()
+                .map(|(_, s)| s.bg.unwrap())
+                .filter(|c| *c == BAR_MISSING)
+                .collect();
+            assert!(
+                empty.is_empty(),
+                "{hours} h: {} of {} cells left empty",
+                empty.len(),
+                width
+            );
+        }
+    }
+
+    #[test]
+    fn the_bar_only_ever_uses_its_four_colours() {
+        // A boundary mid-timeline plus a resident window: the shape most likely
+        // to invent an in-between shade.
+        let mut states = vec![SlotState::Missing; 288];
+        for s in states.iter_mut().take(60) {
+            *s = SlotState::OnDisk;
+        }
+        for s in states.iter_mut().take(25) {
+            *s = SlotState::InRam;
+        }
+        let spans = timeline_bar_spans(288, 12, &states, TIMELINE_BAR_MAX);
+        let allowed = [BAR_MISSING, BAR_DOWNLOADED, BAR_RAM_DOTS, BAR_PLAYHEAD];
+        for (glyph, style) in bar_cells(&spans) {
+            for c in [style.fg.unwrap(), style.bg.unwrap()] {
+                assert!(
+                    allowed.contains(&c),
+                    "glyph {glyph:?} painted {c:?}, which is not one of the four bar colours"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_download_boundary_splits_a_cell_instead_of_blending_it() {
+        // 4 slots over 1 cell: the older half missing, the newer half on disk,
+        // so the cell's two halves disagree.
+        let states = vec![
+            SlotState::OnDisk,
+            SlotState::OnDisk,
+            SlotState::Missing,
+            SlotState::Missing,
+        ];
+        // Playhead parked off this cell's halves is impossible at width 1, so
+        // check the split shape at width 2 where the boundary is interior.
+        let states4 = [states.as_slice(), states.as_slice()].concat();
+        let cells = bar_cells(&timeline_bar_spans(8, 0, &states4, 2));
+        let split: Vec<_> = cells.iter().filter(|(g, _)| *g == '▌').collect();
+        assert!(
+            !split.is_empty(),
+            "a half-cell boundary must be drawn with ▌, not a blended colour"
+        );
+        for (_, style) in split {
+            assert_ne!(
+                style.fg.unwrap(),
+                style.bg.unwrap(),
+                "a split cell paints two different states"
+            );
+        }
+    }
+
+    /// Cells excluding split ones (`▌`), which the playhead and download
+    /// boundaries produce.
+    fn uniform_cells(spans: &[Span<'static>]) -> Vec<(char, Style)> {
+        bar_cells(spans)
+            .into_iter()
+            .filter(|(g, _)| *g != '▌')
+            .collect()
+    }
+
+    #[test]
+    fn bar_renders_two_half_cells_per_column() {
+        let states = vec![SlotState::InRam; 4];
+        let spans = timeline_bar_spans(4, 0, &states, 8);
+        let cells = bar_cells(&spans);
+        assert_eq!(cells.len(), 8, "one glyph per cell");
+        assert!(
+            uniform_cells(&spans)
+                .iter()
+                .all(|(c, _)| ('\u{2800}'..='\u{28FF}').contains(c)),
+            "every uniform cell is a braille glyph carrying two dot columns"
+        );
+    }
+
+    #[test]
+    fn playhead_is_visible_when_slots_share_a_cell() {
+        // 24 h over the widest bar: 288 slots, 96 columns, 3 slots each.
+        let states = vec![SlotState::InRam; 288];
+        let spans = timeline_bar_spans(288, 150, &states, TIMELINE_BAR_MAX);
+        let painted: Vec<Color> = bar_cells(&spans)
+            .iter()
+            .map(|(_, s)| s.bg.unwrap())
+            .collect();
+        assert!(
+            painted.contains(&BAR_PLAYHEAD),
+            "playhead must survive sharing a cell with other slots"
+        );
+    }
+
+    #[test]
+    fn empty_timeline_paints_bare_track() {
+        let spans = timeline_bar_spans(0, 0, &[], 6);
+        let cells = bar_cells(&spans);
+        assert_eq!(cells.len(), 6, "track is drawn even before frames arrive");
+        for (glyph, style) in cells {
+            // Nothing loaded yet looks the same as nothing available — one grey.
+            assert_eq!(style.bg, Some(BAR_MISSING));
+            assert_eq!(glyph, '\u{2800}', "no slots means no stipple");
+        }
+    }
+
+    /// Backgrounds of every cell except the playhead's, which overrides them.
+    fn backgrounds(spans: &[Span<'static>]) -> Vec<Color> {
+        bar_cells(spans)
+            .iter()
+            .map(|(_, s)| s.bg.unwrap())
+            .filter(|c| *c != BAR_PLAYHEAD)
+            .collect()
+    }
+
+    #[test]
+    fn background_carries_download_state_only() {
+        // Downloaded but not resident reads as solid white; in-RAM shares that
+        // background, because RAM is a texture over it rather than a colour.
+        let disk = timeline_bar_spans(8, 0, &[SlotState::OnDisk; 8], 4);
+        let ram = timeline_bar_spans(8, 0, &[SlotState::InRam; 8], 4);
+        let missing = timeline_bar_spans(8, 0, &[SlotState::Missing; 8], 4);
+        assert!(backgrounds(&disk).iter().all(|c| *c == BAR_DOWNLOADED));
+        assert!(
+            backgrounds(&ram).iter().all(|c| *c == BAR_DOWNLOADED),
+            "RAM must not change the bg — it is carried by the dots"
+        );
+        assert!(backgrounds(&missing).iter().all(|c| *c == BAR_MISSING));
+    }
+
+    #[test]
+    fn ram_shows_as_dots_and_absent_ram_shows_none() {
+        let ram = uniform_cells(&timeline_bar_spans(4, 0, &[SlotState::InRam; 4], 2));
+        assert!(
+            !ram.is_empty() && ram.iter().all(|(c, _)| *c != '\u{2800}'),
+            "resident frames must raise dots"
+        );
+        let disk = uniform_cells(&timeline_bar_spans(4, 0, &[SlotState::OnDisk; 4], 2));
+        assert!(
+            !disk.is_empty() && disk.iter().all(|(c, _)| *c == '\u{2800}'),
+            "downloaded-but-not-resident must be bare white, no stipple"
+        );
+    }
+
+    /// Dots raised in braille column `col` of `glyph`.
+    fn col_dots(glyph: char, col: usize) -> usize {
+        let bits = u32::from(glyph) - 0x2800;
+        BRAILLE_COL_BITS[col]
+            .iter()
+            .filter(|b| bits & (1 << **b) != 0)
+            .count()
+    }
+
+    #[test]
+    fn ram_dot_height_tracks_how_much_of_a_column_is_resident() {
+        // 8 slots over 2 cells = 4 columns of 2 slots. Frame 0 is newest and
+        // lands rightmost, so cell 0 holds the four oldest; the playhead parked
+        // on frame 0 splits cell 1, leaving cell 0 uniform to inspect.
+        let mut states = vec![SlotState::OnDisk; 8];
+        states[6] = SlotState::InRam; // cell 0, left column
+        states[7] = SlotState::InRam; // cell 0, left column
+        states[4] = SlotState::InRam; // cell 0, right column: 1 of its 2
+        let cells = bar_cells(&timeline_bar_spans(8, 0, &states, 2));
+        let glyph = cells[0].0;
+        assert_ne!(
+            glyph, '\u{258C}',
+            "cell 0 should be uniform, away from playhead"
+        );
+        // Fully resident column fills; half-resident is half height — the
+        // sub-cell resolution the stipple buys.
+        assert_eq!(col_dots(glyph, 0), 4, "fully resident column fills");
+        assert_eq!(col_dots(glyph, 1), 2, "half-resident column is half height");
+    }
+
+    #[test]
+    fn a_single_resident_frame_in_a_busy_column_still_shows() {
+        // 24 slots over 2 cells: 6 per column. One resident frame in cell 0 must
+        // not round away to zero dots.
+        let mut states = vec![SlotState::OnDisk; 24];
+        states[23] = SlotState::InRam; // oldest, lands in cell 0
+        let cells = bar_cells(&timeline_bar_spans(24, 0, &states, 2));
+        assert_ne!(cells[0].0, '\u{2800}', "1-of-6 resident must still stipple");
+    }
+
+    #[test]
+    fn braille_columns_fill_from_the_bottom() {
+        assert_eq!(braille_columns([0, 0]), '\u{2800}');
+        // Full both columns = all eight dots.
+        assert_eq!(braille_columns([4, 4]), '\u{28FF}');
+        // One dot in the left column is dot 7 (the bottom), not dot 1.
+        assert_eq!(braille_columns([1, 0]), '\u{2840}');
+    }
+
+    #[test]
+    fn help_lists_every_binding_in_the_registry() {
+        let text: String = help_lines()
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        for b in crate::keys::BINDINGS {
+            if let Some(k) = b.help_keys {
+                assert!(text.contains(k), "help omits the `{k}` row");
+                assert!(text.contains(b.name), "help omits `{}`", b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn help_renders_without_painting_its_own_background() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut t = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        t.draw(|f| render_help(f, f.area())).unwrap();
+        let b = t.backend().buffer();
+        // Clear resets the covered cells; nothing may set a fill colour, so the
+        // modal inherits whatever background the terminal itself uses.
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                assert_eq!(b[(x, y)].bg, Color::Reset, "cell ({x},{y}) has a background");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_hints_come_from_the_registry() {
+        let keys: Vec<_> = crate::keys::footer_hints().into_iter().map(|h| h.keys).collect();
+        assert_eq!(keys.first(), Some(&"q"), "the way out is ranked first");
+        assert!(keys.contains(&"space"), "play/pause is a headline hint");
+        assert!(keys.contains(&"enter"), "layer toggle moved to enter");
+        assert!(!keys.contains(&"p"), "`p` is no longer bound");
+    }
+
+    fn footer_text(width: u16) -> String {
+        footer_hint_spans(width)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_footer_shows_every_hint() {
+        let text = footer_text(200);
+        for h in crate::keys::footer_hints() {
+            assert!(text.contains(h.label), "wide footer dropped `{}`", h.label);
+        }
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_whole_hints_worst_ranked_first() {
+        for width in [10u16, 20, 40, 60, 80] {
+            let text = footer_text(width);
+            assert!(
+                text.chars().count() <= width as usize,
+                "footer overflows at width {width}"
+            );
+            // Whatever survives, the escape hatch does.
+            assert!(text.contains("quit"), "width {width} dropped `quit`");
+            // Spans come in (key, label) pairs: a hint is shown whole or not
+            // at all.  Compare the pairs, not substrings — "i" would otherwise
+            // "match" inside "quit".
+            let spans = footer_hint_spans(width);
+            assert_eq!(spans.len() % 2, 0, "width {width} left a dangling span");
+            for pair in spans.chunks(2) {
+                let (key, label) = (pair[0].content.as_ref(), pair[1].content.trim());
+                assert!(
+                    crate::keys::footer_hints()
+                        .iter()
+                        .any(|h| h.keys == key && h.label == label),
+                    "width {width} rendered `{key} {label}`, which is not a registry hint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_footer_too_narrow_for_anything_renders_empty() {
+        assert_eq!(footer_text(3), "");
+    }
+
+    #[test]
+    fn help_modal_is_centred_and_sized_to_content() {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 60,
+        };
+        let r = centered_rect(40, 20, screen);
+        assert_eq!((r.width, r.height), (40, 20), "sized to what was asked for");
+        assert_eq!(r.x, 80, "centred horizontally");
+        assert_eq!(r.y, 20, "centred vertically");
+        assert!(r.width < screen.width && r.height < screen.height);
+    }
+
+    #[test]
+    fn help_modal_shrinks_to_fit_a_small_terminal() {
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let r = centered_rect(80, 40, tiny);
+        assert_eq!((r.width, r.height), (30, 10), "clamped, never overflowing");
+        assert_eq!((r.x, r.y), (0, 0));
+    }
 
     #[test]
     fn clips_segments_that_cross_viewport_edges() {
@@ -3543,7 +4830,7 @@ mod tests {
     }
 
     #[test]
-    fn raster_rows_produces_correct_number_of_rows() {
+    fn blit_writes_glyphs_and_colors_into_the_buffer() {
         let mut cells = vec![RasterCell::default(); 6]; // 3 wide x 2 high
                                                         // Fill first cell
         cells[0].bits |= 0x01; // bottom-left dot
@@ -3553,12 +4840,39 @@ mod tests {
         cells[5].bits |= 0x80 | 0x40; // top-right and top-left in second column
         cells[5].color = Some(Rgb8::RED);
 
-        let mut rows = Vec::new();
-        raster_rows_into(&cells, 3, 2, &mut rows);
-        assert_eq!(rows.len(), 2);
-        for row in &rows {
-            assert!(!row.spans.is_empty());
-        }
+        let area = Rect::new(0, 0, 3, 2);
+        let mut buf = Buffer::empty(area);
+        blit_cells(&cells, area, 3, 2, &mut buf);
+
+        // Braille glyph and colour land on the marked cells.
+        assert_eq!(buf[(0, 0)].symbol(), "\u{2801}");
+        assert_eq!(buf[(0, 0)].fg, to_terminal_color(Rgb8::GREEN));
+        assert_eq!(buf[(2, 1)].symbol(), "\u{28c0}");
+        assert_eq!(buf[(2, 1)].fg, to_terminal_color(Rgb8::RED));
+        // Untouched cells render blank, not stale content.
+        assert_eq!(buf[(1, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn blit_respects_the_area_offset() {
+        let cells = vec![
+            RasterCell {
+                bits: 0x01,
+                color: Some(Rgb8::GREEN),
+                ..RasterCell::default()
+            };
+            2
+        ];
+        // A 2x1 grid drawn into an area offset from the buffer origin.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+        blit_cells(&cells, Rect::new(1, 2, 2, 1), 2, 1, &mut buf);
+
+        assert_eq!(buf[(1, 2)].symbol(), "\u{2801}");
+        assert_eq!(buf[(2, 2)].symbol(), "\u{2801}");
+        // Outside the area nothing was touched.
+        assert_eq!(buf[(0, 2)].symbol(), " ");
+        assert_eq!(buf[(3, 2)].symbol(), " ");
+        assert_eq!(buf[(1, 0)].symbol(), " ");
     }
 
     #[test]
@@ -3650,9 +4964,9 @@ mod tests {
         let radar = synthetic_radar_frame(z, bounds);
         let modes = RenderModeState {
             braille: None,
-            braille_overlay: None,
             color: Some(LayerId::Radar),
             text: None,
+            ..RenderModeState::new()
         };
         let cell_count = usize::from(width) * usize::from(height);
         let mut cells = vec![RasterCell::default(); cell_count];
@@ -3678,6 +4992,67 @@ mod tests {
         );
     }
 
+    /// Render `radar` into a fresh grid, forcing the given rayon width so the
+    /// sequential (1 thread) and banded-parallel paths can be compared.
+    fn render_with_threads(
+        threads: usize,
+        radar: &RadarFrame,
+        bounds: Bounds,
+        width: u16,
+        height: u16,
+        modes: &RenderModeState,
+    ) -> Vec<RasterCell> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut cells = vec![RasterCell::default(); usize::from(width) * usize::from(height)];
+            raster_radar(&mut cells, radar, bounds, width, height, modes);
+            cells
+        })
+    }
+
+    #[test]
+    fn parallel_bands_render_identically_to_sequential() {
+        let bounds = Bounds {
+            min_x: 0.35,
+            max_x: 0.55,
+            min_y: 0.30,
+            max_y: 0.70,
+        };
+        let radar = synthetic_radar_frame(5, bounds);
+        // Braille alone, and braille+colour+text together, exercise every
+        // write path a band can take.
+        let cases = [
+            RenderModeState {
+                braille: Some(LayerId::Radar),
+                color: None,
+                text: None,
+                ..RenderModeState::new()
+            },
+            RenderModeState {
+                braille: Some(LayerId::Radar),
+                color: Some(LayerId::Radar),
+                text: Some(LayerId::Radar),
+                ..RenderModeState::new()
+            },
+        ];
+        // Heights that divide evenly and that leave a short trailing band.
+        for (width, height) in [(120u16, 50u16), (80, 17), (60, 5), (40, 3)] {
+            for modes in &cases {
+                let seq = render_with_threads(1, &radar, bounds, width, height, modes);
+                for threads in [2usize, 4, 8] {
+                    let par = render_with_threads(threads, &radar, bounds, width, height, modes);
+                    assert_eq!(
+                        seq, par,
+                        "banded output differs at {width}x{height} with {threads} threads"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn bench_raster_radar_braille_mode() {
         let width = 120u16;
@@ -3692,9 +5067,9 @@ mod tests {
         let radar = synthetic_radar_frame(z, bounds);
         let modes = RenderModeState {
             braille: Some(LayerId::Radar),
-            braille_overlay: None,
             color: None,
             text: None,
+            ..RenderModeState::new()
         };
         let cell_count = usize::from(width) * usize::from(height);
         let mut cells = vec![RasterCell::default(); cell_count];
@@ -3812,9 +5187,9 @@ mod tests {
         let n = usize::from(width) * usize::from(height);
         let mode = |b: bool, c: bool, t: bool| RenderModeState {
             braille: b.then_some(LayerId::Radar),
-            braille_overlay: None,
             color: c.then_some(LayerId::Radar),
             text: t.then_some(LayerId::Radar),
+            ..RenderModeState::new()
         };
         // braille, color, text, and braille+color / braille+text overlays.
         for (b, c, t) in [
@@ -3844,7 +5219,7 @@ mod tests {
     }
 
     #[test]
-    fn bench_raster_rows_into() {
+    fn bench_blit_cells() {
         let width = 120u16;
         let height = 50u16;
         let cell_count = usize::from(width) * usize::from(height);
@@ -3859,23 +5234,24 @@ mod tests {
             };
             cell_count
         ];
-        let mut out = Vec::new();
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
 
         let iters = 500;
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            raster_rows_into(&cells, width, height, &mut out);
+            blit_cells(&cells, area, width, height, &mut buf);
         }
         let elapsed = t0.elapsed();
         let per_frame_us = elapsed.as_micros() / iters;
         let per_frame_ms = per_frame_us as f64 / 1000.0;
         eprintln!(
-            "bench: raster_rows_into — {iters} frames in {elapsed:?} = {per_frame_ms:.3} ms/frame ({:.0} fps max)",
+            "bench: blit_cells — {iters} frames in {elapsed:?} = {per_frame_ms:.3} ms/frame ({:.0} fps max)",
             1000.0 / per_frame_ms
         );
         assert!(
             per_frame_ms < 5.0,
-            "raster_rows should complete in <5ms, got {per_frame_ms}ms"
+            "blit_cells should complete in <5ms, got {per_frame_ms}ms"
         );
     }
 }
