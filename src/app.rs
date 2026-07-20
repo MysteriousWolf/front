@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use crate::cache::{write_log, FrontDirs};
 use crate::cli::Cli;
 use crate::config::{Config, LayerRenderMode, StateConfig};
-use crate::geo::{world_to_lat_lon, GeoPoint, Viewport, WorldPoint};
+use crate::geo::{haversine_m, world_to_lat_lon, GeoPoint, Viewport, WorldPoint};
 use crate::layers::{
     resolution_distance, BorderLayer, BorderLine, BorderLineKind, BorderResolution, LayerId,
     LayerRegistry, LayerStatus, ObservationLayer, ObservationPoint, RadarFrame, RadarTile,
@@ -72,8 +72,45 @@ pub(crate) const LIGHTNING_IMPACT_MS: u32 = 900;
 struct RadarPreloadResult {
     timestamp: i64,
     tile_zoom: u8,
-    frame: RadarFrame,
+    /// `None` when the fetch failed; the slot is then queued for another
+    /// attempt rather than left as a permanent hole in the timeline.
+    frame: Option<RadarFrame>,
 }
+
+/// Retry bookkeeping for a radar slot whose fetch failed.
+///
+/// A frame that fails once is not abandoned: the timeline would keep a gap
+/// that nothing ever fills, since a slot is only re-requested when something
+/// else happens to trigger a preload pass.
+#[derive(Debug, Clone, Copy)]
+struct FrameRetry {
+    attempts: u32,
+    /// Earliest instant at which this slot may be requested again.
+    next_at: Instant,
+}
+
+/// How far a location fix must move before its settlement label is looked up
+/// again.  Well under the size of any town, so the name stays correct, but far
+/// enough that GPS jitter and accuracy refinements cost nothing.
+const LABEL_REFRESH_M: f64 = 2_000.0;
+
+/// First wait before re-requesting a failed radar slot.  Doubles per attempt.
+const FRAME_RETRY_BASE: Duration = Duration::from_secs(2);
+
+/// Ceiling on the retry backoff.  A slot that has been failing for a while is
+/// polled at this interval, so a frame that becomes available after an outage
+/// still fills itself in.
+const FRAME_RETRY_MAX: Duration = Duration::from_secs(90);
+
+/// Attempts after which a slot is given up on for this session.
+///
+/// Retrying forever is only right when the cause is transient.  Some failures
+/// are properties of the data itself — a composite this build cannot decode —
+/// and those repeat identically no matter how long you wait, burning a download
+/// and a decode each time.  Giving up keeps the timeline honest (the slot reads
+/// as unavailable rather than perpetually loading) and stops the churn; a
+/// history reload or restart clears the slate and tries again.
+const FRAME_RETRY_GIVE_UP: u32 = 8;
 
 /// How many uncached frames a single preload pass will pull in, nearest the
 /// playhead first.  Caps the work per trigger independently of how deep the
@@ -260,6 +297,9 @@ pub struct App {
     /// eviction starts: these still load without a fetch, so the timeline marks
     /// them as available rather than missing.
     pub disk_frames: HashSet<i64>,
+    /// Slots whose fetch failed, with when to try them again.  Entries are
+    /// removed on success and pruned when the slot leaves the timeline.
+    radar_failures: HashMap<i64, FrameRetry>,
     pub radar_frame: Option<RadarFrame>,
     pub border_mask_cache: Option<(BorderMaskStamp, BorderMask)>,
     /// Mask from the _previous_ resolution level, kept alive for one
@@ -378,6 +418,19 @@ pub struct App {
     /// Discriminates in-flight searches so a slow earlier query cannot
     /// overwrite the pin set by a later one.
     search_id: u64,
+    /// Settlement name for the "you are here" marker, once reverse geocoding
+    /// has resolved one.  `None` until then, or when the fix is somewhere with
+    /// no named settlement.
+    location_label: Option<String>,
+    /// Where `location_label` was resolved for, so a refined fix a few metres
+    /// away doesn't spend another Nominatim request.
+    location_label_at: Option<GeoPoint>,
+    location_label_task: Option<tokio::task::JoinHandle<()>>,
+    location_label_tx: UnboundedSender<(GeoPoint, Option<String>)>,
+    location_label_rx: UnboundedReceiver<(GeoPoint, Option<String>)>,
+    /// Settlement name for the search pin, taken from the geocoding result
+    /// that placed it — no extra request needed.
+    search_label: Option<String>,
     /// Pre‑load border tasks (one per resolution).  Stored so they can
     /// be aborted on quit — they're not tied to a specific request.
     preload_tasks: Vec<JoinHandle<()>>,
@@ -429,6 +482,7 @@ impl App {
         let (obs_tx, obs_rx) = unbounded_channel();
         let (warn_tx, warn_rx) = unbounded_channel();
         let (search_tx, search_rx) = unbounded_channel();
+        let (location_label_tx, location_label_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
         let (radar_preload_tx, radar_preload_rx) = unbounded_channel::<RadarPreloadResult>();
@@ -456,6 +510,7 @@ impl App {
             timestamps: Vec::new(),
             history_hours: crate::providers::meteogate::DEFAULT_HISTORY_HOURS,
             disk_frames: HashSet::new(),
+            radar_failures: HashMap::new(),
             radar_frame: None,
             border_mask_cache: None,
             fallback_mask_cache: None,
@@ -484,6 +539,12 @@ impl App {
             search_rx,
             search_task: None,
             search_id: 0,
+            location_label: None,
+            location_label_at: None,
+            location_label_task: None,
+            location_label_tx,
+            location_label_rx,
+            search_label: None,
             warning_layer: None,
             obs_cache: None,
             obs_incoming: Vec::new(),
@@ -1332,8 +1393,13 @@ impl App {
                     // Cache the completed frame and kick off preload for the rest.
                     // Key by the frame's real time, not the requested slot, so a
                     // resolved-elsewhere frame can't occupy two timeline slots.
+                    // It loaded — drop any retry bookkeeping for this slot.
+                    if let Some(req) = self.radar_requested_ts {
+                        self.radar_failures.remove(&req);
+                    }
                     if let Some(f) = self.radar_frame.as_ref() {
                         let ts = f.time;
+                        self.radar_failures.remove(&ts);
                         let zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
                         if zoom == self.frame_cache_zoom && self.timestamps.contains(&ts) {
                             let f = f.clone();
@@ -1351,6 +1417,12 @@ impl App {
                     self.layers
                         .set_status(LayerId::Radar, LayerStatus::Error(error));
                     self.refresh_task = None;
+                    // Queue the displayed slot for another attempt.  Showing an
+                    // error and then never trying again left the map blank until
+                    // the user happened to pan.
+                    if let Some(ts) = self.radar_requested_ts {
+                        self.note_frame_failure(ts);
+                    }
                 }
             }
         }
@@ -1492,6 +1564,60 @@ impl App {
         self.search_pin
     }
 
+    /// Settlement name to draw beside the "you are here" marker.
+    pub fn location_label(&self) -> Option<&str> {
+        self.location_label.as_deref()
+    }
+
+    /// Settlement name to draw beside the search pin.
+    pub fn search_label(&self) -> Option<&str> {
+        self.search_label.as_deref()
+    }
+
+    /// Ask Nominatim what settlement `point` is in, unless we already know.
+    ///
+    /// Skipped when the previous lookup was for somewhere within
+    /// [`LABEL_REFRESH_M`]: platform backends emit refinements continuously,
+    /// and each is a fresh fix even when it moves the marker by metres.  One
+    /// request per genuine relocation keeps us well inside Nominatim's 1 req/s
+    /// policy without any extra throttling here.
+    fn request_location_label(&mut self, point: GeoPoint) {
+        if let Some(prev) = self.location_label_at {
+            if haversine_m(prev, point) < LABEL_REFRESH_M {
+                return;
+            }
+        }
+        self.location_label_at = Some(point);
+        if let Some(task) = self.location_label_task.take() {
+            task.abort();
+        }
+        let geocode = self.geocode.clone();
+        let tx = self.location_label_tx.clone();
+        let log = self.dirs.log_path.clone();
+        self.location_label_task = Some(tokio::spawn(async move {
+            // A failed lookup simply leaves the pin unlabelled; it is a nicety,
+            // not something worth surfacing as a layer error.
+            let name = geocode.reverse(point, &log).await.ok().flatten();
+            let _ = tx.send((point, name));
+        }));
+    }
+
+    /// Drain resolved pin labels.  Returns true when the label changed.
+    pub fn drain_pin_labels(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((point, name)) = self.location_label_rx.try_recv() {
+            // Ignore a result for a position we have already moved on from.
+            if self.location_label_at != Some(point) {
+                continue;
+            }
+            if self.location_label != name {
+                self.location_label = name;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Re-fetch everything that depends on the viewport.  Used after any jump
     /// or pan, so a moved map does not keep showing the old area's data.
     pub fn request_viewport_refresh(&mut self) {
@@ -1536,8 +1662,10 @@ impl App {
     /// Drop the pin and turn the layer off again.
     pub fn clear_search_pin(&mut self) {
         self.search_pin = None;
+        self.search_label = None;
         self.layers.mode_state_mut().remove_all(LayerId::SearchPin);
-        self.layers.set_status(LayerId::SearchPin, LayerStatus::Idle);
+        self.layers
+            .set_status(LayerId::SearchPin, LayerStatus::Idle);
     }
 
     /// Submit the prompt's buffer as a geocoding query.
@@ -1594,6 +1722,16 @@ impl App {
             match result.outcome {
                 SearchOutcome::Found(place) => {
                     self.search_pin = Some(place.point);
+                    // The first component of Nominatim's display_name is the
+                    // place itself, so the pin gets its label for free — no
+                    // second request against the 1 req/s policy.
+                    self.search_label = place
+                        .display_name
+                        .split(',')
+                        .next()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     // A found place is only useful if you can see it, so jump
                     // there — this is an explicit user request, unlike a
                     // location fix arriving on its own.
@@ -1654,9 +1792,13 @@ impl App {
         for fix in fixes {
             if self.location.offer(fix) {
                 changed = true;
-                write_log(&self.dirs.log_path, format!("location: fix {}", fix.label()));
+                write_log(
+                    &self.dirs.log_path,
+                    format!("location: fix {}", fix.label()),
+                );
                 self.layers
                     .set_status(LayerId::Location, LayerStatus::Ready);
+                self.request_location_label(fix.point);
             }
         }
         changed
@@ -2110,11 +2252,20 @@ impl App {
         // instead of stopping dead at either end: sitting on the newest frame
         // preloads the oldest ones too, which is where the loop lands next.
         let len = self.timestamps.len();
+        let now = Instant::now();
         let mut by_distance: Vec<(usize, i64)> = self
             .timestamps
             .iter()
             .enumerate()
             .filter(|(_, ts)| !self.frame_cache.contains_key(ts) && Some(**ts) != current_ts)
+            // A slot that just failed is held back until its backoff expires,
+            // so a genuinely unavailable frame doesn't get hammered on every
+            // pan while a transient one still recovers quickly.
+            .filter(|(_, ts)| {
+                self.radar_failures.get(ts).is_none_or(|retry| {
+                    now >= retry.next_at && retry.attempts < FRAME_RETRY_GIVE_UP
+                })
+            })
             .map(|(i, &ts)| (ring_distance(i, self.frame_index, len), ts))
             .collect();
         // Nearest the playhead first: those are the frames playback reaches
@@ -2124,6 +2275,18 @@ impl App {
         let to_load: Vec<i64> = by_distance.into_iter().map(|(_, ts)| ts).collect();
         if to_load.is_empty() {
             return;
+        }
+        // Push the retry clock forward for every failed slot we are about to
+        // request.  `retry_due_frames` runs each tick, so without this a slot
+        // would still read as "due" while its fetch was in flight and every
+        // tick would abort and relaunch the pass — the frame would never land.
+        for ts in &to_load {
+            if let Some(retry) = self.radar_failures.get_mut(ts) {
+                retry.next_at = Instant::now()
+                    + FRAME_RETRY_BASE
+                        .saturating_mul(1u32 << retry.attempts.min(6))
+                        .min(FRAME_RETRY_MAX);
+            }
         }
         let provider = self.meteogate.clone();
         let tx = self.radar_preload_tx.clone();
@@ -2137,13 +2300,14 @@ impl App {
                 let sem = Arc::clone(&sem);
                 futs.push(async move {
                     let _permit = sem.acquire().await;
-                    if let Ok(frame) = provider.frame(ts, fetch_bounds, zoom).await {
-                        let _ = tx.send(RadarPreloadResult {
-                            timestamp: ts,
-                            tile_zoom,
-                            frame,
-                        });
-                    }
+                    // Failures are reported too, so the slot can be retried
+                    // instead of silently staying blank forever.
+                    let frame = provider.frame(ts, fetch_bounds, zoom).await.ok();
+                    let _ = tx.send(RadarPreloadResult {
+                        timestamp: ts,
+                        tile_zoom,
+                        frame,
+                    });
                 });
             }
             while futs.next().await.is_some() {}
@@ -2161,11 +2325,15 @@ impl App {
             if !self.timestamps.contains(&result.timestamp) {
                 continue;
             }
+            let Some(frame) = result.frame else {
+                self.note_frame_failure(result.timestamp);
+                continue;
+            };
             // The provider resolves a requested slot to whatever is actually
             // published, so key the cache by the time the frame really holds.
             // Caching under the requested slot instead would show the same
             // data on two timeline positions and mark both as loaded.
-            let actual_ts = result.frame.time;
+            let actual_ts = frame.time;
             if actual_ts != result.timestamp {
                 changed |= self.drop_phantom_slot(result.timestamp, actual_ts);
                 if !self.timestamps.contains(&actual_ts) {
@@ -2175,11 +2343,89 @@ impl App {
             // Loading it wrote the GeoTIFF to disk, so it stays reloadable
             // after `prune_frame_cache` drops it from RAM.
             self.disk_frames.insert(actual_ts);
-            self.frame_cache.insert(actual_ts, result.frame);
+            self.frame_cache.insert(actual_ts, frame);
+            // Both the requested and the resolved slot are settled now.
+            self.radar_failures.remove(&result.timestamp);
+            self.radar_failures.remove(&actual_ts);
             changed = true;
         }
         self.prune_frame_cache();
         changed
+    }
+
+    /// Record a failed slot and schedule the next attempt.
+    ///
+    /// The backoff grows per attempt but is capped, so retries continue for as
+    /// long as the slot is on the timeline: a frame missing because of an
+    /// outage fills itself in once the outage ends, with no user action.
+    fn note_frame_failure(&mut self, ts: i64) {
+        let entry = self.radar_failures.entry(ts).or_insert(FrameRetry {
+            attempts: 0,
+            next_at: Instant::now(),
+        });
+        entry.attempts = entry.attempts.saturating_add(1);
+        let backoff = FRAME_RETRY_BASE
+            .saturating_mul(1u32 << entry.attempts.min(6))
+            .min(FRAME_RETRY_MAX);
+        entry.next_at = Instant::now() + backoff;
+        let msg = if entry.attempts >= FRAME_RETRY_GIVE_UP {
+            format!(
+                "radar: frame {ts} failed (attempt {}) — giving up this session",
+                entry.attempts
+            )
+        } else {
+            format!(
+                "radar: frame {ts} failed (attempt {}) — retrying in {backoff:?}",
+                entry.attempts
+            )
+        };
+        write_log(&self.dirs.log_path, msg);
+    }
+
+    /// Re-launch a preload pass when a failed slot has become due for another
+    /// attempt.  Called every tick; cheap when nothing is pending.
+    ///
+    /// Without this, a failed slot would only be retried if some *other* event
+    /// happened to trigger a preload, so a frame that failed while the user sat
+    /// still would stay missing indefinitely.
+    pub fn retry_due_frames(&mut self) {
+        if self.radar_failures.is_empty() || self.is_dragging {
+            return;
+        }
+        // Forget slots that have scrolled off the timeline entirely.
+        let live: HashSet<i64> = self.timestamps.iter().copied().collect();
+        self.radar_failures.retain(|ts, _| live.contains(ts));
+
+        let now = Instant::now();
+
+        // The frame on screen is not part of a preload pass, so it needs its
+        // own re-request — and it is the one the user is actually waiting for.
+        let current_ts = self.timestamps.get(self.frame_index).copied();
+        if let Some(ts) = current_ts {
+            let due = self.radar_failures.get(&ts).is_some_and(|retry| {
+                now >= retry.next_at && retry.attempts < FRAME_RETRY_GIVE_UP
+            });
+            if due && self.refresh_task.is_none() && !self.frame_cache.contains_key(&ts) {
+                if let Some(retry) = self.radar_failures.get_mut(&ts) {
+                    // Same in-flight guard as the preload path.
+                    retry.next_at = now
+                        + FRAME_RETRY_BASE
+                            .saturating_mul(1u32 << retry.attempts.min(6))
+                            .min(FRAME_RETRY_MAX);
+                }
+                self.request_meteogate_refresh(self.map_width, self.map_height);
+                return;
+            }
+        }
+
+        let due = self.radar_failures.iter().any(|(ts, retry)| {
+            now >= retry.next_at
+                && retry.attempts < FRAME_RETRY_GIVE_UP
+                && !self.frame_cache.contains_key(ts)
+        });
+        if due {
+            self.trigger_radar_preload();
+        }
     }
 
     /// How readily `ts` can be displayed: decoded in RAM, on disk needing only

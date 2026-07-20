@@ -135,7 +135,35 @@ pub struct EumetnetConfig {
     /// Surface observations REST endpoint.
     #[serde(default = "default_surface_obs_endpoint")]
     pub surface_endpoint: String,
+    /// Optional MeteoGate API key.  Register one at
+    /// <https://devportal.meteogate.eu/>.
+    ///
+    /// This is the only knob that meaningfully raises the observation budget:
+    /// the gateway allows anonymous callers 50 requests/hour, but 500/hour once
+    /// a key identifies you.  Leave empty for anonymous access.
+    #[serde(default)]
+    pub api_key: String,
 }
+
+impl EumetnetConfig {
+    /// Requests allowed per hour, per the MeteoGate gateway's published
+    /// quotas.  Used to size the client-side budget so we throttle ourselves
+    /// instead of discovering the limit as a 429.
+    pub fn hourly_quota(&self) -> u32 {
+        if self.api_key.trim().is_empty() {
+            ANON_HOURLY_QUOTA
+        } else {
+            AUTH_HOURLY_QUOTA
+        }
+    }
+}
+
+/// MeteoGate gateway default quota for unauthenticated callers: 50 requests
+/// per 3600 s (`ratelimitAnon.quota` in the EUMETNET onboarding examples).
+pub const ANON_HOURLY_QUOTA: u32 = 50;
+
+/// Quota once an API key identifies the caller: 500 requests per 3600 s.
+pub const AUTH_HOURLY_QUOTA: u32 = 500;
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -165,6 +193,7 @@ impl Default for EumetnetConfig {
     fn default() -> Self {
         Self {
             surface_endpoint: default_surface_obs_endpoint(),
+            api_key: String::new(),
         }
     }
 }
@@ -332,6 +361,25 @@ mqtt_broker = "{ma_mqtt}"
 [eumetnet]
 # REST endpoint for surface observations.
 surface_endpoint = "{eu_surface}"
+#
+# ── MeteoGate API key ────────────────────────────────────────────
+# Surface observations go through the MeteoGate API gateway, which enforces a
+# request quota per client.  The published defaults are:
+#
+#     anonymous       10 req/s (burst 20),  {anon_q} requests per hour
+#     with an API key 60 req/s (burst 100), {auth_q} requests per hour
+#
+# front budgets itself against whichever quota applies, so anonymous use works
+# — observations simply refresh less often and prioritise the area you are
+# looking at.  A key lifts that considerably.
+#
+# To get one:
+#   1. Register an account at https://devportal.meteogate.eu/
+#   2. Create an API key from the developer portal
+#   3. Paste it below and restart front
+#
+# The key is sent as an `apikey` header.  Leave empty for anonymous access.
+api_key = "{eu_key}"
 "###,
             lat = self.viewport.lat,
             lon = self.viewport.lon,
@@ -343,6 +391,9 @@ surface_endpoint = "{eu_surface}"
             ma_api = self.meteoalarm.api_endpoint,
             ma_mqtt = self.meteoalarm.mqtt_broker,
             eu_surface = self.eumetnet.surface_endpoint,
+            eu_key = self.eumetnet.api_key,
+            anon_q = ANON_HOURLY_QUOTA,
+            auth_q = AUTH_HOURLY_QUOTA,
         );
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {

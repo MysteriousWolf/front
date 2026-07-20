@@ -59,6 +59,14 @@ const LAEA_FALSE_N: f64 = -2_100_000.0;
 /// Minimum dBZ value (≈ 1 dBZ). Values below this are noise/undetect.
 const MIN_DBZ: f32 = 1.0;
 
+/// Cap on samples taken per axis when averaging a source footprint.
+///
+/// Zoomed fully out a single pixel covers ~2900 source cells; reading all of
+/// them would cost more than the whole frame decode for no visible gain, since
+/// the mean has long since converged.  8 per axis (64 samples) keeps small
+/// features represented while bounding the work per pixel.
+const MAX_FOOTPRINT_SAMPLES: u32 = 8;
+
 // ---------------------------------------------------------------------------
 // On-disk grid format (`.frd`)
 // ---------------------------------------------------------------------------
@@ -97,17 +105,30 @@ const FRD_ZSTD_LEVEL: i32 = 1;
 /// Encode one dBZ sample as a `u8` code, or `None` when it is no-data.
 ///
 /// Returns `Err` when the value doesn't sit on the expected 0.5 dBZ grid or
-/// falls outside `u8` range.  That is deliberate: silently rounding to the
-/// nearest code would corrupt pixels invisibly if OPERA ever changed its
-/// quantisation, so the conversion fails loudly instead.
+/// exceeds the ceiling.  That is deliberate: silently rounding to the nearest
+/// code would corrupt pixels invisibly if OPERA ever changed its quantisation,
+/// so the conversion fails loudly instead.
+///
+/// Values *below* [`DBZ_BASE`] are the one exception, and are folded into the
+/// no-data code rather than failing.  OPERA does emit them — measured across
+/// three consecutive composites, each carried exactly one pixel in the
+/// -35..-32.5 range out of ~628 000 — and that single pixel used to abort the
+/// whole frame, so roughly three quarters of all frames never decoded and the
+/// timeline showed permanent gaps.  Nothing is lost by dropping them: they sit
+/// far below [`MIN_DBZ`], the threshold under which a sample is treated as
+/// undetect and never drawn.
 fn dbz_to_code(v: f32) -> Result<u8> {
     if !v.is_finite() || v <= DBZ_SENTINEL_MAX {
         return Ok(0);
     }
     let step = ((v - DBZ_BASE) / DBZ_STEP).round();
     let code = step + 1.0;
-    if !(1.0..=255.0).contains(&code) {
-        color_eyre::eyre::bail!("dBZ value {v} outside representable range");
+    if code < 1.0 {
+        // Weak echo below the encodable floor — undetect for our purposes.
+        return Ok(0);
+    }
+    if code > 255.0 {
+        color_eyre::eyre::bail!("dBZ value {v} above representable range");
     }
     let code = code as u8;
     // Verify rather than trust: the round-trip must be exact.
@@ -148,14 +169,58 @@ const MAX_CACHED_GRIDS: usize = 2;
 /// before the slot is probed again.
 const MISSING_RETRY: Duration = Duration::from_secs(60);
 
+/// How long a *transient* probe failure (timeout, 5xx, 429, DNS blip) is
+/// cached before re-probing.
+///
+/// Deliberately far shorter than [`MISSING_RETRY`]: a slot we merely failed to
+/// reach is very likely there, and pinning it as unreachable for a full minute
+/// is what made a single dropped packet look like a missing frame.
+const TRANSIENT_RETRY: Duration = Duration::from_secs(5);
+
+/// Ceiling on a server-supplied `Retry-After`, so a hostile or mistaken header
+/// cannot freeze radar for the rest of the session.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// How many times a GeoTIFF body fetch is attempted before the frame is
+/// reported as failed to the caller (which then schedules its own retry).
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// First backoff between download attempts; doubles each try.
+const DOWNLOAD_RETRY_BASE: Duration = Duration::from_millis(400);
+
+/// HEAD timeout.  The old 3 s was tight enough that an ordinary slow round
+/// trip registered as "frame does not exist"; the probe is cheap, so give it
+/// room to actually answer.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a HEAD probe actually established about a slot.
+///
+/// The distinction matters: S3 answering `404` is authoritative — the frame is
+/// genuinely not published yet — whereas a timeout or a `503` says nothing
+/// about the object at all.  Collapsing the two (the previous behaviour) let
+/// one network blip convince `resolve_nearest_available` that a slot was
+/// absent, which silently pulled the displayed frame backwards in time.
+#[derive(Debug, Clone, Copy)]
+enum Probe {
+    /// The object is there.
+    Exists,
+    /// S3 said `404`: not published (yet).
+    Absent,
+    /// We could not find out.  Carries how long to wait before asking again.
+    Transient(Duration),
+}
+
 /// Outcome of probing S3 for a given timestamp, cached so repeated
 /// pans/zooms don't re-issue HEAD requests for slots we already know
 /// about.  Objects are immutable once published, so positive results
-/// never expire; negative results are retried after [`MISSING_RETRY`].
+/// never expire; negative results are retried after [`MISSING_RETRY`],
+/// and unreachable ones after the much shorter [`TRANSIENT_RETRY`].
 #[derive(Debug, Clone, Copy)]
 enum ProbeResult {
     Exists,
     Missing(Instant),
+    /// Probe failed for reasons unrelated to the object; retry at this instant.
+    Unreachable(Instant),
 }
 
 type ProbeCache = Arc<tokio::sync::Mutex<HashMap<i64, ProbeResult>>>;
@@ -493,29 +558,32 @@ impl MeteoGateProvider {
             }
         }
 
-        let url = self.s3_url(timestamp);
-        write_log(log, format!("meteogate: downloading {url}"));
-        let bytes = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .wrap_err_with(|| format!("download MeteoGate GeoTIFF: {url}"))?
-            .error_for_status()
-            .wrap_err_with(|| format!("MeteoGate GeoTIFF response: {url}"))?
-            .bytes()
-            .await
-            .wrap_err("read MeteoGate GeoTIFF")?
-            .to_vec();
+        let bytes = self.download_geotiff(timestamp).await?;
         write_log(log, format!("meteogate: downloaded {} bytes", bytes.len()));
 
-        let (grid, encoded) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let converted = tokio::task::spawn_blocking(move || -> Result<_> {
             let grid = parse_geotiff(&bytes)?;
             let encoded = encode_frd(&grid)?;
             Ok((grid, encoded))
         })
         .await
-        .wrap_err("parse_geotiff task panicked")??;
+        .wrap_err("parse_geotiff task panicked")?;
+
+        // Log before propagating.  This error used to travel out silently, so a
+        // frame that downloaded fine but failed to convert looked identical to
+        // one that was never published — the log showed the download and then
+        // simply nothing, which is how a 77 % conversion failure rate went
+        // unnoticed.
+        let (grid, encoded) = match converted {
+            Ok(v) => v,
+            Err(e) => {
+                write_log(
+                    log,
+                    format!("meteogate: converting ts={timestamp} failed: {e}"),
+                );
+                return Err(e);
+            }
+        };
 
         write_log(
             log,
@@ -531,34 +599,106 @@ impl MeteoGateProvider {
         Ok(grid)
     }
 
-    /// Send a HEAD request with a short timeout; return `true` if the
-    /// object exists.  A failure (timeout / network error) is treated
-    /// as "not found" so the outer retry loop moves on quickly.
-    async fn head_geotiff(&self, timestamp: i64) -> Result<bool> {
+    /// Fetch the GeoTIFF body, retrying transient failures.
+    ///
+    /// S3 is not rate limited for this bucket, so a failure here is almost
+    /// always a dropped connection or a brief 5xx — worth a few quick retries
+    /// rather than surfacing as a hole in the timeline.  A `404` is final and
+    /// returns immediately: no amount of retrying publishes a frame.
+    async fn download_geotiff(&self, timestamp: i64) -> Result<Vec<u8>> {
+        let log = &self.dirs.log_path;
+        let url = self.s3_url(timestamp);
+        let mut delay = DOWNLOAD_RETRY_BASE;
+        let mut last: Option<String> = None;
+
+        for attempt in 1..=DOWNLOAD_ATTEMPTS {
+            if self.cancel.load(Ordering::Relaxed) {
+                color_eyre::eyre::bail!("cancelled");
+            }
+            write_log(log, format!("meteogate: downloading {url} (try {attempt})"));
+            match self.client.get(&url).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        match resp.bytes().await {
+                            Ok(b) => return Ok(b.to_vec()),
+                            // A truncated body is worth another attempt.
+                            Err(e) => last = Some(format!("read body: {e}")),
+                        }
+                    } else if matches!(
+                        status,
+                        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+                    ) {
+                        color_eyre::eyre::bail!("MeteoGate GeoTIFF {url}: HTTP {status}");
+                    } else {
+                        if let Some(after) = retry_after(resp.headers()) {
+                            delay = after.min(MAX_RETRY_AFTER);
+                        }
+                        last = Some(format!("HTTP {status}"));
+                    }
+                }
+                Err(e) => last = Some(e.to_string()),
+            }
+
+            if attempt < DOWNLOAD_ATTEMPTS {
+                write_log(
+                    log,
+                    format!(
+                        "meteogate: download ts={timestamp} failed ({}) — retrying in {:?}",
+                        last.as_deref().unwrap_or("unknown"),
+                        delay
+                    ),
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_RETRY_AFTER);
+            }
+        }
+        color_eyre::eyre::bail!(
+            "download MeteoGate GeoTIFF {url} after {DOWNLOAD_ATTEMPTS} attempts: {}",
+            last.as_deref().unwrap_or("unknown")
+        )
+    }
+
+    /// Send a HEAD request and classify the answer.
+    ///
+    /// Only a `404`/`410` counts as [`Probe::Absent`].  Everything else that
+    /// isn't a success — timeout, connection error, `429`, any `5xx` — is
+    /// [`Probe::Transient`], because none of it tells us whether the object is
+    /// on S3.  `Retry-After` is honoured when the server sends one.
+    async fn head_geotiff(&self, timestamp: i64) -> Probe {
         let url = self.s3_url(timestamp);
         write_log(&self.dirs.log_path, format!("meteogate: HEAD {url}"));
-        match tokio::time::timeout(Duration::from_secs(3), self.client.head(&url).send()).await {
+        match tokio::time::timeout(HEAD_TIMEOUT, self.client.head(&url).send()).await {
             Ok(Ok(resp)) => {
-                let ok = resp.status().is_success();
+                let status = resp.status();
                 write_log(
                     &self.dirs.log_path,
-                    format!("meteogate: HEAD ts={timestamp} -> {}", resp.status()),
+                    format!("meteogate: HEAD ts={timestamp} -> {status}"),
                 );
-                Ok(ok)
+                if status.is_success() {
+                    Probe::Exists
+                } else if matches!(
+                    status,
+                    reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+                ) {
+                    Probe::Absent
+                } else {
+                    Probe::Transient(retry_after(resp.headers()).unwrap_or(TRANSIENT_RETRY))
+                }
             }
             Ok(Err(e)) => {
                 write_log(
                     &self.dirs.log_path,
                     format!("meteogate: HEAD ts={timestamp} error: {e}"),
                 );
-                Ok(false) // treat as not found
+                Probe::Transient(TRANSIENT_RETRY)
             }
             Err(_) => {
                 write_log(
                     &self.dirs.log_path,
                     format!("meteogate: HEAD ts={timestamp} timeout"),
                 );
-                Ok(false) // treat as not found
+                Probe::Transient(TRANSIENT_RETRY)
             }
         }
     }
@@ -575,24 +715,34 @@ impl MeteoGateProvider {
             match cache.get(&ts) {
                 Some(ProbeResult::Exists) => return Ok(true),
                 Some(ProbeResult::Missing(at)) if at.elapsed() < MISSING_RETRY => return Ok(false),
+                Some(ProbeResult::Unreachable(until)) if Instant::now() < *until => {
+                    return Ok(false)
+                }
                 _ => {}
             }
         }
-        let exists = self.cache_path(ts).exists() || self.head_geotiff(ts).await?;
+        // A grid already on disk is proof enough; never spend a request on it.
+        let probe = if self.cache_path(ts).exists() {
+            Probe::Exists
+        } else {
+            self.head_geotiff(ts).await
+        };
         let mut cache = self.probe_cache.lock().await;
         cache.insert(
             ts,
-            if exists {
-                ProbeResult::Exists
-            } else {
-                ProbeResult::Missing(Instant::now())
+            match probe {
+                Probe::Exists => ProbeResult::Exists,
+                Probe::Absent => ProbeResult::Missing(Instant::now()),
+                Probe::Transient(wait) => {
+                    ProbeResult::Unreachable(Instant::now() + wait.min(MAX_RETRY_AFTER))
+                }
             },
         );
         // Keep the cache from growing without bound across long sessions.
         if cache.len() > 512 {
             cache.clear();
         }
-        Ok(exists)
+        Ok(matches!(probe, Probe::Exists))
     }
 
     async fn resolve_nearest_available(&self, timestamp: i64) -> Result<i64> {
@@ -650,6 +800,22 @@ impl MeteoGateProvider {
 // ---------------------------------------------------------------------------
 // Grid representation
 // ---------------------------------------------------------------------------
+
+/// Parse a `Retry-After` header into a delay.
+///
+/// Only the delta-seconds form is honoured; the HTTP-date form is rare on
+/// object stores and not worth a date parser here — callers fall back to their
+/// own default when this returns `None`.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
 
 /// Compute the list of expected radar frame timestamps spanning `hours` of
 /// history, newest first.  Purely local — no network traffic — so the UI can
@@ -713,6 +879,70 @@ impl RadarGrid {
     fn sample(&self, col: usize, row: usize) -> Option<f32> {
         let code = self.codes[row * self.width as usize + col];
         code_to_dbz(code).filter(|v| *v >= MIN_DBZ)
+    }
+
+    /// Average dBZ over the `span_u` × `span_v` source footprint that one
+    /// output pixel covers, centred on (`col`, `row`).
+    ///
+    /// Zoomed out, one screen pixel stands for a lot of radar: at tile zoom 4 a
+    /// pixel spans roughly 46 source cells, and at zoom 1 nearer 2900.  Taking a
+    /// single sample from that footprint — the old behaviour — meant whichever
+    /// cell happened to land under the sample point decided the whole pixel, so
+    /// small showers and the small gaps between them blinked in and out as the
+    /// map moved rather than shrinking smoothly.
+    ///
+    /// The mean is taken in **linear reflectivity** (Z), not dBZ.  dBZ is
+    /// logarithmic, so averaging it directly under-weights the strong returns
+    /// that dominate a cell; converting to Z, averaging, and converting back is
+    /// what the quantity actually means.
+    ///
+    /// No-data cells count as zero Z rather than being skipped.  That is what
+    /// keeps gaps visible: a footprint half echo and half hole averages to about
+    /// 3 dB less than a full one, instead of reading as solid echo.
+    fn sample_area(&self, col: usize, row: usize, span_u: u32, span_v: u32) -> Option<f32> {
+        if span_u <= 1 && span_v <= 1 {
+            return self.sample(col, row);
+        }
+        // Cap the work per pixel: past a handful of samples per axis the result
+        // stops changing visibly, but the cost keeps growing with the square.
+        let step_u = span_u.div_ceil(MAX_FOOTPRINT_SAMPLES).max(1) as usize;
+        let step_v = span_v.div_ceil(MAX_FOOTPRINT_SAMPLES).max(1) as usize;
+        let half_u = (span_u / 2) as usize;
+        let half_v = (span_v / 2) as usize;
+
+        let u0 = col.saturating_sub(half_u);
+        let v0 = row.saturating_sub(half_v);
+        let u1 = (col + half_u).min(self.width as usize - 1);
+        let v1 = (row + half_v).min(self.height as usize - 1);
+
+        let mut z_sum = 0.0f64;
+        let mut n = 0u32;
+        let mut v = v0;
+        while v <= v1 {
+            let base = v * self.width as usize;
+            let mut u = u0;
+            while u <= u1 {
+                // Read the code directly: `sample` applies the MIN_DBZ display
+                // threshold, which must not be applied per-cell before the
+                // average — that would erase the weak edges of a cell.
+                if let Some(dbz) = code_to_dbz(self.codes[base + u]) {
+                    z_sum += 10f64.powf(f64::from(dbz) / 10.0);
+                }
+                n += 1;
+                u += step_u;
+            }
+            v += step_v;
+        }
+        if n == 0 {
+            return None;
+        }
+        let z_mean = z_sum / f64::from(n);
+        if z_mean <= 0.0 {
+            return None;
+        }
+        let dbz = 10.0 * z_mean.log10();
+        let dbz = dbz as f32;
+        (dbz >= MIN_DBZ).then_some(dbz)
     }
 }
 
@@ -938,9 +1168,10 @@ fn tile_pixel_to_latlon(tc: TileCoord, z: u8, tx: u32, ty: u32) -> (f64, f64) {
 }
 
 fn build_tile(grid: &RadarGrid, tc: TileCoord, z: u8) -> Result<RadarTile> {
+    let (span_u, span_v) = footprint_cells(grid, tc, z);
     let mut rows = Vec::with_capacity(TILE_PX as usize);
     for py in 0..TILE_PX {
-        rows.push(build_row(grid, tc, z, py));
+        rows.push(build_row(grid, tc, z, py, span_u, span_v));
     }
     Ok(RadarTile {
         coord: tc,
@@ -949,7 +1180,35 @@ fn build_tile(grid: &RadarGrid, tc: TileCoord, z: u8) -> Result<RadarTile> {
     })
 }
 
-fn build_row(grid: &RadarGrid, tc: TileCoord, z: u8, py: u32) -> Vec<RadarRun> {
+/// How many source grid cells one output pixel of this tile covers, per axis.
+///
+/// Measured rather than derived from a zoom formula: the tile grid is Web
+/// Mercator and the radar grid is LAEA, so the ratio depends on latitude and on
+/// the angle between the two projections.  Stepping one pixel diagonally at the
+/// tile centre and converting both ends to LAEA metres captures all of that.
+fn footprint_cells(grid: &RadarGrid, tc: TileCoord, z: u8) -> (u32, u32) {
+    let mid = TILE_PX / 2;
+    let (lat_a, lon_a) = tile_pixel_to_latlon(tc, z, mid, mid);
+    let (lat_b, lon_b) = tile_pixel_to_latlon(tc, z, mid + 1, mid + 1);
+    let (xa, ya) = laea_forward(lat_a, lon_a);
+    let (xb, yb) = laea_forward(lat_b, lon_b);
+    let span = |d: f64, scale: f64| -> u32 {
+        if !d.is_finite() || scale <= 0.0 {
+            return 1;
+        }
+        ((d.abs() / scale).round() as u32).max(1)
+    };
+    (span(xb - xa, grid.scale_x), span(yb - ya, grid.scale_y))
+}
+
+fn build_row(
+    grid: &RadarGrid,
+    tc: TileCoord,
+    z: u8,
+    py: u32,
+    span_u: u32,
+    span_v: u32,
+) -> Vec<RadarRun> {
     let mut runs: Vec<RadarRun> = Vec::new();
     let mut current: Option<(Rgb8, u8)> = None;
     let mut start_x: u16 = 0;
@@ -957,7 +1216,7 @@ fn build_row(grid: &RadarGrid, tc: TileCoord, z: u8, py: u32) -> Vec<RadarRun> {
     for px in 0..TILE_PX {
         let (lat, lon) = tile_pixel_to_latlon(tc, z, px, py);
         let value: Option<(Rgb8, u8)> = match grid.lat_lon_to_uv(lat, lon) {
-            Some((col, row)) => grid.sample(col, row).map(dbz_to_color),
+            Some((col, row)) => grid.sample_area(col, row, span_u, span_v).map(dbz_to_color),
             None => None,
         };
 
@@ -1133,9 +1392,39 @@ mod tests {
             dbz_to_code(10.25).is_err(),
             "off-grid value must be rejected"
         );
-        // Outside the representable range.
+        // Above the ceiling is still a hard error: it would mean the product
+        // changed shape, not that the weather was quiet.
         assert!(dbz_to_code(200.0).is_err());
-        assert!(dbz_to_code(-100.0).is_err());
+    }
+
+    /// Weak echo below the encodable floor is folded into no-data instead of
+    /// failing.  OPERA emits a handful of such pixels per composite, and
+    /// rejecting them aborted the whole frame — roughly three quarters of all
+    /// frames never decoded, leaving permanent gaps in the timeline.
+    #[test]
+    fn sub_floor_values_become_nodata_rather_than_failing_the_frame() {
+        // The exact values observed in three consecutive failing composites.
+        for v in [-32.5_f32, -35.0, -100.0] {
+            assert_eq!(
+                dbz_to_code(v).expect("must not fail the frame"),
+                0,
+                "{v} dBZ should read as undetect"
+            );
+        }
+        // The floor itself still encodes normally.
+        assert_eq!(dbz_to_code(DBZ_BASE).unwrap(), 1);
+    }
+
+    /// A single sub-floor pixel must not stop a grid from encoding — that one
+    /// pixel in ~628 000 is exactly what used to kill an entire frame.
+    #[test]
+    fn one_sub_floor_pixel_does_not_abort_the_grid() {
+        let mut values = vec![10.0_f32; 64];
+        values[37] = -35.0;
+        let codes: Result<Vec<u8>> = values.iter().map(|&v| dbz_to_code(v)).collect();
+        let codes = codes.expect("grid with one sub-floor pixel must still encode");
+        assert_eq!(codes[37], 0, "the outlier reads as undetect");
+        assert!(codes.iter().filter(|&&c| c != 0).count() == 63);
     }
 
     #[test]
@@ -1218,8 +1507,124 @@ mod tests {
         assert_eq!(decode_frd(&encoded).unwrap().codes, grid.codes);
     }
 
+    // ── footprint averaging (software decimation) ──────────────────────
+
+    /// A small grid whose codes are produced by `f(col, row)` in dBZ.
+    fn grid_from(w: u32, h: u32, f: impl Fn(usize, usize) -> Option<f32>) -> RadarGrid {
+        let mut codes = vec![0u8; (w * h) as usize];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                if let Some(dbz) = f(col, row) {
+                    codes[row * w as usize + col] = dbz_to_code(dbz).unwrap();
+                }
+            }
+        }
+        RadarGrid {
+            codes,
+            width: w,
+            height: h,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1000.0,
+            scale_y: 1000.0,
+        }
+    }
+
+    /// A span of 1 must behave exactly like the old point sample, so zoomed
+    /// fully in nothing changes.
+    #[test]
+    fn unit_footprint_is_the_plain_sample() {
+        let g = grid_from(8, 8, |c, _| Some(10.0 + c as f32));
+        for col in 0..8 {
+            assert_eq!(g.sample_area(col, 3, 1, 1), g.sample(col, 3));
+        }
+    }
+
+    /// The regression this exists for: a hole surrounded by echo must still
+    /// read as weaker than solid echo once decimated, rather than being filled
+    /// in or dropped depending on where the sample point landed.
+    #[test]
+    fn a_gap_inside_echo_survives_decimation() {
+        // Uniform 40 dBZ.
+        let solid = grid_from(16, 16, |_, _| Some(40.0));
+        // Same, but a quarter of the cells are holes.
+        let holey = grid_from(16, 16, |c, r| ((c + r) % 4 != 0).then_some(40.0));
+
+        let a = solid.sample_area(8, 8, 8, 8).unwrap();
+        let b = holey.sample_area(8, 8, 8, 8).unwrap();
+        assert!(
+            b < a - 0.5,
+            "a gappy footprint ({b} dBZ) must read weaker than a solid one ({a} dBZ)"
+        );
+    }
+
+    /// A lone strong cell in an empty footprint must not vanish — it should
+    /// register as weaker echo, not as nothing at all.
+    #[test]
+    fn an_isolated_cell_is_attenuated_not_erased() {
+        let g = grid_from(16, 16, |c, r| (c == 8 && r == 8).then_some(55.0));
+        let v = g
+            .sample_area(8, 8, 4, 4)
+            .expect("isolated cell must survive");
+        assert!(
+            v < 55.0,
+            "should be attenuated by the surrounding emptiness"
+        );
+        assert!(v >= MIN_DBZ, "but must stay above the display threshold");
+    }
+
+    /// Averaging happens in linear Z, not dBZ.  Halving the *area* covered by a
+    /// given echo drops it by ~3 dB; a naive dBZ mean would instead halve the
+    /// dBZ number, which is a completely different (and wrong) answer.
+    #[test]
+    fn averaging_is_linear_in_z_not_in_dbz() {
+        // Half the cells at 40 dBZ, half empty.
+        let g = grid_from(16, 16, |c, _| (c % 2 == 0).then_some(40.0));
+        let v = g.sample_area(8, 8, 8, 8).unwrap();
+        assert!(
+            (v - 37.0).abs() < 0.6,
+            "half coverage of 40 dBZ should read ~37 dBZ, got {v}"
+        );
+    }
+
+    /// An entirely empty footprint stays empty — decimation must not invent
+    /// echo where the radar saw none.
+    #[test]
+    fn an_empty_footprint_stays_empty() {
+        let g = grid_from(16, 16, |_, _| None);
+        assert_eq!(g.sample_area(8, 8, 8, 8), None);
+    }
+
+    /// Uniform echo is preserved exactly, whatever the footprint size.
+    #[test]
+    fn uniform_echo_survives_any_footprint() {
+        let g = grid_from(64, 64, |_, _| Some(30.0));
+        for span in [1, 2, 5, 16, 40] {
+            let v = g.sample_area(32, 32, span, span).unwrap();
+            assert!((v - 30.0).abs() < 0.2, "span {span} gave {v}");
+        }
+    }
+
+    /// The sample cap bounds cost without changing the answer much: a huge
+    /// footprint over uniform echo must still read as that echo.
+    #[test]
+    fn oversized_footprints_are_capped_but_still_correct() {
+        let g = grid_from(200, 200, |_, _| Some(25.0));
+        let v = g.sample_area(100, 100, 180, 180).unwrap();
+        assert!((v - 25.0).abs() < 0.2, "got {v}");
+    }
+
+    /// Footprints near the grid edge must clamp rather than panic.
+    #[test]
+    fn footprint_clamps_at_grid_edges() {
+        let g = grid_from(16, 16, |_, _| Some(20.0));
+        for (c, r) in [(0, 0), (15, 15), (0, 15), (15, 0)] {
+            assert!(g.sample_area(c, r, 12, 12).is_some());
+        }
+    }
+
     /// Verify that `lat_lon_to_uv` maps the LAEA origin (55°N, 10°E) to the
-    /// centre of the grid (~pixel 1950, 2100) when accounting for false
+    /// centre of the grid (~pixel 1950, 2100) when accounting for false
     /// easting/northing.
     #[test]
     fn lat_lon_to_uv_maps_origin_to_center() {
@@ -1327,6 +1732,50 @@ mod tests {
         assert_eq!(radar_zoom(8.0), 7, "above max clamps to 7");
         assert_eq!(radar_zoom(4.4), 4, "rounds down");
         assert_eq!(radar_zoom(4.6), 5, "rounds up");
+    }
+
+    // ── retry / probe classification ───────────────────────────────────
+
+    #[test]
+    fn retry_after_parses_delta_seconds() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(30)));
+    }
+
+    /// The HTTP-date form is not parsed; callers must fall back to their own
+    /// default rather than treating a `None` as "retry immediately".
+    #[test]
+    fn retry_after_ignores_the_http_date_form() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_after_absent_is_none() {
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    /// A transient failure must be retried far sooner than a confirmed
+    /// absence — that difference is the whole point of splitting the two.
+    #[test]
+    fn transient_failures_are_retried_sooner_than_confirmed_absences() {
+        assert!(
+            TRANSIENT_RETRY < MISSING_RETRY,
+            "an unreachable slot is likely present; a 404 slot is known not to be"
+        );
+    }
+
+    /// A server-supplied Retry-After must not be able to stall radar for the
+    /// rest of the session.
+    #[test]
+    fn retry_after_is_capped() {
+        let huge = Duration::from_secs(86_400);
+        assert_eq!(huge.min(MAX_RETRY_AFTER), MAX_RETRY_AFTER);
     }
 
     #[test]

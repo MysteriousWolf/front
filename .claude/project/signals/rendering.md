@@ -1,0 +1,35 @@
+# rendering
+
+## What it does
+- [`src/ui.rs`](../../../src/ui.rs) (5560 lines) does pure ratatui rendering, driven by `render_map` and called on every tick; [`src/layers.rs`](../../../src/layers.rs) (2457 lines) defines the layer/render-mode data model consumed by it.
+- Three mutually exclusive `RenderMode` variants (`Braille`, `Color`, `Text`, `src/layers.rs:13-17`) each hold at most one *primary* owner (`RenderModeState.braille/color/text: Option<LayerId>`) plus a shared `overlays: Vec<(RenderMode, LayerId)>` list that can hold any number of non-evicting owners per mode (`src/layers.rs:34-48`).
+- Borders are rasterised into a `BorderMask` (`cells: Vec<Option<BorderLineKind>>`, `marks: Vec<BorderMaskPoint>`, `center: WorldPoint`, defined `src/app.rs:50-59`) cached in `App.border_mask_cache: Option<(BorderMaskStamp, BorderMask)>` and keyed by `BorderMaskStamp` (`zoom_bits`, `resolution`, `show_regions`, `show_roads`, `width`, `height`, `layers_version`, `src/app.rs:33-48`).
+
+## Artifacts
+(none)
+
+## CLI code
+(none — this domain has no CLI surface; commands live in `main.rs`/`config.rs`)
+
+## Docs
+- [`CLAUDE.md`](../../../CLAUDE.md) — documents rendering modes, overlay exception table, and layer-add persistence rule (root-level project doc, not under `docs/`).
+
+## Coupling
+- **persistence** ([`src/config.rs`](../../../src/config.rs), `src/app.rs::save_state`/`load_state`): `LayerRegistry::known_layers()` / `known_from_state()` / `restore_enabled()` (`src/layers.rs:956-1012`) are read by `App::save_state`/`load_state` (`src/app.rs:2499-2567`) to persist `known_layers` and `enabled_layers` into `state.toml` (`src/config.rs:274`); `RenderModeState.overlays` is persisted with the same mode tag as primaries and routed back via `restore()` (`src/layers.rs:169-175`, round-tripped by `src/app.rs:2522-2523`).
+- **geo** ([`src/geo.rs`](../../../src/geo.rs)): `RenderModeState`/`BorderMask`/`raster_pin`/`raster_capital_names` all operate on `WorldPoint`, `Bounds`, `TileCoord`, `GeoPoint` from [`src/geo.rs`](../../../src/geo.rs) (imported `src/layers.rs:6`); `BorderLine::compute_bbox()` and `SpatialGrid` in `layers.rs` depend on `geo::Bounds`/`tile_bounds`/`visible_tiles`.
+- **app-core** ([`src/app.rs`](../../../src/app.rs)): owns `border_mask_cache`, `fallback_mask_cache`, `braille_frame`, `border_layers`, `border_layers_version` fields that `ui.rs::render_map`/`get_or_compute_border_mask` read and mutate directly (`src/ui.rs:1312-1481`); a change to `BorderMaskStamp`'s fields forces a matching change in both files.
+- **providers/eumetnet** ([`src/providers/eumetnet.rs`](../../../src/providers/eumetnet.rs)): observation layer rendering (`is_observation()`, `ObservationProperty`, `ObservationPoint`/`ObservationLayer` in `src/layers.rs:408-473,1566-1592`) assumes the three-phase capitals→major-cities→full-viewport delivery documented for that provider; `obs_point_visible`/`is_capital_station` in `ui.rs:106-143` gate visibility by the same `CITY_MATCH_KM` constant.
+- **providers/meteogate**: `RadarFrame::merge_tiles`/`covers_bounds`/`trim_to_bounds` (`src/layers.rs:1466-1507`) encode the tile-eviction contract that `meteogate.rs`'s streaming tile delivery depends on (stale-zoom eviction, dedup by `TileCoord`).
+
+## Conventions worth knowing
+- `LayerId::is_simple_toggle()` (`src/layers.rs:458-460`) returns true only for geographic layers (`is_geographic()`: MapBorders, RegionBorders, MajorRoads); every other layer's "enabled" state is derived from `RenderModeState::has_any()`, i.e. owning at least one render mode.
+- `overlay_modes(id)` (`src/layers.rs:231-237`) hardcodes the only two overlay exceptions: `LayerId::Lightning` overlays `Braille`; `id.is_pin()` (`Location`, `SearchPin`) overlays both `Text` and `Color`. `toggle()`/`restore()` both branch on this function so callers never pick primary-vs-overlay themselves (`src/layers.rs:153-175`).
+- `preferred_modes(id)` (`src/layers.rs:211-222`) defines each layer's mode preference order used by `best_available()`; pins prefer `Text` before `Color` specifically because the glyph marks the spot "without hiding the cell underneath the way the background does."
+- `raster_pin` (`src/ui.rs:1778-1837`) is shared by both `Location` and `SearchPin` — they differ only in `color: Rgb8` and which `LayerId` owns the modes. `Color` mode only sets `cell.bg` (never moves); `Text` mode calls `nearest_free_cell` (`src/ui.rs:1932-1971`) to search outward up to `PIN_NUDGE_RADIUS = 3` cells for a glyph-free cell before falling back to overwriting in place.
+- `raster_pin` also calls `recolor_existing_label` (`src/ui.rs:1850-1885`) before `write_pin_label`: if the pin's place name is already drawn on screen (e.g. the capital label), the existing text is recoloured in place instead of drawing a duplicate.
+- `raster_capital_names` (`src/ui.rs:157-196`) draws capital names strictly at each city's hardcoded lat/lon from the `CAPITALS`/`EUROPEAN_CAPITAL_NAMES` tables, one sub-row below the city point, and only when the target cell row is glyph-free — never anchored to the nearest observation station.
+- `LEGACY_KNOWN_LAYERS` (`src/layers.rs:960-971`, 10 entries) is the layer set that existed before `known_layers` was added to `state.toml`; `known_from_state()` (`src/layers.rs:976-982`) substitutes it whenever the saved `known` list is empty, and `restore_enabled()` (`src/layers.rs:990-998`) skips restoring any layer absent from the resolved `known` list, leaving it at its constructor default.
+- `BorderMaskStamp` equality gates recompute in `get_or_compute_border_mask` (`src/ui.rs:1419-1430`): an unchanged stamp returns the cached mask untouched. On a resolution change, the old cache is moved into `App.fallback_mask_cache` (`src/ui.rs:1324-1328`) and promoted back only if the new-resolution compute yields nothing (`src/ui.rs:1373-1379`), avoiding a blank-frame flash during resolution cutover.
+- `get_or_compute_border_mask` falls back through `[Regional10m, High10m, Medium50m, Low110m]` (`src/ui.rs:1449-1454`) to the highest still-loaded resolution when the desired one isn't ready, specifically because `HashMap` iteration order is arbitrary and an arbitrary pick (e.g. `Low110m`) has no region/road data.
+- `SpatialGrid` (`src/layers.rs:1238-1337`) is a fixed 16×16 world-space grid over `BorderLine` bounding boxes, built once per `BorderLayer` and queried per mask recompute via `lines_for_bounds` with a reusable dedup bitset, reducing the per-frame scan from O(all_lines) to O(viewport_lines).
+- Test coverage in both files is extensive: [`src/layers.rs`](../../../src/layers.rs) has ~50 `#[cfg(test)]` unit tests covering `RenderModeState` overlay/primary semantics, `known_layers`/legacy restore, `SpatialGrid`, and `RadarFrame::merge_tiles` zoom eviction; [`src/ui.rs`](../../../src/ui.rs) has tests for capital-name placement, pin text/background independence, and border-mask dimension/precedence behavior (country > road > region, `country_wins_over_road_wins_over_region_mask`, `src/ui.rs:4873`).

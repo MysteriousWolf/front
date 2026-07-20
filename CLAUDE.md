@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+<atomic-signals>
+
+## Project signals (auto-loaded)
+
+
+@.claude/project/signals.md
+
+</atomic-signals>
+
 ## Git — standing rules
 
 **No agent-initiated git operations.** The agent must never run `git commit`, `git push`, `git branch`, `git checkout -b`, `git tag`, or any command that creates, modifies, or publishes git state. No PRs may be opened by the agent. All git operations — committing, tagging, pushing, branching, opening PRs — are performed manually by the repo owner after manual review. This applies to every task in this repo, not just individual requests.

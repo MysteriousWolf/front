@@ -20,8 +20,19 @@ Thumbs.db
 *.key
 
 # Claude Code local state
+# NOTE: .claude/project/ (signals + followups) is deliberately tracked — CLAUDE.md
+# @-refs the signals file and the followups index is auto-loaded each session.
+# Only the disposable working dirs are ignored here.
 .claude/settings.local.json
+.claude/.scratchpad/
+.claude/.atomic-index/
 .sisyphus/
+
+# Isolated worktrees created by the implement loop / autopilot
+.worktrees/
+
+# Ad-hoc experiments and scratch scripts
+tmp/
 
 # CLAUDE.md is intentionally tracked (project instructions)
 

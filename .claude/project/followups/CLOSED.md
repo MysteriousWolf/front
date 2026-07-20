@@ -1,0 +1,1 @@
+- 2026-07-20 gitignore-missing-atomic-paths — "gitignore lacks .claude/.scratchpad/, .worktrees/ and tmp/" — *(closed 2026-07-20)*

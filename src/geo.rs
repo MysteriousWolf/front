@@ -14,6 +14,28 @@ pub const MAX_VIEW_ZOOM: f64 = 12.0;
 /// generous: it only gates visibility, never naming.
 pub const CITY_MATCH_KM: f64 = 100.0;
 
+/// Zoom boundary between the two observation-fetch/display strategies:
+/// below it, a fixed set of ~16 regional cells (capitals + major cities)
+/// backs the display; at/above it, a single viewport-scoped query takes
+/// over and the regional cells stop fetching.
+///
+/// Single source of truth for what were two independently-tunable
+/// constants (`eumetnet.rs::CAPITALS_ZOOM_CUTOFF` and
+/// `ui.rs::MAJOR_CITIES_ZOOM_CUTOFF`) that carried a comment asserting they
+/// must be kept equal but were not (5.5 vs 5.0) — the fetch tier and the
+/// display tier could disagree.
+///
+/// Picked 5.5 over 5.0: the viewport query is the expensive one (a single
+/// continent-scale `area` request the gateway can take ~40s to assemble),
+/// while the regional-cell backdrop is capped at ~16 cheap requests
+/// regardless of zoom. Deferring the switch to the viewport strategy to a
+/// higher zoom keeps the anonymous 50/hour quota intact longer; the only
+/// cost is that major-city stations render one display tier later than
+/// they used to (5.5 instead of 5.0), which is a display lag, not a fetch
+/// gap — the backdrop already covers major cities for the whole span below
+/// this cutoff.
+pub const OBS_TIER_ZOOM_CUTOFF: f64 = 5.5;
+
 
 /// City names matching `EUROPEAN_CAPITALS` (same order).
 pub const EUROPEAN_CAPITAL_NAMES: &[&str] = &[
@@ -185,6 +207,19 @@ pub const EUROPEAN_MAJOR_CITIES: &[(f64, f64)] = &[
     (54.89, 23.90), // Kaunas, LT
     (58.38, 26.73), // Tartu, EE
 ];
+
+/// Great-circle distance between two points, in metres.
+///
+/// Used for "has this moved far enough to matter" checks, where the equirect-
+/// angular approximations elsewhere in this module would drift at the poles.
+pub fn haversine_m(a: GeoPoint, b: GeoPoint) -> f64 {
+    const EARTH_R_M: f64 = 6_371_000.0;
+    let (lat1, lat2) = (a.lat.to_radians(), b.lat.to_radians());
+    let dlat = lat2 - lat1;
+    let dlon = (b.lon - a.lon).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_R_M * h.sqrt().clamp(0.0, 1.0).asin()
+}
 
 /// Returns `true` when `(lat, lon)` is within `CITY_MATCH_KM` of any
 /// European capital.  Used by both the display filter and density clipping

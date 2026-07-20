@@ -13,7 +13,7 @@ use crate::cache::{read_if_exists, write_atomic, write_log, FrontDirs};
 use crate::config::EumetnetConfig;
 use crate::geo::{
     lat_lon_to_world, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, EUROPEAN_CAPITALS,
-    EUROPEAN_MAJOR_CITIES, EUROPE_LAT, EUROPE_LON,
+    EUROPEAN_MAJOR_CITIES, EUROPE_LAT, EUROPE_LON, OBS_TIER_ZOOM_CUTOFF,
 };
 use crate::layers::{ObservationLayer, ObservationPoint};
 
@@ -67,6 +67,9 @@ enum AreaFetch {
     /// The gateway returned HTTP 429.  Carries the `X-RateLimit-Reset` value
     /// (seconds until the budget resets) when present.
     RateLimited(Option<u64>),
+    /// Not sent at all — our own hourly budget is spent.  Distinct from
+    /// `Empty` so the caller does not cache an absence it never verified.
+    OverBudget,
 }
 
 /// Default back-off when the gateway rate-limits us but sends no reset hint.
@@ -80,23 +83,116 @@ const RATE_LIMIT_MAX_COOLDOWN: Duration = Duration::from_secs(20 * 60);
 /// once per day.
 const STATION_LIST_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Zoom below which only capital-city stations are fetched.
-/// Must match `ui.rs` MAJOR_CITIES_ZOOM_CUTOFF.
-const CAPITALS_ZOOM_CUTOFF: f64 = 5.5;
+/// Side length of the regional cells the capital/city list is clustered into
+/// before fetching.
+///
+/// The layer used to issue one 1° box per capital and major city: 113 requests
+/// for a full refresh, against a gateway quota of 50/hour.  It could never fit,
+/// and the budget would be gone before the first dozen cities were covered —
+/// which is what made observations appear at random.
+///
+/// Snapping those 113 points onto a 12° grid collapses them to ~16 distinct
+/// cells, and one `area` query per cell returns *every* station inside it, not
+/// just the ones near a city.  Fewer requests and better coverage at once.
+const REGION_CELL_DEG: f64 = 12.0;
 
-/// Half-side in degrees of the bbox queried around each capital/city.
-/// 1.0° ≈ 111 km — matches the 100 km `CITY_MATCH_KM` display radius so
-/// the fetch always covers every station the renderer might want to show.
-const CAPITAL_BOX_DEG: f64 = 1.0;
+/// `true` when the regional backdrop (capitals + major cities, clustered
+/// into `REGION_CELL_DEG` cells) should be fetched at this zoom.
+///
+/// Below `OBS_TIER_ZOOM_CUTOFF` the viewport query is skipped (too far out
+/// to be useful) and the backdrop is the only source. At/above it the
+/// viewport query covers what's visible and the backdrop would just be
+/// paying for continental cells the user has zoomed past — that was the
+/// budget leak this predicate closes.
+fn should_fetch_backdrop(zoom: f64) -> bool {
+    zoom < OBS_TIER_ZOOM_CUTOFF
+}
+
+/// Distinct regional cell centres covering `points`.
+///
+/// Points are snapped to a `cell_deg` grid and de-duplicated, so nearby cities
+/// share one query instead of each paying for its own.
+fn region_cells(points: &[(f64, f64)], cell_deg: f64) -> Vec<(f64, f64)> {
+    let mut seen: HashSet<(i64, i64)> = HashSet::new();
+    let mut out = Vec::new();
+    for &(lat, lon) in points {
+        let la = (lat / cell_deg).round();
+        let lo = (lon / cell_deg).round();
+        if seen.insert((la as i64, lo as i64)) {
+            out.push((la * cell_deg, lo * cell_deg));
+        }
+    }
+    out
+}
 
 /// How long a per-capital bbox result is reused before re-fetching.
-/// Independent of viewport; shared across all zoom levels.
-const CAPITAL_DATA_TTL: Duration = Duration::from_secs(5 * 60);
+///
+/// Deliberately long.  There are ~114 capitals and major cities, one request
+/// each, against a gateway budget of 50 requests/hour for anonymous callers —
+/// the old 5 min TTL implied ~1400 requests/hour, roughly 27× over, which is
+/// why the layer used to wedge itself into a permanent 429.  These boxes are
+/// low-zoom context, not the data you are reading; the viewport stations you
+/// are actually looking at refresh on [`VIEWPORT_DATA_TTL`] instead.
+const CAPITAL_DATA_TTL: Duration = Duration::from_secs(6 * 3600);
 
-/// Max concurrent per-location HTTP requests.  Combined with centre-outward
-/// sorting, closer stations start first while farther ones queue until a
-/// permit frees up.
-const MAX_CONCURRENT_LOCATIONS: usize = 32;
+/// Max concurrent per-location HTTP requests.
+///
+/// The gateway allows a burst of 20 for anonymous callers; 32 in flight at
+/// once overran it on its own, independently of the hourly quota.  Eight keeps
+/// us clear of the burst ceiling while still filling the map quickly, and
+/// combined with centre-outward sorting the nearest stations start first.
+const MAX_CONCURRENT_LOCATIONS: usize = 8;
+
+/// Fraction of the published hourly quota front will actually spend.
+///
+/// The remainder is headroom: the quota is shared per client IP, so another
+/// tool (or a second front instance) on the same address must not be able to
+/// push us over simply because we sized ourselves to exactly 100%.
+const BUDGET_UTILISATION: f64 = 0.8;
+
+/// A rolling-hour request budget.
+///
+/// The gateway's quota is `count` requests per `time_window` seconds, so the
+/// matching client-side model is a sliding window over request timestamps
+/// rather than a fixed counter that resets on the hour: the latter lets you
+/// spend the whole allowance in the last minute of one window and the first
+/// minute of the next, which the gateway would reject.
+///
+/// Spending is *advisory* — `try_spend` returning `false` means "skip this
+/// request", not "fail". Callers fall back to cached data, so running out of
+/// budget degrades freshness rather than breaking the layer.
+#[derive(Debug, Default)]
+struct RequestBudget {
+    /// Instants of requests issued within the current window, oldest first.
+    spent: Vec<Instant>,
+}
+
+impl RequestBudget {
+    /// Drop timestamps that have aged out of the window.
+    fn expire(&mut self, window: Duration) {
+        let now = Instant::now();
+        self.spent.retain(|t| now.duration_since(*t) < window);
+    }
+
+    /// Take one request from the budget if any remains.
+    fn try_spend(&mut self, limit: u32, window: Duration) -> bool {
+        self.expire(window);
+        if self.spent.len() as u32 >= limit {
+            return false;
+        }
+        self.spent.push(Instant::now());
+        true
+    }
+
+    /// How many requests remain in the current window.
+    fn remaining(&mut self, limit: u32, window: Duration) -> u32 {
+        self.expire(window);
+        limit.saturating_sub(self.spent.len() as u32)
+    }
+}
+
+/// Width of the gateway's quota window.
+const BUDGET_WINDOW: Duration = Duration::from_secs(3600);
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -136,6 +232,9 @@ pub struct EumetnetProvider {
     /// Per-location observation cache.  Key: (lat.to_bits(), lon.to_bits()).
     /// Value: points from that location's bbox query + the fetch instant.
     location_cache: ObsCache,
+    /// Rolling-hour spend against the gateway quota, shared by every request
+    /// this provider makes so the phases cannot each blow the budget alone.
+    budget: Arc<tokio::sync::Mutex<RequestBudget>>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +244,11 @@ struct MemCacheEntry {
     layer: ObservationLayer,
 }
 
-const MEM_CACHE_TTL: Duration = Duration::from_secs(300);
+/// How long the viewport's own observations are reused, in memory and on disk.
+///
+/// Short relative to [`CAPITAL_DATA_TTL`], deliberately: this is the data the
+/// user is actually reading, so it is where the request budget gets spent.
+const VIEWPORT_DATA_TTL: Duration = Duration::from_secs(600);
 
 impl EumetnetProvider {
     pub fn new(client: Client, dirs: FrontDirs, config: EumetnetConfig) -> Self {
@@ -156,6 +259,53 @@ impl EumetnetProvider {
             mem_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             rate_limited_until: Arc::new(tokio::sync::Mutex::new(None)),
             location_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            budget: Arc::new(tokio::sync::Mutex::new(RequestBudget::default())),
+        }
+    }
+
+    /// How many requests front will spend per hour, given whether an API key
+    /// is configured.  Held below the published quota by [`BUDGET_UTILISATION`].
+    fn budget_limit(&self) -> u32 {
+        let quota = f64::from(self.config.hourly_quota());
+        (quota * BUDGET_UTILISATION).floor().max(1.0) as u32
+    }
+
+    /// Reserve one request against the hourly budget.
+    ///
+    /// `false` means the caller should skip the request and leave whatever is
+    /// cached on screen — freshness degrades, the layer keeps working.
+    async fn try_spend(&self) -> bool {
+        let limit = self.budget_limit();
+        let mut budget = self.budget.lock().await;
+        let ok = budget.try_spend(limit, BUDGET_WINDOW);
+        if !ok {
+            write_log(
+                &self.dirs.log_path,
+                format!(
+                    "eumetnet: hourly request budget exhausted ({limit}/h) — \
+                     serving cached observations; set eumetnet.api_key for a larger quota"
+                ),
+            );
+        }
+        ok
+    }
+
+    /// Requests still available this hour.
+    async fn budget_remaining(&self) -> u32 {
+        let limit = self.budget_limit();
+        self.budget.lock().await.remaining(limit, BUDGET_WINDOW)
+    }
+
+    /// Attach the API key to a request when one is configured.
+    ///
+    /// The gateway accepts the key as an `apikey` header; without it the
+    /// caller is treated as anonymous and gets the much smaller quota.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let key = self.config.api_key.trim();
+        if key.is_empty() {
+            req
+        } else {
+            req.header("apikey", key)
         }
     }
 
@@ -245,7 +395,7 @@ impl EumetnetProvider {
         // with the location batch.  It's the slowest single request (the
         // gateway can take ~40s to assemble a continent-wide area response)
         // and covers the most important stations — those actually visible.
-        let viewport_task = if zoom >= CAPITALS_ZOOM_CUTOFF {
+        let viewport_task = if zoom >= OBS_TIER_ZOOM_CUTOFF {
             let provider = self.clone();
             let ep = endpoint.to_string();
             let cid = collection_id.to_string();
@@ -262,46 +412,58 @@ impl EumetnetProvider {
             None
         };
 
-        // Merge capitals + major cities into one centre-sorted list so
-        // stations pop in from the viewport centre outward instead of in
-        // two neat capital-then-city waves.
-        let center = bounds
-            .map(|b| WorldPoint {
-                x: (b.min_x + b.max_x) * 0.5,
-                y: (b.min_y + b.max_y) * 0.5,
-            })
-            .unwrap_or_else(|| lat_lon_to_world(EUROPE_LAT, EUROPE_LON));
+        // The regional backdrop (capitals + major cities) is only useful
+        // when zoomed out enough that no viewport query ran above — at
+        // higher zoom the viewport already covers what's visible, and
+        // fetching ~16 continental cells on top of it would be pure waste
+        // against the anonymous hourly quota.
+        if should_fetch_backdrop(zoom) {
+            // Merge capitals + major cities into one centre-sorted list so
+            // stations pop in from the viewport centre outward instead of in
+            // two neat capital-then-city waves.
+            let center = bounds
+                .map(|b| WorldPoint {
+                    x: (b.min_x + b.max_x) * 0.5,
+                    y: (b.min_y + b.max_y) * 0.5,
+                })
+                .unwrap_or_else(|| lat_lon_to_world(EUROPE_LAT, EUROPE_LON));
 
-        let mut all_locations: Vec<(f64, f64)> = EUROPEAN_CAPITALS
-            .iter()
-            .chain(EUROPEAN_MAJOR_CITIES.iter())
-            .copied()
-            .collect();
-        all_locations.sort_by(|&(la, lo_a), &(lb, lo_b)| {
-            let da = {
-                let w = lat_lon_to_world(la, lo_a);
-                (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
-            };
-            let db = {
-                let w = lat_lon_to_world(lb, lo_b);
-                (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
-            };
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        });
+            // Cluster the city list into regional cells before fetching: one
+            // query per cell covers every station inside it, so a full
+            // refresh costs ~16 requests instead of 113 and actually fits
+            // the gateway budget.
+            let cities: Vec<(f64, f64)> = EUROPEAN_CAPITALS
+                .iter()
+                .chain(EUROPEAN_MAJOR_CITIES.iter())
+                .copied()
+                .collect();
+            let mut all_locations = region_cells(&cities, REGION_CELL_DEG);
+            all_locations.sort_by(|&(la, lo_a), &(lb, lo_b)| {
+                let da = {
+                    let w = lat_lon_to_world(la, lo_a);
+                    (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
+                };
+                let db = {
+                    let w = lat_lon_to_world(lb, lo_b);
+                    (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
+                };
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-        self.fetch_location_batch(
-            endpoint,
-            collection_id,
-            &all_locations,
-            "locations",
-            &names,
-            log,
-            &point_tx,
-            &flush_tx,
-            &self.location_cache,
-            &mut seen_wigos,
-        )
-        .await;
+            self.fetch_location_batch(
+                endpoint,
+                collection_id,
+                &all_locations,
+                "locations",
+                &names,
+                log,
+                &point_tx,
+                &flush_tx,
+                &self.location_cache,
+                &mut seen_wigos,
+            )
+            .await;
+        }
 
         // Let the background station list fetch complete so it writes to
         // disk cache for the next refresh.  The current refresh already
@@ -352,7 +514,8 @@ impl EumetnetProvider {
         let cache_hit = {
             let cache = self.mem_cache.lock().await;
             cache.get(collection_id).and_then(|e| {
-                if e.fetched_at.elapsed() < MEM_CACHE_TTL && bounds_covered(e.bounds, fetch_bounds)
+                if e.fetched_at.elapsed() < VIEWPORT_DATA_TTL
+                    && bounds_covered(e.bounds, fetch_bounds)
                 {
                     Some(e.layer.points.clone())
                 } else {
@@ -369,14 +532,15 @@ impl EumetnetProvider {
             return pts;
         }
 
-        let disk_hit = Self::load_disk_cache::<DiskCacheEntry>(cache_path, MEM_CACHE_TTL.as_secs())
-            .and_then(|e| {
-                if bounds_covered(e.bounds, fetch_bounds) {
-                    Some(e.layer.points)
-                } else {
-                    None
-                }
-            });
+        let disk_hit =
+            Self::load_disk_cache::<DiskCacheEntry>(cache_path, VIEWPORT_DATA_TTL.as_secs())
+                .and_then(|e| {
+                    if bounds_covered(e.bounds, fetch_bounds) {
+                        Some(e.layer.points)
+                    } else {
+                        None
+                    }
+                });
         if let Some(pts) = disk_hit {
             write_log(
                 log,
@@ -398,16 +562,16 @@ impl EumetnetProvider {
         }
 
         let polygon = bounds_polygon(fetch_bounds);
-        let pts = Self::fetch_area_points(
-            &self.client,
-            endpoint,
-            collection_id,
-            &polygon,
-            names,
-            Arc::clone(&self.rate_limited_until),
-            log,
-        )
-        .await;
+        let pts = self
+            .fetch_area_points(
+                endpoint,
+                collection_id,
+                &polygon,
+                names,
+                Arc::clone(&self.rate_limited_until),
+                log,
+            )
+            .await;
 
         if !pts.is_empty() {
             let layer = ObservationLayer {
@@ -511,6 +675,24 @@ impl EumetnetProvider {
             return;
         }
 
+        // Spend at most half the remaining hourly allowance on this batch.
+        //
+        // These are the context boxes, not the viewport; leaving headroom means
+        // a pan or zoom immediately afterwards can still refresh the stations
+        // the user is looking at rather than finding the budget already gone.
+        // `stale` is centre-sorted, so truncating drops the farthest first.
+        let allowance = (self.budget_remaining().await / 2).max(1) as usize;
+        if stale.len() > allowance {
+            write_log(
+                log,
+                format!(
+                    "eumetnet: {label} — {} stale, budget allows {allowance} this pass",
+                    stale.len()
+                ),
+            );
+            stale.truncate(allowance);
+        }
+
         write_log(
             log,
             format!(
@@ -528,8 +710,9 @@ impl EumetnetProvider {
         );
 
         let polygons: Vec<String> = stale.iter().map(|&(lat, lon)| {
-            let (lat0, lat1) = (lat - CAPITAL_BOX_DEG, lat + CAPITAL_BOX_DEG);
-            let (lon0, lon1) = (lon - CAPITAL_BOX_DEG, lon + CAPITAL_BOX_DEG);
+            let half = REGION_CELL_DEG / 2.0;
+            let (lat0, lat1) = (lat - half, lat + half);
+            let (lon0, lon1) = (lon - half, lon + half);
             format!("POLYGON(({lon0} {lat0},{lon1} {lat0},{lon1} {lat1},{lon0} {lat1},{lon0} {lat0}))")
         }).collect();
 
@@ -541,9 +724,9 @@ impl EumetnetProvider {
             let sem = Arc::clone(&sem);
             futs.push(async move {
                 let _permit = sem.acquire().await;
-                let result =
-                    Self::fetch_area_values(&self.client, endpoint, collection_id, dt, poly, log)
-                        .await;
+                let result = self
+                    .fetch_area_values(endpoint, collection_id, dt, poly, log)
+                    .await;
                 (clat, clon, result)
             });
         }
@@ -600,6 +783,12 @@ impl EumetnetProvider {
                         .min(RATE_LIMIT_MAX_COOLDOWN);
                     rate_limit_cooldown = Some(cooldown);
                 }
+                // Our own budget ran out.  Nothing was asked of the gateway, so
+                // don't cache an empty result — that would mark the location
+                // fresh and suppress the refetch once budget returns.  Stop the
+                // pass: everything still queued would hit the same wall, and
+                // the list is centre-sorted so what we skipped is the far stuff.
+                AreaFetch::OverBudget => break,
             }
         }
 
@@ -840,7 +1029,7 @@ impl EumetnetProvider {
     /// response, name looked up in `names`).  Returns the full set; the caller
     /// caches it and density-clips for display.
     async fn fetch_area_points(
-        client: &Client,
+        &self,
         endpoint: &str,
         collection_id: &str,
         polygon: &str,
@@ -885,29 +1074,31 @@ impl EumetnetProvider {
             (now - ChronoDuration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ"),
             now.format("%Y-%m-%dT%H:%M:%SZ"),
         );
-        let stations =
-            match Self::fetch_area_values(client, endpoint, collection_id, &datetime, polygon, log)
-                .await
-            {
-                AreaFetch::Ok(stations) => stations,
-                AreaFetch::Empty => Vec::new(),
-                AreaFetch::RateLimited(reset) => {
-                    let cooldown = reset
-                        .map(Duration::from_secs)
-                        .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
-                        .min(RATE_LIMIT_MAX_COOLDOWN);
-                    write_log(
-                        log,
-                        format!(
-                            "eumetnet: rate limited (HTTP 429) — backing off {}s",
-                            cooldown.as_secs(),
-                        ),
-                    );
-                    let mut until = rate_limited_until.lock().await;
-                    *until = Some(Instant::now() + cooldown);
-                    return Vec::new();
-                }
-            };
+        let stations = match self
+            .fetch_area_values(endpoint, collection_id, &datetime, polygon, log)
+            .await
+        {
+            AreaFetch::Ok(stations) => stations,
+            AreaFetch::Empty => Vec::new(),
+            // Budget spent — keep whatever is already on screen.
+            AreaFetch::OverBudget => return Vec::new(),
+            AreaFetch::RateLimited(reset) => {
+                let cooldown = reset
+                    .map(Duration::from_secs)
+                    .unwrap_or(RATE_LIMIT_DEFAULT_COOLDOWN)
+                    .min(RATE_LIMIT_MAX_COOLDOWN);
+                write_log(
+                    log,
+                    format!(
+                        "eumetnet: rate limited (HTTP 429) — backing off {}s",
+                        cooldown.as_secs(),
+                    ),
+                );
+                let mut until = rate_limited_until.lock().await;
+                *until = Some(Instant::now() + cooldown);
+                return Vec::new();
+            }
+        };
 
         stations
             .into_iter()
@@ -927,20 +1118,25 @@ impl EumetnetProvider {
     /// Fetch observation values for every station inside `polygon` in a single
     /// EDR `area` query.
     async fn fetch_area_values(
-        client: &Client,
+        &self,
         endpoint: &str,
         collection_id: &str,
         datetime: &str,
         polygon: &str,
         log: &Path,
     ) -> AreaFetch {
+        // Check the budget before the request, not after a 429: the point is
+        // to stay under the quota rather than to discover it the hard way.
+        if !self.try_spend().await {
+            return AreaFetch::OverBudget;
+        }
         let url = format!("{endpoint}/collections/{collection_id}/area");
         // A continent-wide surface `area` response can be tens of MB and take the
         // gateway ~40s to assemble, so allow generous headroom while still staying
         // under the 120s global client timeout.
         let fetch = async {
-            let r = client
-                .get(&url)
+            let r = self
+                .authed(self.client.get(&url))
                 .query(&[("coords", polygon), ("datetime", datetime)])
                 .send()
                 .await
@@ -1138,6 +1334,150 @@ fn normalize_station_name(name: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── zoom tiering ─────────────────────────────────────────────────
+
+    /// Below the shared cutoff, only the regional backdrop should run —
+    /// this is the state the viewport gate already covered.
+    #[test]
+    fn backdrop_fetches_below_the_cutoff() {
+        assert!(should_fetch_backdrop(OBS_TIER_ZOOM_CUTOFF - 0.1));
+    }
+
+    /// At/above the shared cutoff the viewport query alone covers what's
+    /// visible; the regional backdrop must not also fire, or a refresh pays
+    /// for ~16 continental cells whose stations are entirely off-screen —
+    /// the budget leak this checkpoint closes.
+    #[test]
+    fn backdrop_does_not_fetch_at_or_above_the_cutoff() {
+        assert!(!should_fetch_backdrop(OBS_TIER_ZOOM_CUTOFF));
+        assert!(!should_fetch_backdrop(OBS_TIER_ZOOM_CUTOFF + 1.0));
+    }
+
+    // ── region clustering ──────────────────────────────────────────────
+
+    /// The regression that made observations appear at random: 113 city boxes
+    /// against a 50/hour quota could never all be fetched.  Clustering must
+    /// bring a full refresh inside the anonymous budget.
+    #[test]
+    fn clustering_brings_a_full_refresh_within_the_anonymous_budget() {
+        let cities: Vec<(f64, f64)> = EUROPEAN_CAPITALS
+            .iter()
+            .chain(EUROPEAN_MAJOR_CITIES.iter())
+            .copied()
+            .collect();
+        let cells = region_cells(&cities, REGION_CELL_DEG);
+        assert!(
+            cells.len() < cities.len() / 4,
+            "expected a big reduction, got {} cells from {} cities",
+            cells.len(),
+            cities.len()
+        );
+        let budget = (f64::from(crate::config::ANON_HOURLY_QUOTA) * BUDGET_UTILISATION) as usize;
+        assert!(
+            cells.len() < budget,
+            "{} cells must fit the {budget}/h anonymous budget",
+            cells.len()
+        );
+    }
+
+    #[test]
+    fn region_cells_deduplicates_nearby_points() {
+        // Three points inside one 12° cell collapse to a single query.
+        let pts = [(46.05, 14.51), (46.5, 15.0), (45.8, 14.0)];
+        assert_eq!(region_cells(&pts, 12.0).len(), 1);
+    }
+
+    #[test]
+    fn region_cells_keeps_distant_points_apart() {
+        // Lisbon and Helsinki cannot share a cell.
+        let pts = [(38.72, -9.14), (60.17, 24.94)];
+        assert_eq!(region_cells(&pts, 12.0).len(), 2);
+    }
+
+    /// Every city must still fall inside the cell that represents it, or the
+    /// bbox query would miss the stations it exists to cover.
+    #[test]
+    fn every_city_is_covered_by_its_cell_bbox() {
+        let cities: Vec<(f64, f64)> = EUROPEAN_CAPITALS
+            .iter()
+            .chain(EUROPEAN_MAJOR_CITIES.iter())
+            .copied()
+            .collect();
+        let cells = region_cells(&cities, REGION_CELL_DEG);
+        let half = REGION_CELL_DEG / 2.0;
+        for &(lat, lon) in &cities {
+            assert!(
+                cells.iter().any(|&(cla, clo)| {
+                    (lat - cla).abs() <= half + 1e-9 && (lon - clo).abs() <= half + 1e-9
+                }),
+                "city {lat},{lon} is not covered by any cell"
+            );
+        }
+    }
+
+    // ── RequestBudget ──────────────────────────────────────────────────
+
+    #[test]
+    fn budget_allows_exactly_the_limit_then_refuses() {
+        let mut b = RequestBudget::default();
+        for _ in 0..5 {
+            assert!(b.try_spend(5, BUDGET_WINDOW));
+        }
+        assert!(!b.try_spend(5, BUDGET_WINDOW));
+        assert_eq!(b.remaining(5, BUDGET_WINDOW), 0);
+    }
+
+    /// A refused request must not consume budget — otherwise a caller that
+    /// polls while exhausted would keep the window permanently full.
+    #[test]
+    fn refused_requests_do_not_consume_budget() {
+        let mut b = RequestBudget::default();
+        assert!(b.try_spend(1, BUDGET_WINDOW));
+        for _ in 0..10 {
+            assert!(!b.try_spend(1, BUDGET_WINDOW));
+        }
+        assert_eq!(b.spent.len(), 1);
+    }
+
+    /// Spends older than the window age out, so the budget recovers rather
+    /// than staying exhausted for the life of the process.
+    #[test]
+    fn budget_recovers_once_spends_age_out_of_the_window() {
+        let mut b = RequestBudget::default();
+        let window = Duration::from_millis(40);
+        assert!(b.try_spend(1, window));
+        assert!(!b.try_spend(1, window));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(b.remaining(1, window), 1);
+        assert!(b.try_spend(1, window));
+    }
+
+    /// The whole point of the budget: an anonymous caller must be held below
+    /// the gateway's published 50/hour, and a key must lift it.
+    #[test]
+    fn budget_limit_tracks_whether_an_api_key_is_configured() {
+        let anon = EumetnetConfig::default();
+        assert_eq!(anon.hourly_quota(), crate::config::ANON_HOURLY_QUOTA);
+
+        let keyed = EumetnetConfig {
+            api_key: "abc123".to_string(),
+            ..EumetnetConfig::default()
+        };
+        assert_eq!(keyed.hourly_quota(), crate::config::AUTH_HOURLY_QUOTA);
+        assert!(keyed.hourly_quota() > anon.hourly_quota());
+    }
+
+    /// Whitespace is not a key.  A config with a stray space must still be
+    /// budgeted as anonymous rather than silently assuming the larger quota.
+    #[test]
+    fn blank_api_key_is_treated_as_anonymous() {
+        let cfg = EumetnetConfig {
+            api_key: "   ".to_string(),
+            ..EumetnetConfig::default()
+        };
+        assert_eq!(cfg.hourly_quota(), crate::config::ANON_HOURLY_QUOTA);
+    }
 
     // ── normalize_station_name ─────────────────────────────────────────
 

@@ -30,7 +30,7 @@ use crate::app::{
 use crate::cache::write_log;
 use crate::geo::{
     lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, CITY_MATCH_KM,
-    EUROPEAN_CAPITALS, EUROPEAN_CAPITAL_NAMES, EUROPEAN_MAJOR_CITIES,
+    EUROPEAN_CAPITALS, EUROPEAN_CAPITAL_NAMES, EUROPEAN_MAJOR_CITIES, OBS_TIER_ZOOM_CUTOFF,
 };
 use crate::keys::{self, Action, Category};
 use crate::layers::{
@@ -52,11 +52,6 @@ const ZOOM_RADAR_DEBOUNCE_MS: u64 = 80;
 // capitals are shown.  As the user zooms in, major-city stations are
 // added, and once a single country dominates the viewport all cached
 // stations are shown.
-
-/// Below this zoom only capital-adjacent stations are shown.
-/// Must match `eumetnet.rs` CAPITALS_ZOOM_CUTOFF so the fetch tier
-/// aligns with the display tier.
-const MAJOR_CITIES_ZOOM_CUTOFF: f64 = 5.0;
 
 /// Horizontal+vertical cell radius for non-capital stations.
 /// Wider at low zoom to prevent "wall of values" patterns.
@@ -96,7 +91,7 @@ enum ObsMode {
 fn obs_display_mode(zoom: f64) -> ObsMode {
     if zoom >= ALL_OBS_ZOOM_CUTOFF {
         ObsMode::All
-    } else if zoom >= MAJOR_CITIES_ZOOM_CUTOFF {
+    } else if zoom >= OBS_TIER_ZOOM_CUTOFF {
         ObsMode::MajorCities
     } else {
         ObsMode::Capitals
@@ -380,10 +375,15 @@ async fn run_loop(
             | app.drain_warning_results()
             | app.drain_lightning_results()
             | app.drain_location_updates()
-            | app.drain_search_results();
+            | app.drain_search_results()
+            | app.drain_pin_labels();
         if drained {
             dirty = true;
         }
+        // Re-request radar slots whose backoff has expired, so a frame that
+        // failed to load recovers on its own instead of waiting for the user
+        // to pan or zoom.
+        app.retry_due_frames();
         if app.pending_warning_refresh {
             app.pending_warning_refresh = false;
             app.warn_last_attempt = None; // force an immediate fetch
@@ -1735,6 +1735,7 @@ fn raster_map_rows(
             modes,
             LayerId::Location,
             Rgb8::RED,
+            app.location_label(),
         );
     }
 
@@ -1748,6 +1749,7 @@ fn raster_map_rows(
             modes,
             LayerId::SearchPin,
             Rgb8::BLUE,
+            app.search_label(),
         );
     }
 }
@@ -1777,6 +1779,7 @@ fn raster_pin(
     modes: &RenderModeState,
     layer: LayerId,
     color: Rgb8,
+    label: Option<&str>,
 ) {
     let text = modes.has(RenderMode::Text, layer);
     let background = modes.has(RenderMode::Color, layer);
@@ -1814,6 +1817,102 @@ fn raster_pin(
         let idx = usize::from(gy) * usize::from(width) + usize::from(gx);
         if let Some(cell) = cells.get_mut(idx) {
             cell.glyph = Some('x');
+            cell.color = Some(color);
+        }
+
+        // Name the place the pin marks.  If that name is already on the map —
+        // standing in Ljubljana, whose capital label is right there — recolour
+        // the existing text instead of writing a second copy beside it.
+        if let Some(name) = label.map(str::trim).filter(|s| !s.is_empty()) {
+            if !recolor_existing_label(cells, width, height, name, color) {
+                write_pin_label(cells, width, height, gx, gy, name, color);
+            }
+        }
+    }
+}
+
+/// Recolour an existing on-screen copy of `name`, if there is one.
+///
+/// Returns `true` when a match was found and recoloured, meaning the caller
+/// should not draw its own label.
+///
+/// The whole grid is searched, not a window around the pin.  The two labels
+/// are anchored to different things — the pin sits at your measured position,
+/// the capital label at the city's own hardcoded centre — so they can be many
+/// cells apart and still name the same place; a fix on the edge of Ljubljana
+/// put them five rows apart and printed "Ljubljana" twice.  A same-named place
+/// elsewhere on screen is possible in principle but far rarer than that.
+fn recolor_existing_label(
+    cells: &mut [RasterCell],
+    width: u16,
+    height: u16,
+    name: &str,
+    color: Rgb8,
+) -> bool {
+    let w = usize::from(width);
+    let target: Vec<char> = name.chars().collect();
+    if target.is_empty() || target.len() > w {
+        return false;
+    }
+
+    for row in 0..height {
+        let base = usize::from(row) * w;
+        // Compare case-insensitively: station and capital labels do not agree
+        // on casing, and "LJUBLJANA" is still the place the pin is marking.
+        for start in 0..=(w - target.len()) {
+            let matches = target.iter().enumerate().all(|(i, want)| {
+                cells.get(base + start + i).is_some_and(|c| {
+                    c.glyph
+                        .is_some_and(|g| g.eq_ignore_ascii_case(want) || g == *want)
+                })
+            });
+            if matches {
+                for i in 0..target.len() {
+                    if let Some(cell) = cells.get_mut(base + start + i) {
+                        cell.color = Some(color);
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Write the pin's label one row below the marker, if there is room.
+///
+/// The label is skipped rather than overwritten onto occupied cells: a partly
+/// clobbered city name or temperature reading is worse than an unlabelled pin,
+/// which still shows position via the `x` itself.
+fn write_pin_label(
+    cells: &mut [RasterCell],
+    width: u16,
+    height: u16,
+    x: u16,
+    y: u16,
+    name: &str,
+    color: Rgb8,
+) {
+    let row = y + 1;
+    if row >= height {
+        return;
+    }
+    let w = usize::from(width);
+    let base = usize::from(row) * w;
+    // Centre the label under the marker, clamped into the viewport.
+    let len = name.chars().count();
+    let start = usize::from(x)
+        .saturating_sub(len / 2)
+        .min(w.saturating_sub(len));
+    if start + len > w {
+        return;
+    }
+    if !(start..start + len).all(|cx| cells.get(base + cx).is_some_and(|c| c.glyph.is_none())) {
+        return;
+    }
+    for (i, ch) in name.chars().enumerate() {
+        if let Some(cell) = cells.get_mut(base + start + i) {
+            cell.glyph = Some(ch);
             cell.color = Some(color);
         }
     }
@@ -3895,7 +3994,17 @@ mod tests {
 
     fn marker_grid(point: GeoPoint, modes: &RenderModeState) -> Vec<RasterCell> {
         let mut cells = vec![RasterCell::default(); 100];
-        raster_pin(&mut cells, point, WORLD_BOUNDS, 10, 10, modes, LayerId::Location, Rgb8::RED);
+        raster_pin(
+            &mut cells,
+            point,
+            WORLD_BOUNDS,
+            10,
+            10,
+            modes,
+            LayerId::Location,
+            Rgb8::RED,
+            None,
+        );
         cells
     }
 
@@ -3929,6 +4038,7 @@ mod tests {
             &location_modes(false, true),
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         assert_eq!(cells[centre].bg, Some(Rgb8::RED));
         assert_eq!(cells[centre].glyph, Some('@'), "foreground untouched");
@@ -3959,6 +4069,7 @@ mod tests {
             &location_modes(true, false),
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         assert_eq!(cells[centre].glyph, Some('L'), "existing label survives");
         let pin = cells.iter().position(|c| c.glyph == Some('x'));
@@ -3987,6 +4098,7 @@ mod tests {
             &location_modes(false, true),
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         assert_eq!(cells[centre].bg, Some(Rgb8::RED), "tint on the true cell");
         assert_eq!(cells[centre].glyph, Some('L'));
@@ -4008,6 +4120,7 @@ mod tests {
             &location_modes(true, false),
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         assert_eq!(cells[5 * 10 + 5].glyph, Some('x'), "drawn at the true cell");
     }
@@ -4052,6 +4165,7 @@ mod tests {
             &search_pin_modes(),
             LayerId::SearchPin,
             Rgb8::BLUE,
+            None,
         );
         let marked: Vec<&RasterCell> = cells.iter().filter(|c| c.glyph.is_some()).collect();
         assert_eq!(marked.len(), 1);
@@ -4077,6 +4191,7 @@ mod tests {
             &modes,
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         raster_pin(
             &mut cells,
@@ -4087,6 +4202,7 @@ mod tests {
             &modes,
             LayerId::SearchPin,
             Rgb8::BLUE,
+            None,
         );
         let drawn: Vec<Rgb8> = cells
             .iter()
@@ -4096,6 +4212,170 @@ mod tests {
         assert_eq!(drawn.len(), 2, "both pins drawn");
         assert!(drawn.contains(&Rgb8::RED), "location marker still there");
         assert!(drawn.contains(&Rgb8::BLUE), "search pin there too");
+    }
+
+    // ── pin labels ─────────────────────────────────────────────────────
+
+    /// Read a row of the raster back as a string, for label assertions.
+    fn row_text(cells: &[RasterCell], width: usize, row: usize) -> String {
+        (0..width)
+            .map(|c| cells[row * width + c].glyph.unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn pin_label_is_drawn_below_the_marker() {
+        let mut modes = RenderModeState::new();
+        modes.set_overlay(RenderMode::Text, LayerId::Location);
+        let mut cells = vec![RasterCell::default(); 400];
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            20,
+            20,
+            &modes,
+            LayerId::Location,
+            Rgb8::RED,
+            Some("Kranj"),
+        );
+        let marker_row = cells.iter().position(|c| c.glyph == Some('x')).unwrap() / 20;
+        assert!(
+            row_text(&cells, 20, marker_row + 1).contains("Kranj"),
+            "label sits on the row under the marker"
+        );
+    }
+
+    /// The whole point of the recolour path: standing in a city whose name is
+    /// already on the map must tint that name, not print a second copy.
+    #[test]
+    fn pin_label_recolors_an_existing_name_instead_of_duplicating_it() {
+        let mut modes = RenderModeState::new();
+        modes.set_overlay(RenderMode::Text, LayerId::Location);
+        let width = 20usize;
+        let mut cells = vec![RasterCell::default(); width * 20];
+
+        // Pre-draw "Ljubljana" where the capital label would already be.
+        let (lrow, lcol) = (11usize, 8usize);
+        for (i, ch) in "Ljubljana".chars().enumerate() {
+            cells[lrow * width + lcol + i].glyph = Some(ch);
+            cells[lrow * width + lcol + i].color = Some(Rgb8::new(105, 105, 105));
+        }
+
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            width as u16,
+            20,
+            &modes,
+            LayerId::Location,
+            Rgb8::RED,
+            Some("Ljubljana"),
+        );
+
+        let occurrences = (0..20)
+            .filter(|&r| row_text(&cells, width, r).contains("Ljubljana"))
+            .count();
+        assert_eq!(occurrences, 1, "name is not duplicated");
+        assert_eq!(
+            cells[lrow * width + lcol].color,
+            Some(Rgb8::RED),
+            "the existing name is recoloured to the pin colour"
+        );
+    }
+
+    /// Casing differs between capital labels and station names; a pin in
+    /// "LJUBLJANA" is still marking Ljubljana.
+    #[test]
+    fn pin_label_match_ignores_case() {
+        let width = 20usize;
+        let mut cells = vec![RasterCell::default(); width * 20];
+        for (i, ch) in "LJUBLJANA".chars().enumerate() {
+            cells[10 * width + 5 + i].glyph = Some(ch);
+        }
+        assert!(recolor_existing_label(
+            &mut cells,
+            width as u16,
+            20,
+            "Ljubljana",
+            Rgb8::RED
+        ));
+        assert_eq!(cells[10 * width + 5].color, Some(Rgb8::RED));
+    }
+
+    /// The pin and the capital label are anchored to different points — your
+    /// measured position vs the city's hardcoded centre — so a match many
+    /// cells away is still the same place and must not be printed twice.
+    /// This is the case that shipped broken: five rows apart, drawn twice.
+    #[test]
+    fn pin_label_recolors_a_match_far_from_the_pin() {
+        let width = 40usize;
+        let mut cells = vec![RasterCell::default(); width * 20];
+        for (i, ch) in "Ljubljana".chars().enumerate() {
+            cells[15 * width + 30 + i].glyph = Some(ch);
+        }
+        assert!(recolor_existing_label(
+            &mut cells,
+            width as u16,
+            20,
+            "Ljubljana",
+            Rgb8::RED
+        ));
+        assert_eq!(cells[15 * width + 30].color, Some(Rgb8::RED));
+    }
+
+    /// A different name is never touched, however close it sits.
+    #[test]
+    fn pin_label_does_not_recolor_a_different_name() {
+        let width = 40usize;
+        let mut cells = vec![RasterCell::default(); width * 20];
+        for (i, ch) in "Kranj".chars().enumerate() {
+            cells[2 * width + 3 + i].glyph = Some(ch);
+        }
+        assert!(!recolor_existing_label(
+            &mut cells,
+            width as u16,
+            20,
+            "Ljubljana",
+            Rgb8::RED
+        ));
+        assert_eq!(cells[2 * width + 3].color, None);
+    }
+
+    /// An unlabelled pin must still render — the marker is the important part.
+    #[test]
+    fn pin_without_a_label_still_draws_its_marker() {
+        let mut modes = RenderModeState::new();
+        modes.set_overlay(RenderMode::Text, LayerId::Location);
+        let mut cells = vec![RasterCell::default(); 100];
+        raster_pin(
+            &mut cells,
+            GeoPoint::new(0.0, 0.0),
+            WORLD_BOUNDS,
+            10,
+            10,
+            &modes,
+            LayerId::Location,
+            Rgb8::RED,
+            None,
+        );
+        assert_eq!(cells.iter().filter(|c| c.glyph == Some('x')).count(), 1);
+    }
+
+    /// The label must never partially clobber a reading already on that row.
+    #[test]
+    fn pin_label_is_skipped_when_the_row_below_is_occupied() {
+        let width = 20usize;
+        let mut cells = vec![RasterCell::default(); width * 20];
+        for c in cells.iter_mut().skip(11 * width).take(width) {
+            c.glyph = Some('7');
+        }
+        write_pin_label(&mut cells, width as u16, 20, 10, 10, "Kranj", Rgb8::RED);
+        assert!(
+            !row_text(&cells, width, 11).contains("Kranj"),
+            "label yields to existing text"
+        );
     }
 
     /// When both pins land on the same cell the nudge keeps them both
@@ -4108,10 +4388,26 @@ mod tests {
         let mut cells = vec![RasterCell::default(); 100];
         let same = GeoPoint::new(0.0, 0.0);
         raster_pin(
-            &mut cells, same, WORLD_BOUNDS, 10, 10, &modes, LayerId::Location, Rgb8::RED,
+            &mut cells,
+            same,
+            WORLD_BOUNDS,
+            10,
+            10,
+            &modes,
+            LayerId::Location,
+            Rgb8::RED,
+            None,
         );
         raster_pin(
-            &mut cells, same, WORLD_BOUNDS, 10, 10, &modes, LayerId::SearchPin, Rgb8::BLUE,
+            &mut cells,
+            same,
+            WORLD_BOUNDS,
+            10,
+            10,
+            &modes,
+            LayerId::SearchPin,
+            Rgb8::BLUE,
+            None,
         );
         let drawn: Vec<Rgb8> = cells
             .iter()
@@ -4136,6 +4432,7 @@ mod tests {
             &search_pin_modes(),
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         assert!(cells.iter().all(|c| c.glyph.is_none()));
     }
@@ -4167,6 +4464,7 @@ mod tests {
             &location_modes(true, true),
             LayerId::Location,
             Rgb8::RED,
+            None,
         );
         assert!(cells.iter().all(|c| c.glyph.is_none() && c.bg.is_none()));
     }

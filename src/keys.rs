@@ -291,11 +291,8 @@ pub static BINDINGS: &[Binding] = &[
         name: "Select layer",
         category: Category::Layers,
         description: "move up / down the panel",
-        chords: &[
-            Chord::shift(KeyCode::Up),
-            Chord::alt(KeyCode::Up),
-        ],
-        help_keys: Some("shift+↑↓"),
+        chords: &[Chord::alt(KeyCode::Up)],
+        help_keys: Some("alt+↑↓"),
         footer: None,
     },
     Binding {
@@ -303,10 +300,7 @@ pub static BINDINGS: &[Binding] = &[
         name: "Select next layer",
         category: Category::Layers,
         description: "move down the panel",
-        chords: &[
-            Chord::shift(KeyCode::Down),
-            Chord::alt(KeyCode::Down),
-        ],
+        chords: &[Chord::alt(KeyCode::Down)],
         help_keys: None,
         footer: None,
     },
@@ -496,9 +490,20 @@ mod tests {
             resolve(press(KeyCode::Up, KeyModifiers::NONE)),
             Some(Action::PanUp)
         );
+        // Alt is the only layer-selection modifier; Shift+arrow was a second,
+        // partial binding for the same thing and only muddied the model.
+        assert_eq!(
+            resolve(press(KeyCode::Up, KeyModifiers::ALT)),
+            Some(Action::SelectPrevious)
+        );
+        assert_eq!(
+            resolve(press(KeyCode::Down, KeyModifiers::ALT)),
+            Some(Action::SelectNext)
+        );
         assert_eq!(
             resolve(press(KeyCode::Up, KeyModifiers::SHIFT)),
-            Some(Action::SelectPrevious)
+            None,
+            "shift+arrow no longer selects layers"
         );
         // A layout that reports '+' as Shift+'+' still zooms in.
         assert_eq!(
