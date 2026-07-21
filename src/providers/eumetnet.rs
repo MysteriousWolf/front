@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -34,6 +35,23 @@ struct DiskCacheEntry {
 struct StationListEntry {
     bounds: Option<Bounds>,
     stations: Vec<StationInfo>,
+}
+
+/// One regional backdrop cell persisted to disk: the `(lat, lon)` bit pattern
+/// the in-memory cache keys on, the wall-clock second it was fetched, and every
+/// station that cell's `area` query returned.
+///
+/// The in-memory cache times each cell with an `Instant` (monotonic, and so
+/// unserialisable). Persistence folds that into a wall-clock `fetched_unix` on
+/// save and back into an age on load, so a relaunch recovers each cell's real
+/// age instead of resetting the clock and re-paying the whole backdrop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackdropCacheEntry {
+    lat_bits: u64,
+    lon_bits: u64,
+    fetched_unix: u64,
+    #[serde(default)]
+    points: Vec<ObservationPoint>,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +284,73 @@ fn region_cells(points: &[(f64, f64)], cell_deg: f64) -> Vec<(f64, f64)> {
 /// are actually looking at refresh on [`VIEWPORT_DATA_TTL`] instead.
 const CAPITAL_DATA_TTL: Duration = Duration::from_secs(6 * 3600);
 
+/// How long a regional backdrop cell is retained on disk.
+///
+/// Deliberately longer than [`CAPITAL_DATA_TTL`] — that constant is the
+/// *freshness* window deciding when a cell is refetched for display; this is the
+/// *retention* window deciding how long the cell survives on disk. Persisting
+/// the backdrop stops every launch re-paying it against the 50/hour quota, and
+/// keeping a full day of cells is the ground the observation-history playback
+/// layer will read from. Cells older than this are dropped on both save and
+/// load.
+const BACKDROP_HISTORY_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Current wall-clock time in whole seconds since the Unix epoch, or 0 if the
+/// clock is set before the epoch.
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Convert live in-memory backdrop cells to their on-disk form, dropping any
+/// older than `max_age`.
+///
+/// `cells` yields `(lat_bits, lon_bits, age, points)`, where `age` is how long
+/// ago the cell was fetched (`Instant::elapsed`). Each age is folded into a
+/// wall-clock `fetched_unix` against `now_unix` so it survives a restart.
+fn backdrop_to_disk(
+    cells: impl Iterator<Item = (u64, u64, Duration, Vec<ObservationPoint>)>,
+    now_unix: u64,
+    max_age: Duration,
+) -> Vec<BackdropCacheEntry> {
+    cells
+        .filter(|(_, _, age, _)| *age < max_age)
+        .map(|(lat_bits, lon_bits, age, points)| BackdropCacheEntry {
+            lat_bits,
+            lon_bits,
+            fetched_unix: now_unix.saturating_sub(age.as_secs()),
+            points,
+        })
+        .collect()
+}
+
+/// Rebuild in-memory backdrop cells from their on-disk form, dropping any older
+/// than `max_age`.
+///
+/// Returns `(key, age, points)`; the caller turns `age` back into the `Instant`
+/// the live cache times against. A `fetched_unix` in the future relative to
+/// `now_unix` (clock moved backwards) yields a zero age via `saturating_sub` —
+/// the cell is treated as just-fetched rather than dropped.
+fn backdrop_from_disk(
+    entries: Vec<BackdropCacheEntry>,
+    now_unix: u64,
+    max_age: Duration,
+) -> Vec<((u64, u64), Duration, Vec<ObservationPoint>)> {
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let age = Duration::from_secs(now_unix.saturating_sub(e.fetched_unix));
+            if age >= max_age {
+                None
+            } else {
+                Some(((e.lat_bits, e.lon_bits), age, e.points))
+            }
+        })
+        .collect()
+}
+
 /// Max concurrent per-location HTTP requests.
 ///
 /// The gateway allows a burst of 20 for anonymous callers; 32 in flight at
@@ -363,6 +448,9 @@ pub struct EumetnetProvider {
     /// Per-location observation cache.  Key: (lat.to_bits(), lon.to_bits()).
     /// Value: points from that location's bbox query + the fetch instant.
     location_cache: ObsCache,
+    /// Set once the persisted backdrop has been loaded into `location_cache`,
+    /// so the disk read happens at most once per process.
+    backdrop_loaded: Arc<AtomicBool>,
     /// Rolling-hour spend against the gateway quota, shared by every request
     /// this provider makes so the phases cannot each blow the budget alone.
     budget: Arc<tokio::sync::Mutex<RequestBudget>>,
@@ -390,6 +478,7 @@ impl EumetnetProvider {
             mem_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             rate_limited_until: Arc::new(tokio::sync::Mutex::new(None)),
             location_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            backdrop_loaded: Arc::new(AtomicBool::new(false)),
             budget: Arc::new(tokio::sync::Mutex::new(RequestBudget::default())),
         }
     }
@@ -453,9 +542,11 @@ impl EumetnetProvider {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let cache_path = self.dirs.cache_dir.join("eumetnet/surface-v2.json");
         let stations_path = self.dirs.cache_dir.join("eumetnet/surface-stations.json");
+        let backdrop_path = self.dirs.cache_dir.join("eumetnet/surface-backdrop.json");
         self.fetch_observations(
             &cache_path,
             &stations_path,
+            &backdrop_path,
             &self.config.surface_endpoint,
             "observations",
             zoom,
@@ -475,6 +566,7 @@ impl EumetnetProvider {
         &self,
         cache_path: &Path,
         stations_cache_path: &Path,
+        backdrop_cache_path: &Path,
         endpoint: &str,
         collection_id: &str,
         zoom: f64,
@@ -484,6 +576,11 @@ impl EumetnetProvider {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let log = &self.dirs.log_path;
         let t_total = Instant::now();
+
+        // Warm the backdrop from disk before any batch runs so a relaunch shows
+        // yesterday's regional cells immediately and only refetches the stale
+        // ones, rather than re-paying the whole backdrop against the quota.
+        self.load_backdrop(backdrop_cache_path).await;
 
         // Try station names from the 24 h disk cache first so we don't block
         // the entire pipeline on a network call.  On a cold cache the names
@@ -600,6 +697,10 @@ impl EumetnetProvider {
                 &mut seen_wigos,
             )
             .await;
+
+            // Persist the refreshed backdrop (pruned to the 24 h retention
+            // window) so the next launch reuses it instead of re-paying it.
+            self.save_backdrop(backdrop_cache_path).await;
         }
 
         // Let the background station list fetch complete so it writes to
@@ -1060,6 +1161,55 @@ impl EumetnetProvider {
         serde_json::from_slice(&bytes).ok()
     }
 
+    /// Load the persisted regional backdrop into `location_cache` once per
+    /// process, dropping cells older than [`BACKDROP_HISTORY_TTL`]. A no-op on
+    /// later calls, when the file is absent, or when it fails to parse.
+    ///
+    /// Cells already present in memory win (`or_insert`): a fetch that beat the
+    /// load must not be clobbered by a staler disk copy.
+    async fn load_backdrop(&self, path: &Path) {
+        if self.backdrop_loaded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(Some(bytes)) = read_if_exists(path) else {
+            return;
+        };
+        let Ok(entries) = serde_json::from_slice::<Vec<BackdropCacheEntry>>(&bytes) else {
+            return;
+        };
+        let restored = backdrop_from_disk(entries, now_unix_secs(), BACKDROP_HISTORY_TTL);
+        if restored.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut cache = self.location_cache.lock().await;
+        for (key, age, points) in restored {
+            let fetched = now.checked_sub(age).unwrap_or(now);
+            cache.entry(key).or_insert((points, fetched));
+        }
+    }
+
+    /// Persist the regional backdrop cache to disk, pruned to
+    /// [`BACKDROP_HISTORY_TTL`]. Called after each backdrop refresh so the newest
+    /// cells — and everything still inside the retention window — survive a
+    /// restart instead of being re-paid against the hourly quota.
+    async fn save_backdrop(&self, path: &Path) {
+        let now_unix = now_unix_secs();
+        let entries = {
+            let cache = self.location_cache.lock().await;
+            backdrop_to_disk(
+                cache.iter().map(|(&(lat_bits, lon_bits), (points, fetched))| {
+                    (lat_bits, lon_bits, fetched.elapsed(), points.clone())
+                }),
+                now_unix,
+                BACKDROP_HISTORY_TTL,
+            )
+        };
+        if let Ok(json) = serde_json::to_vec(&entries) {
+            let _ = write_atomic(path, &json);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Locations parser
     // ------------------------------------------------------------------
@@ -1472,6 +1622,96 @@ mod tests {
     fn backdrop_does_not_fetch_at_or_above_the_cutoff() {
         assert!(!should_fetch_backdrop(OBS_TIER_ZOOM_CUTOFF));
         assert!(!should_fetch_backdrop(OBS_TIER_ZOOM_CUTOFF + 1.0));
+    }
+
+    // ── backdrop disk persistence ───────────────────────────────────────
+
+    fn obs_point(wigos_id: &str) -> ObservationPoint {
+        ObservationPoint {
+            point: GeoPoint::new(14.5, 46.0),
+            world: lat_lon_to_world(46.0, 14.5),
+            station_id: wigos_id.to_string(),
+            wigos_id: wigos_id.to_string(),
+            temperature: Some(21.0),
+            wind_speed: None,
+            wind_direction: None,
+            humidity: None,
+            pressure: None,
+        }
+    }
+
+    /// A cell serialised then deserialised must recover its key, its points,
+    /// and — crucially — its *age*, not reset to fresh. The wall-clock fold is
+    /// the only thing that lets a restart know a cell is 1 h old rather than
+    /// brand new, which is what keeps the freshness TTL meaningful across runs.
+    #[test]
+    fn backdrop_round_trip_preserves_key_points_and_age() {
+        let now = 100_000u64;
+        let cells = vec![(1u64, 2u64, Duration::from_secs(3600), vec![obs_point("0-1")])];
+        let disk = backdrop_to_disk(cells.into_iter(), now, BACKDROP_HISTORY_TTL);
+        assert_eq!(disk.len(), 1);
+        assert_eq!(disk[0].fetched_unix, now - 3600);
+
+        let back = backdrop_from_disk(disk, now, BACKDROP_HISTORY_TTL);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, (1, 2));
+        assert_eq!(back[0].1, Duration::from_secs(3600));
+        assert_eq!(back[0].2.len(), 1);
+        assert_eq!(back[0].2[0].wigos_id, "0-1");
+    }
+
+    /// Save-side pruning: a cell already older than the retention window is
+    /// never written, so the on-disk file cannot grow without bound.
+    #[test]
+    fn backdrop_to_disk_drops_cells_older_than_the_retention_window() {
+        let cells = vec![
+            (1u64, 1u64, BACKDROP_HISTORY_TTL + Duration::from_secs(1), vec![]),
+            (2u64, 2u64, Duration::from_secs(3600), vec![]),
+        ];
+        let disk = backdrop_to_disk(cells.into_iter(), 100_000, BACKDROP_HISTORY_TTL);
+        assert_eq!(disk.len(), 1);
+        assert_eq!((disk[0].lat_bits, disk[0].lon_bits), (2, 2));
+    }
+
+    /// Load-side pruning: a file that outlived the retention window (app was
+    /// closed for over a day) drops the expired cells on load rather than
+    /// resurrecting day-old readings as if current.
+    #[test]
+    fn backdrop_from_disk_drops_entries_older_than_the_retention_window() {
+        let now = 200_000u64;
+        let entries = vec![
+            BackdropCacheEntry {
+                lat_bits: 1,
+                lon_bits: 1,
+                fetched_unix: now - (BACKDROP_HISTORY_TTL.as_secs() + 1),
+                points: vec![],
+            },
+            BackdropCacheEntry {
+                lat_bits: 2,
+                lon_bits: 2,
+                fetched_unix: now - 3600,
+                points: vec![],
+            },
+        ];
+        let back = backdrop_from_disk(entries, now, BACKDROP_HISTORY_TTL);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, (2, 2));
+    }
+
+    /// A `fetched_unix` ahead of `now` (system clock moved backwards between
+    /// runs) must not underflow into a huge age that silently drops the cell —
+    /// it is clamped to zero age and kept.
+    #[test]
+    fn backdrop_from_disk_clamps_future_timestamps_to_zero_age() {
+        let entries = vec![BackdropCacheEntry {
+            lat_bits: 1,
+            lon_bits: 1,
+            fetched_unix: 5_000,
+            points: vec![],
+        }];
+        let back = backdrop_from_disk(entries, 1_000, BACKDROP_HISTORY_TTL);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].1, Duration::from_secs(0));
     }
 
     // ── WIGOS dedup identity ────────────────────────────────────────────
