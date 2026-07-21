@@ -15,6 +15,7 @@ use crate::cache::{read_if_exists, write_atomic, write_log, FrontDirs};
 use crate::config::MeteoGateConfig;
 use crate::geo::{world_to_lat_lon, Bounds, TileCoord, WorldPoint};
 use crate::layers::{RadarFrame, RadarRun, RadarTile, Rgb8};
+use crate::retry::RetryPolicy;
 
 /// Cadence of the OPERA composite: one published slot every 5 minutes.
 pub const SLOT_SECS: i64 = 300;
@@ -606,8 +607,19 @@ impl MeteoGateProvider {
     /// rather than surfacing as a hole in the timeline.  A `404` is final and
     /// returns immediately: no amount of retrying publishes a frame.
     async fn download_geotiff(&self, timestamp: i64) -> Result<Vec<u8>> {
+        const POLICY: RetryPolicy = RetryPolicy::new(
+            DOWNLOAD_RETRY_BASE,
+            MAX_RETRY_AFTER,
+            Some(DOWNLOAD_ATTEMPTS),
+        );
         let log = &self.dirs.log_path;
         let url = self.s3_url(timestamp);
+        // `delay` is the next sleep duration, seeded at the policy base and
+        // advanced by `POLICY.double` after each sleep. A server `Retry-After`
+        // redirects it: the override is used for its own sleep *and* becomes
+        // the new baseline the doubling continues from — matching the original
+        // mutating-`delay` loop rather than snapping back to the pure
+        // attempt-indexed sequence. See docs/spec/task-system-unification.md.
         let mut delay = DOWNLOAD_RETRY_BASE;
         let mut last: Option<String> = None;
 
@@ -650,7 +662,7 @@ impl MeteoGateProvider {
                     ),
                 );
                 tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(MAX_RETRY_AFTER);
+                delay = POLICY.double(delay);
             }
         }
         color_eyre::eyre::bail!(
@@ -1776,6 +1788,50 @@ mod tests {
     fn retry_after_is_capped() {
         let huge = Duration::from_secs(86_400);
         assert_eq!(huge.min(MAX_RETRY_AFTER), MAX_RETRY_AFTER);
+    }
+
+    /// `download_geotiff`'s sleeps have no seam to drive without real network
+    /// I/O, so these mirror the loop's exact `delay` recurrence — seed at
+    /// `DOWNLOAD_RETRY_BASE`, advance via `POLICY.double` — and assert it
+    /// against today's sequence. The loop is the source of truth; if it
+    /// changes, these must be updated to match.
+    #[test]
+    fn download_retry_sequence_matches_today() {
+        const POLICY: RetryPolicy = RetryPolicy::new(
+            DOWNLOAD_RETRY_BASE,
+            MAX_RETRY_AFTER,
+            Some(DOWNLOAD_ATTEMPTS),
+        );
+        // Default path, no header: 400ms then 800ms — the two sleeps a
+        // 3-attempt download performs.
+        let mut delay = DOWNLOAD_RETRY_BASE;
+        assert_eq!(delay, Duration::from_millis(400));
+        delay = POLICY.double(delay);
+        assert_eq!(delay, Duration::from_millis(800));
+    }
+
+    /// A server `Retry-After` redirects the backoff baseline: it is used for
+    /// its own sleep AND the doubling continues from it, rather than snapping
+    /// back to the pure attempt-indexed sequence. This is the exact case
+    /// CP-2's first cut got wrong (it returned 800ms here); the loop mirrors
+    /// the original mutating-`delay` semantics.
+    #[test]
+    fn retry_after_redirects_the_doubling_baseline() {
+        const POLICY: RetryPolicy = RetryPolicy::new(
+            DOWNLOAD_RETRY_BASE,
+            MAX_RETRY_AFTER,
+            Some(DOWNLOAD_ATTEMPTS),
+        );
+        // Attempt 1 gets Retry-After: 30s (replacing the DOWNLOAD_RETRY_BASE
+        // seed); attempt 2 fails with no header.
+        let mut delay = Duration::from_secs(30).min(MAX_RETRY_AFTER); // header wins, sleep 1
+        assert_eq!(delay, Duration::from_secs(30));
+        delay = POLICY.double(delay); // baseline carried forward, not reset
+        assert_eq!(
+            delay,
+            Duration::from_secs(60),
+            "the sleep after a 30s Retry-After must be 60s, not the base sequence's 800ms"
+        );
     }
 
     #[test]

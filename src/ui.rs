@@ -25,7 +25,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 
 use crate::app::{
-    App, BorderMask, BorderMaskPoint, BorderMaskStamp, PlaybackMode, TaskState, LIGHTNING_IMPACT_MS,
+    ActiveTask, App, BorderMask, BorderMaskPoint, BorderMaskStamp, PlaybackMode, TaskState,
+    LIGHTNING_IMPACT_MS,
 };
 use crate::cache::write_log;
 use crate::geo::{
@@ -37,6 +38,7 @@ use crate::layers::{
     BorderLine, BorderLineKind, BorderResolution, LayerId, LayerOption, LayerRegistry, LayerStatus,
     MainItem, ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
 };
+use crate::providers::location::LocationFix;
 
 const INTERACTION_REFRESH_DEBOUNCE_MS: u64 = 60;
 
@@ -215,6 +217,9 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Redraw cadence for fast animations (spinners, lightning impact flash).
 const ANIM_FAST: Duration = Duration::from_millis(50);
+
+/// How long one indeterminate-task marquee sweep takes to bounce end to end.
+const MARQUEE_PERIOD: Duration = Duration::from_millis(1200);
 
 /// Redraw cadence for slow animations (lightning trails fading over minutes).
 const ANIM_SLOW: Duration = Duration::from_millis(250);
@@ -1725,19 +1730,15 @@ fn raster_map_rows(
 
     raster_lightning(cells, app, bounds, width, height);
 
-    if let Some(fix) = app.location_fix() {
-        raster_pin(
-            cells,
-            fix.point,
-            bounds,
-            width,
-            height,
-            modes,
-            LayerId::Location,
-            Rgb8::RED,
-            app.location_label(),
-        );
-    }
+    raster_location_marker(
+        cells,
+        app.location_fix(),
+        app.location_label(),
+        bounds,
+        width,
+        height,
+        modes,
+    );
 
     if let Some(pin) = app.search_pin() {
         raster_pin(
@@ -1767,6 +1768,41 @@ const PIN_NUDGE_RADIUS: u16 = 3;
 /// - `Color` — a coloured background, leaving the foreground alone so radar
 ///   braille underneath still reads through.
 ///
+/// Draws the "you are here" marker and its label, gated on [`LocationFix::is_displayable`].
+///
+/// A fix coarser than [`DISPLAY_ACCURACY_M`](crate::providers::location::DISPLAY_ACCURACY_M)
+/// (or of unknown accuracy, except `Manual`) would draw a dot claiming a
+/// precision the fix does not have — so the marker and its place-name label
+/// are suppressed together rather than picking one to keep. This is a
+/// display gate only; the viewport still centres on the first fix regardless
+/// of accuracy (see `initial_viewport` in `app.rs`).
+#[allow(clippy::too_many_arguments)]
+fn raster_location_marker(
+    cells: &mut [RasterCell],
+    fix: Option<LocationFix>,
+    label: Option<&str>,
+    bounds: Bounds,
+    width: u16,
+    height: u16,
+    modes: &RenderModeState,
+) {
+    let Some(fix) = fix else { return };
+    if !fix.is_displayable() {
+        return;
+    }
+    raster_pin(
+        cells,
+        fix.point,
+        bounds,
+        width,
+        height,
+        modes,
+        LayerId::Location,
+        Rgb8::RED,
+        label,
+    );
+}
+
 /// Shared by the "you are here" marker and the search pin, which differ only
 /// in colour and which layer owns the modes.
 #[allow(clippy::too_many_arguments)]
@@ -1855,11 +1891,26 @@ fn recolor_existing_label(
         return false;
     }
 
+    let first = target[0];
     for row in 0..height {
         let base = usize::from(row) * w;
         // Compare case-insensitively: station and capital labels do not agree
         // on casing, and "LJUBLJANA" is still the place the pin is marking.
         for start in 0..=(w - target.len()) {
+            // Prefilter on the first glyph before paying for the full
+            // comparison: almost every start offset in an unrelated row is
+            // ruled out by its first character alone. Uses the same
+            // comparison as the full path below, or a fast "LJUBLJANA" pin
+            // would stop matching "Ljubljana".
+            let first_matches = cells.get(base + start).is_some_and(|c| {
+                c.glyph
+                    .is_some_and(|g| g.eq_ignore_ascii_case(&first) || g == first)
+            });
+            if !first_matches {
+                continue;
+            }
+            #[cfg(test)]
+            tests::LABEL_FULL_COMPARE_CALLS.with(|c| c.set(c.get() + 1));
             let matches = target.iter().enumerate().all(|(i, want)| {
                 cells.get(base + start + i).is_some_and(|c| {
                     c.glyph
@@ -1939,27 +1990,50 @@ fn nearest_free_cell(
     if free(x, y) {
         return Some((x, y));
     }
-    let mut best: Option<(u16, u16, u32)> = None;
-    for r in 1..=PIN_NUDGE_RADIUS {
-        for cy in y.saturating_sub(r)..=(y + r).min(height.saturating_sub(1)) {
-            for cx in x.saturating_sub(r)..=(x + r).min(width.saturating_sub(1)) {
-                // Only the ring at distance r — inner cells were checked already.
-                if x.abs_diff(cx) != r && y.abs_diff(cy) != r {
-                    continue;
-                }
-                if !free(cx, cy) {
-                    continue;
-                }
-                // Squared cell distance; columns are ~half as wide as rows are
-                // tall, so weight y to keep the nudge visually shortest.
-                let dx = u32::from(x.abs_diff(cx));
-                let dy = u32::from(y.abs_diff(cy)) * 2;
-                let d2 = dx * dx + dy * dy;
-                if best.is_none_or(|(_, _, bd)| d2 < bd) {
-                    best = Some((cx, cy, d2));
-                }
-            }
+
+    // Consider one candidate cell against the current best, by squared
+    // (y-weighted) distance. `best` is threaded through explicitly rather
+    // than captured, so the ring loops below can each call this without
+    // fighting the borrow checker.
+    let consider = |cx: i32, cy: i32, best: &mut Option<(u16, u16, u32)>| {
+        if cx < 0 || cy < 0 || cx >= i32::from(width) || cy >= i32::from(height) {
+            return;
         }
+        let (cx, cy) = (cx as u16, cy as u16);
+        if !free(cx, cy) {
+            return;
+        }
+        // Squared cell distance; columns are ~half as wide as rows are
+        // tall, so weight y to keep the nudge visually shortest.
+        let dx = u32::from(x.abs_diff(cx));
+        let dy = u32::from(y.abs_diff(cy)) * 2;
+        let d2 = dx * dx + dy * dy;
+        if best.is_none_or(|(_, _, bd)| d2 < bd) {
+            *best = Some((cx, cy, d2));
+        }
+    };
+
+    let (xi, yi) = (i32::from(x), i32::from(y));
+    for r in 1..=PIN_NUDGE_RADIUS {
+        let ri = i32::from(r);
+        let mut best: Option<(u16, u16, u32)> = None;
+
+        // Walk only the ring at distance r, in the same row-major order the
+        // old full-square sweep visited its ring cells in, so a tie between
+        // two equally-close free cells still resolves to the same winner:
+        // top row, then the ring's side columns (top to bottom), then the
+        // bottom row.
+        for cx in (xi - ri)..=(xi + ri) {
+            consider(cx, yi - ri, &mut best);
+        }
+        for cy in (yi - ri + 1)..=(yi + ri - 1) {
+            consider(xi - ri, cy, &mut best);
+            consider(xi + ri, cy, &mut best);
+        }
+        for cx in (xi - ri)..=(xi + ri) {
+            consider(cx, yi + ri, &mut best);
+        }
+
         if let Some((bx, by, _)) = best {
             return Some((bx, by));
         }
@@ -3264,6 +3338,27 @@ fn options_panel_area(total_area: Rect, main_area: Rect, n_lines: u16) -> Rect {
     }
 }
 
+/// Order visible overlay rows deterministically before truncating to
+/// `max_visible` (CP-5): running tasks before terminal ones, then
+/// oldest-first by `started_at` so a row doesn't reshuffle every time its
+/// fraction updates — the longest-waiting task stays put. Ties (equal on
+/// both keys) break on `id` so the order is total and never flaky.
+///
+/// NOT in this checkpoint: a "user-initiated before background" tier — it
+/// discriminates on the `Geocode`/`Location` kinds CP-6 introduces (spec
+/// change-log 2026-07-21).
+fn sort_visible_tasks(mut tasks: Vec<&ActiveTask>) -> Vec<&ActiveTask> {
+    tasks.sort_by(|a, b| {
+        let a_running = a.state == TaskState::Running;
+        let b_running = b.state == TaskState::Running;
+        b_running
+            .cmp(&a_running) // running (true) sorts before terminal (false)
+            .then(a.started_at.cmp(&b.started_at)) // oldest first
+            .then(a.id.cmp(&b.id)) // total, stable tie-break
+    });
+    tasks
+}
+
 /// Render task progress overlay in the top-right corner.
 fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if app.active_tasks.is_empty() {
@@ -3272,7 +3367,23 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let bar_chars = 12usize;
     let max_visible = 8;
-    let n = app.active_tasks.len().min(max_visible);
+
+    // CP-4's visibility threshold filters first, then CP-5's deterministic
+    // sort, then truncate — a young task must not win a slot over an older
+    // visible one purely by vec position, and an all-invisible panel must
+    // render nothing (early return below covers that case).
+    let now = std::time::Instant::now();
+    let visible: Vec<&ActiveTask> = app
+        .active_tasks
+        .iter()
+        .filter(|t| t.is_visible(now))
+        .collect();
+    let ordered = sort_visible_tasks(visible);
+    let rows: Vec<&ActiveTask> = ordered.into_iter().take(max_visible).collect();
+    if rows.is_empty() {
+        return;
+    }
+    let n = rows.len();
 
     let kind_w: usize = 8;
     let label_w: usize = 18;
@@ -3289,8 +3400,13 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         height: n as u16,
     };
 
+    // One shared phase for every marquee this frame — they need to move,
+    // not stay in lockstep forever, but per-task offsets aren't worth the
+    // complexity for a handful of rows.
+    let marquee_phase = marquee_phase(MARQUEE_PERIOD);
+
     let mut lines: Vec<TextLine<'static>> = Vec::with_capacity(n);
-    for task in &app.active_tasks[..n] {
+    for task in &rows {
         let color = task.kind.color();
 
         let kind = format!("{:>kw$}", task.kind.label(), kw = kind_w);
@@ -3313,8 +3429,17 @@ fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         };
         let label_sp = Span::raw(format!(" {label_raw}"));
 
-        let bar_str = braille_bar(task.display_fraction, bar_chars);
-        let pct_str = format!("{:>3.0}%", task.display_fraction * 100.0);
+        let (bar_str, pct_str) = match task.fraction {
+            Some(_) => (
+                braille_bar(task.display_fraction, bar_chars),
+                format!("{:>3.0}%", task.display_fraction * 100.0),
+            ),
+            // No measurable progress: a marquee, and no faked percentage.
+            None => (
+                braille_marquee(marquee_phase, bar_chars),
+                format!("{:>4}", "···"),
+            ),
+        };
         let bar_sp = Span::styled(format!(" {bar_str}"), Style::default().fg(color));
         let pct_sp = Span::styled(pct_str, Style::default().fg(color));
 
@@ -3878,10 +4003,194 @@ fn braille_bar(fraction: f64, width: usize) -> String {
         .collect()
 }
 
+/// Current position, in `[0, 1)`, of a marquee sweeping back and forth over
+/// `period` — driven off wall-clock time rather than any per-task state, so
+/// an indeterminate task needs no animation bookkeeping of its own.
+fn marquee_phase(period: Duration) -> f64 {
+    let period_ms = period.as_millis().max(1);
+    let elapsed_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    (elapsed_ms % period_ms) as f64 / period_ms as f64
+}
+
+/// Render an indeterminate progress marquee: a small lit block bouncing
+/// across a `width`-char bar, at the position `phase` (`[0, 1)`, one lap per
+/// call to [`marquee_phase`]) maps to via a triangle wave — so it sweeps to
+/// one end and back rather than snapping from the far edge to the start.
+fn braille_marquee(phase: f64, width: usize) -> String {
+    const BLOCK: usize = 3; // lit-cell width of the sweeping block
+    if width == 0 {
+        return String::new();
+    }
+    let block = BLOCK.min(width);
+    let travel = width - block; // range the block's left edge can occupy
+    let phase = phase.rem_euclid(1.0);
+    let triangle = if phase < 0.5 {
+        phase * 2.0
+    } else {
+        2.0 - phase * 2.0
+    };
+    let pos = (triangle * travel as f64).round() as usize;
+    (0..width)
+        .map(|i| {
+            if (pos..pos + block).contains(&i) {
+                '\u{28FF}' // ⣿ full
+            } else {
+                '\u{2800}' // ⠀ empty
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::TaskKind;
     use crate::layers::{RadarRun, RadarTile};
+    use std::cell::Cell;
+
+    /// `ActiveTask` has pub fields; build fixtures directly rather than
+    /// relying on any `App` constructor (none cheap exists — see the
+    /// `app::tests` module comment).
+    fn task(id: u64, state: TaskState, started_at: Instant) -> ActiveTask {
+        ActiveTask {
+            id,
+            label: "test".into(),
+            action: String::new(),
+            fraction: Some(0.0),
+            display_fraction: 0.0,
+            anim_from: 0.0,
+            anim_t: 1.0,
+            kind: TaskKind::RadarFrame,
+            state,
+            started_at,
+            completed_at: None,
+            last_anim: started_at,
+        }
+    }
+
+    // ── Task overlay: CP-5 deterministic overflow sort ─────────────────
+
+    #[test]
+    fn running_sorts_before_a_completed_task_positioned_earlier() {
+        let now = Instant::now();
+        let completed = task(1, TaskState::Completed, now);
+        let running = task(2, TaskState::Running, now);
+        // Completed is positioned before running in the input vec.
+        let sorted = sort_visible_tasks(vec![&completed, &running]);
+        assert_eq!(sorted[0].id, 2, "running must precede terminal");
+        assert_eq!(sorted[1].id, 1);
+    }
+
+    #[test]
+    fn two_running_tasks_sort_oldest_first() {
+        let now = Instant::now();
+        let older = task(1, TaskState::Running, now);
+        let newer = task(2, TaskState::Running, now + Duration::from_millis(50));
+        let sorted = sort_visible_tasks(vec![&newer, &older]);
+        assert_eq!(sorted[0].id, 1, "oldest-started task must sort first");
+        assert_eq!(sorted[1].id, 2);
+    }
+
+    #[test]
+    fn ties_break_stably_by_id() {
+        let now = Instant::now();
+        let a = task(5, TaskState::Running, now);
+        let b = task(3, TaskState::Running, now);
+        let sorted = sort_visible_tasks(vec![&a, &b]);
+        assert_eq!(
+            sorted[0].id, 3,
+            "equal state and start time: lower id first"
+        );
+        assert_eq!(sorted[1].id, 5);
+    }
+
+    #[test]
+    fn overflow_take_keeps_all_running_and_drops_completed() {
+        let now = Instant::now();
+        // 6 completed (older start times so they'd sort first under a
+        // naive oldest-only order) + 4 running, max_visible = 8.
+        let mut tasks: Vec<ActiveTask> = (0..6)
+            .map(|i| task(i, TaskState::Completed, now - Duration::from_secs(60 - i)))
+            .collect();
+        tasks.extend(
+            (6..10).map(|i| task(i, TaskState::Running, now - Duration::from_secs(10 - i))),
+        );
+        let refs: Vec<&ActiveTask> = tasks.iter().collect();
+        let sorted = sort_visible_tasks(refs);
+        let survivors: Vec<u64> = sorted.into_iter().take(8).map(|t| t.id).collect();
+        for running_id in 6..10 {
+            assert!(
+                survivors.contains(&running_id),
+                "running task {running_id} must survive truncation, got {survivors:?}"
+            );
+        }
+        assert_eq!(survivors.len(), 8);
+        let dropped_completed = (0..6).filter(|id| !survivors.contains(id)).count();
+        assert_eq!(dropped_completed, 2, "2 of the 6 completed rows must drop");
+    }
+
+    thread_local! {
+        /// Counts how many times `recolor_existing_label` pays for the full
+        /// per-character comparison, so the prefilter's savings are directly
+        /// observable rather than inferred from wall-clock time.
+        pub(super) static LABEL_FULL_COMPARE_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // ── Task overlay: determinate bar / indeterminate marquee ──────────
+
+    /// The determinate path must render byte-identically to before the
+    /// `Option<f64>` change — `braille_bar` itself is untouched, but this
+    /// pins the exact output so a future edit to the dispatch in
+    /// `render_task_queue` can't silently start feeding it a different
+    /// value (e.g. the raw `fraction` instead of `display_fraction`).
+    /// Falsify: change the `.round()` to `.floor()` in `braille_bar` and
+    /// confirm this assertion breaks.
+    #[test]
+    fn braille_bar_determinate_output_is_unchanged() {
+        assert_eq!(braille_bar(0.5, 12), "⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀");
+        assert_eq!(braille_bar(0.0, 12), "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀");
+        assert_eq!(braille_bar(1.0, 12), "⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿");
+    }
+
+    #[test]
+    fn braille_marquee_sweeps_from_left_at_phase_zero() {
+        let bar = braille_marquee(0.0, 12);
+        assert_eq!(bar, "⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀");
+    }
+
+    #[test]
+    fn braille_marquee_reaches_the_right_edge_at_phase_half() {
+        // Triangle wave peaks at phase 0.5: the block's left edge sits at
+        // `width - block`, i.e. flush with the right end of the bar.
+        let bar = braille_marquee(0.5, 12);
+        assert_eq!(bar, "⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿");
+    }
+
+    #[test]
+    fn braille_marquee_bounces_back_toward_the_left() {
+        // Falsify: a naive sawtooth (no bounce) would keep pos climbing past
+        // phase 0.5 instead of reversing; this would fail such an implementation.
+        let at_far_end = braille_marquee(0.5, 12);
+        let past_the_peak = braille_marquee(0.75, 12);
+        assert_ne!(at_far_end, past_the_peak);
+        assert_eq!(braille_marquee(0.75, 12), braille_marquee(0.25, 12));
+    }
+
+    #[test]
+    fn braille_marquee_never_exceeds_the_requested_width() {
+        for i in 0..20 {
+            let phase = i as f64 / 20.0;
+            let bar = braille_marquee(phase, 12);
+            assert_eq!(
+                bar.chars().count(),
+                12,
+                "phase {phase} produced the wrong bar length"
+            );
+        }
+    }
 
     // ── Capital name labels ────────────────────────────────────────────
 
@@ -4049,6 +4358,79 @@ mod tests {
     fn location_marker_is_not_drawn_when_it_owns_no_mode() {
         let cells = marker_grid(GeoPoint::new(0.0, 0.0), &location_modes(false, false));
         assert!(cells.iter().all(|c| c.glyph.is_none() && c.bg.is_none()));
+    }
+
+    // ── Accuracy gate at the render site ───────────────────────────────
+
+    use crate::providers::location::LocationSource;
+
+    fn location_fix(accuracy_m: Option<f64>) -> LocationFix {
+        LocationFix::new(
+            GeoPoint::new(0.0, 0.0),
+            accuracy_m,
+            LocationSource::Platform,
+        )
+    }
+
+    fn draw_location_marker(fix: Option<LocationFix>, label: Option<&str>) -> Vec<RasterCell> {
+        let mut cells = vec![RasterCell::default(); 100];
+        raster_location_marker(
+            &mut cells,
+            fix,
+            label,
+            WORLD_BOUNDS,
+            10,
+            10,
+            &location_modes(true, false),
+        );
+        cells
+    }
+
+    /// A 10 km fix is the motivating case: GeoIP delivers exactly this on
+    /// boot, and it must not draw a dot claiming better precision than it has.
+    #[test]
+    fn a_coarse_10km_fix_draws_no_marker() {
+        let cells = draw_location_marker(Some(location_fix(Some(10_000.0))), Some("Ljubljana"));
+        assert!(
+            cells.iter().all(|c| c.glyph.is_none()),
+            "coarse fix must not draw the marker"
+        );
+        assert!(
+            !cells.iter().any(|c| c.glyph == Some('L')),
+            "coarse fix must not draw the label either"
+        );
+    }
+
+    /// A precise 25 m fix (the WiFi-refined GeoClue stage) draws normally.
+    #[test]
+    fn a_precise_25m_fix_draws_the_marker() {
+        let cells = draw_location_marker(Some(location_fix(Some(25.0))), None);
+        assert!(
+            cells.iter().any(|c| c.glyph == Some('x')),
+            "precise fix must draw the marker"
+        );
+    }
+
+    #[test]
+    fn unknown_accuracy_draws_no_marker() {
+        let cells = draw_location_marker(Some(location_fix(None)), None);
+        assert!(cells.iter().all(|c| c.glyph.is_none()));
+    }
+
+    #[test]
+    fn manual_fix_always_draws_regardless_of_accuracy() {
+        let fix = LocationFix::new(GeoPoint::new(0.0, 0.0), None, LocationSource::Manual);
+        let cells = draw_location_marker(Some(fix), None);
+        assert!(
+            cells.iter().any(|c| c.glyph == Some('x')),
+            "Manual (--lat/--lon) must always render"
+        );
+    }
+
+    #[test]
+    fn no_fix_draws_no_marker() {
+        let cells = draw_location_marker(None, None);
+        assert!(cells.iter().all(|c| c.glyph.is_none()));
     }
 
     // ── Pin collision nudging ──────────────────────────────────────────
@@ -4323,6 +4705,32 @@ mod tests {
             Rgb8::RED
         ));
         assert_eq!(cells[15 * width + 30].color, Some(Rgb8::RED));
+    }
+
+    /// A grid where no cell's first character matches must be ruled out by
+    /// the prefilter alone; the full per-character comparison should never
+    /// run. Before the prefilter existed this counter incremented once per
+    /// start offset in every row, so this test failed on the pre-fix code.
+    #[test]
+    fn pin_label_no_match_grid_skips_the_full_compare() {
+        let width = 40usize;
+        let mut cells = vec![RasterCell::default(); width * 20];
+        for c in cells.iter_mut() {
+            c.glyph = Some('#');
+        }
+        LABEL_FULL_COMPARE_CALLS.with(|c| c.set(0));
+        assert!(!recolor_existing_label(
+            &mut cells,
+            width as u16,
+            20,
+            "Ljubljana",
+            Rgb8::RED
+        ));
+        assert_eq!(
+            LABEL_FULL_COMPARE_CALLS.with(|c| c.get()),
+            0,
+            "first-character prefilter must rule out a no-match grid without a full compare"
+        );
     }
 
     /// A different name is never touched, however close it sits.

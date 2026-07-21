@@ -16,6 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::{LocationFix, LocationSource};
 use crate::cache::write_log;
 use crate::geo::GeoPoint;
+use crate::retry::RetryPolicy;
 
 /// Assumed radius for a city-level IP lookup.  Services rarely return a real
 /// accuracy figure, and when they do it is optimistic; 25 km keeps the fix
@@ -49,14 +50,15 @@ pub async fn run(tx: UnboundedSender<LocationFix>, endpoint: String, log_path: &
         .build()
         .map_err(|e| eyre!("build IP geolocation HTTP client: {e}"))?;
 
-    let mut backoff = RETRY_INTERVAL;
+    const POLICY: RetryPolicy = RetryPolicy::new(RETRY_INTERVAL, MAX_RETRY_INTERVAL, None);
+    let mut failures: u32 = 0;
     loop {
         let delay = match fetch(&client, &endpoint).await {
             Ok(fix) => {
                 if tx.send(fix).is_err() {
                     return Ok(());
                 }
-                backoff = RETRY_INTERVAL;
+                failures = 0;
                 REFRESH_INTERVAL
             }
             // A failed IP lookup is entirely routine (offline, rate limited,
@@ -64,8 +66,8 @@ pub async fn run(tx: UnboundedSender<LocationFix>, endpoint: String, log_path: &
             // be delivering. Log it and try again later.
             Err(e) => {
                 write_log(log_path, format!("location/ip: lookup failed: {e}"));
-                let delay = backoff;
-                backoff = (backoff * 2).min(MAX_RETRY_INTERVAL);
+                let delay = POLICY.delay_for(failures);
+                failures += 1;
                 delay
             }
         };
@@ -145,5 +147,22 @@ mod tests {
     #[test]
     fn rejects_non_json_body() {
         assert!(parse("<html>429 Too Many Requests</html>").is_err());
+    }
+
+    /// `run`'s backoff loop has no seam to drive without real sleeps, so this
+    /// asserts the policy call it now delegates to (`POLICY.delay_for(failures)`,
+    /// `failures` starting at 0) against today's hand-rolled sequence:
+    /// 60, 120, 240, 480, 960, then clamps to 1800 (30 min).
+    #[test]
+    fn retry_sequence_matches_today() {
+        let policy = RetryPolicy::new(RETRY_INTERVAL, MAX_RETRY_INTERVAL, None);
+        let expected = [60u64, 120, 240, 480, 960, 1800, 1800];
+        for (failures, secs) in expected.into_iter().enumerate() {
+            assert_eq!(
+                policy.delay_for(failures as u32),
+                Duration::from_secs(secs),
+                "failures {failures}"
+            );
+        }
     }
 }

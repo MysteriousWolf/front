@@ -1,1 +1,8 @@
 - 2026-07-20 gitignore-missing-atomic-paths — "gitignore lacks .claude/.scratchpad/, .worktrees/ and tmp/" — *(closed 2026-07-20)*
+- 2026-07-20 obs-zoom-cutoff-mismatch — "CAPITALS_ZOOM_CUTOFF (5.5) and MAJOR_CITIES_ZOOM_CUTOFF (5.0) disagree" — *(closed 2026-07-20)*
+- 2026-07-20 obs-backdrop-not-zoom-gated — "Regional obs backdrop is fetched at every zoom, ungated" — *(closed 2026-07-20)*
+- 2026-07-20 obs-station-list-off-budget — "fetch_station_list bypasses the request budget" — *(closed 2026-07-20)*
+- 2026-07-20 recolor-label-full-grid-scan — "recolor_existing_label scans the full cell grid per pin per frame" — *(closed 2026-07-20)*
+- 2026-07-20 nearest-free-cell-ring-search — "nearest_free_cell ring search is O(radius^2) per pin per frame" — *(closed 2026-07-20)*
+- 2026-07-20 obs-station-identity-is-the-name — "ObservationPoint identity is the station name, not the WIGOS id" — *(closed 2026-07-20)*
+- 2026-07-21 obs-partial-lazy-reset — "obs_partial reset lazily on first Point, not on PartialCommit/Ready" — *(closed 2026-07-21)*

@@ -28,6 +28,7 @@ use crate::providers::location::{LocationArbiter, LocationFix, LocationSource};
 use crate::providers::maps::NaturalEarthProvider;
 use crate::providers::meteoalarm::MeteoAlarmProvider;
 use crate::providers::meteogate::MeteoGateProvider;
+use crate::retry::RetryPolicy;
 use crate::ui::BrailleFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,13 @@ const FRAME_RETRY_MAX: Duration = Duration::from_secs(90);
 /// history reload or restart clears the slate and tries again.
 const FRAME_RETRY_GIVE_UP: u32 = 8;
 
+/// Shared backoff policy for radar frame retries, built from the constants
+/// above. `attempts` here is 1-based (pre-incremented before use in
+/// `note_frame_failure`), so `delay_for(entry.attempts)` — not `attempts - 1`
+/// — reproduces the existing sequence: first failure is `base * 2^1`.
+const FRAME_RETRY_POLICY: RetryPolicy =
+    RetryPolicy::new(FRAME_RETRY_BASE, FRAME_RETRY_MAX, Some(FRAME_RETRY_GIVE_UP));
+
 /// How many uncached frames a single preload pass will pull in, nearest the
 /// playhead first.  Caps the work per trigger independently of how deep the
 /// history window is; the window re-centres as the playhead moves, so the rest
@@ -194,6 +202,22 @@ fn frames_to_evict(cached: &[i64], timestamps: &[i64], frame_index: usize, cap: 
             .unwrap_or(usize::MAX)
     });
     keys.split_off(cap)
+}
+
+/// Resets the observation accumulator for a freshly kicked-off refresh.
+///
+/// Called once per refresh, unconditionally, rather than lazily on the first
+/// `Point` — a refresh that errors before producing any `Point` still needs
+/// the previous refresh's leftover `obs_partial` cleared.
+fn reset_obs_accumulator(
+    obs_incoming: &mut Vec<ObservationPoint>,
+    obs_incoming_id: &mut u64,
+    obs_partial: &mut Vec<ObservationPoint>,
+    new_id: u64,
+) {
+    obs_incoming.clear();
+    *obs_incoming_id = new_id;
+    obs_partial.clear();
 }
 
 /// Remove `req_ts` from `timestamps` and work out which index should stay
@@ -777,7 +801,7 @@ impl App {
                             let _ = task_tx2.send(TaskMsg::Progress {
                                 id: task_id,
                                 action: format!("{} tiles", tile_count),
-                                fraction,
+                                fraction: Some(fraction),
                             });
                             RadarRefreshPayload::Tile(tile)
                         }
@@ -983,7 +1007,7 @@ impl App {
             let _ = task_tx.send(TaskMsg::Progress {
                 id: task_id,
                 action: format!("downloading {res_label} geo…"),
-                fraction: 0.3,
+                fraction: Some(0.3),
             });
             let result = match maps
                 .borders_for_resolution(desired, bounds, spawn_cancel)
@@ -993,7 +1017,7 @@ impl App {
                     let _ = task_tx.send(TaskMsg::Progress {
                         id: task_id,
                         action: "building grid".into(),
-                        fraction: 0.8,
+                        fraction: Some(0.8),
                     });
                     let tile_task_id = next_task_id();
                     let _ = task_tx.send(TaskMsg::Complete { id: task_id });
@@ -1166,6 +1190,16 @@ impl App {
         // a refresh never blanks the map mid-fetch.
         self.obs_refresh_id = self.obs_refresh_id.wrapping_add(1);
         let id = self.obs_refresh_id;
+        // Reset the accumulator here — once per refresh, unconditionally —
+        // rather than lazily on the first `Point`. A refresh that errors
+        // before producing any `Point` would otherwise never clear
+        // `obs_partial`, leaving the previous refresh's data to linger.
+        reset_obs_accumulator(
+            &mut self.obs_incoming,
+            &mut self.obs_incoming_id,
+            &mut self.obs_partial,
+            id,
+        );
         let provider = self.eumetnet.clone();
         let tx = self.obs_tx.clone();
         let log = self.dirs.log_path.clone();
@@ -1200,7 +1234,7 @@ impl App {
                                     let _ = task_tx_fwd.send(TaskMsg::Progress {
                                         id: task_id,
                                         action: format!("{n} stations"),
-                                        fraction: frac,
+                                        fraction: Some(frac),
                                     });
                                 }
                                 let _ = tx_fwd.send(ObsRefreshResult {
@@ -1827,23 +1861,28 @@ impl App {
                         task.id = id;
                         task.label = label;
                         task.action = String::new();
-                        task.fraction = 0.0;
+                        task.fraction = Some(0.0);
                         task.anim_from = task.display_fraction;
                         task.anim_t = 0.0;
                         task.state = TaskState::Running;
                         task.completed_at = None;
                         task.last_anim = now;
+                        // A reused row is a new task — reset its start time
+                        // so the visibility threshold gates on this run, not
+                        // whatever the prior occupant had going.
+                        task.started_at = now;
                     } else {
                         self.active_tasks.push(ActiveTask {
                             id,
                             label,
                             action: String::new(),
-                            fraction: 0.0,
+                            fraction: Some(0.0),
                             display_fraction: 0.0,
                             anim_from: 0.0,
                             anim_t: 0.0,
                             kind,
                             state: TaskState::Running,
+                            started_at: now,
                             completed_at: None,
                             last_anim: now,
                         });
@@ -1855,21 +1894,12 @@ impl App {
                     fraction,
                 } => {
                     if let Some(task) = self.active_tasks.iter_mut().find(|t| t.id == id) {
-                        task.action = action;
-                        if (fraction - task.fraction).abs() > 0.001 {
-                            task.anim_from = task.display_fraction;
-                            task.anim_t = 0.0;
-                        }
-                        task.fraction = fraction;
+                        task.apply_progress(action, fraction);
                     }
                 }
                 TaskMsg::Complete { id } => {
                     if let Some(task) = self.active_tasks.iter_mut().find(|t| t.id == id) {
-                        task.anim_from = task.display_fraction;
-                        task.anim_t = 0.0;
-                        task.fraction = 1.0;
-                        task.state = TaskState::Completed;
-                        task.completed_at = Some(Instant::now());
+                        task.apply_complete(Instant::now());
                     }
                 }
                 TaskMsg::Error { id, error } => {
@@ -1890,11 +1920,17 @@ impl App {
         for task in &mut self.active_tasks {
             let dt = now.duration_since(task.last_anim).as_secs_f64();
             task.last_anim = now;
+            // Indeterminate tasks have no fraction to ease toward — the
+            // marquee derives its position from wall-clock time at render
+            // instead, so there is nothing for smoothstep to animate here.
+            let Some(target) = task.fraction else {
+                continue;
+            };
             if task.anim_t < 1.0 {
                 task.anim_t = (task.anim_t + dt * 4.0).min(1.0); // 0.25 s max
                 let t = task.anim_t;
                 let eased = t * t * (3.0 - 2.0 * t); // smoothstep
-                task.display_fraction = task.anim_from + (task.fraction - task.anim_from) * eased;
+                task.display_fraction = task.anim_from + (target - task.anim_from) * eased;
                 changed = true;
             }
         }
@@ -2043,11 +2079,10 @@ impl App {
             }
             match result.result {
                 ObsRefreshPayload::Point(point) => {
-                    if result.id != self.obs_incoming_id {
-                        self.obs_incoming.clear();
-                        self.obs_incoming_id = result.id;
-                        self.obs_partial.clear(); // reset partial accumulator for new refresh
-                    }
+                    // The accumulator is reset once per refresh at kickoff
+                    // (`request_obs_refresh`), so by the time any `Point` for
+                    // this refresh id reaches here `obs_incoming_id` already
+                    // matches — no lazy reset needed.
                     self.obs_incoming.push(point);
                 }
                 ObsRefreshPayload::PartialCommit => {
@@ -2263,7 +2298,7 @@ impl App {
             // pan while a transient one still recovers quickly.
             .filter(|(_, ts)| {
                 self.radar_failures.get(ts).is_none_or(|retry| {
-                    now >= retry.next_at && retry.attempts < FRAME_RETRY_GIVE_UP
+                    now >= retry.next_at && !FRAME_RETRY_POLICY.exhausted(retry.attempts)
                 })
             })
             .map(|(i, &ts)| (ring_distance(i, self.frame_index, len), ts))
@@ -2282,10 +2317,7 @@ impl App {
         // tick would abort and relaunch the pass — the frame would never land.
         for ts in &to_load {
             if let Some(retry) = self.radar_failures.get_mut(ts) {
-                retry.next_at = Instant::now()
-                    + FRAME_RETRY_BASE
-                        .saturating_mul(1u32 << retry.attempts.min(6))
-                        .min(FRAME_RETRY_MAX);
+                retry.next_at = Instant::now() + FRAME_RETRY_POLICY.delay_for(retry.attempts);
             }
         }
         let provider = self.meteogate.clone();
@@ -2364,9 +2396,7 @@ impl App {
             next_at: Instant::now(),
         });
         entry.attempts = entry.attempts.saturating_add(1);
-        let backoff = FRAME_RETRY_BASE
-            .saturating_mul(1u32 << entry.attempts.min(6))
-            .min(FRAME_RETRY_MAX);
+        let backoff = FRAME_RETRY_POLICY.delay_for(entry.attempts);
         entry.next_at = Instant::now() + backoff;
         let msg = if entry.attempts >= FRAME_RETRY_GIVE_UP {
             format!(
@@ -2403,15 +2433,12 @@ impl App {
         let current_ts = self.timestamps.get(self.frame_index).copied();
         if let Some(ts) = current_ts {
             let due = self.radar_failures.get(&ts).is_some_and(|retry| {
-                now >= retry.next_at && retry.attempts < FRAME_RETRY_GIVE_UP
+                now >= retry.next_at && !FRAME_RETRY_POLICY.exhausted(retry.attempts)
             });
             if due && self.refresh_task.is_none() && !self.frame_cache.contains_key(&ts) {
                 if let Some(retry) = self.radar_failures.get_mut(&ts) {
                     // Same in-flight guard as the preload path.
-                    retry.next_at = now
-                        + FRAME_RETRY_BASE
-                            .saturating_mul(1u32 << retry.attempts.min(6))
-                            .min(FRAME_RETRY_MAX);
+                    retry.next_at = now + FRAME_RETRY_POLICY.delay_for(retry.attempts);
                 }
                 self.request_meteogate_refresh(self.map_width, self.map_height);
                 return;
@@ -2420,7 +2447,7 @@ impl App {
 
         let due = self.radar_failures.iter().any(|(ts, retry)| {
             now >= retry.next_at
-                && retry.attempts < FRAME_RETRY_GIVE_UP
+                && !FRAME_RETRY_POLICY.exhausted(retry.attempts)
                 && !self.frame_cache.contains_key(ts)
         });
         if due {
@@ -2767,7 +2794,7 @@ async fn initial_viewport(
         Ok(Some(fix)) => {
             write_log(log_path, format!("boot: initial fix from {}", fix.label()));
             arbiter.offer(fix);
-            Viewport::from_lat_lon(fix.point.lat, fix.point.lon, cli.zoom.unwrap_or(5.0))
+            viewport_for_fix(&fix, cli.zoom)
         }
         Ok(None) => {
             // Every backend gave up (no GeoClue daemon, IP fallback off).
@@ -2784,6 +2811,17 @@ async fn initial_viewport(
     };
 
     (viewport, arbiter, Some(stream.rx))
+}
+
+/// Where the first fix centres the viewport, regardless of accuracy.
+///
+/// This is deliberately independent of [`LocationFix::is_displayable`]: a
+/// 10 km GeoIP fix is still far better than the Europe fallback for choosing
+/// where to start, even though it is too coarse to draw a marker for. The
+/// accuracy gate governs the "you are here" dot only, never where the map
+/// boots.
+fn viewport_for_fix(fix: &LocationFix, cli_zoom: Option<f64>) -> Viewport {
+    Viewport::from_lat_lon(fix.point.lat, fix.point.lon, cli_zoom.unwrap_or(5.0))
 }
 
 // ── Background task queue ───────────────────────────────────────────
@@ -2838,7 +2876,9 @@ pub enum TaskMsg {
     Progress {
         id: u64,
         action: String,
-        fraction: f64,
+        /// `None` means "working, no measurable progress" (e.g. a geocode or
+        /// location fix) — rendered as a marquee, never a faked value.
+        fraction: Option<f64>,
     },
     Complete {
         id: u64,
@@ -2855,7 +2895,8 @@ pub struct ActiveTask {
     pub id: u64,
     pub label: String,
     pub action: String,
-    pub fraction: f64,
+    /// `None` = indeterminate (marquee); `Some(f)` = determinate progress.
+    pub fraction: Option<f64>,
     /// Smoothly-animated display value.  Updated by animating `anim_t` from
     /// 0→1 and applying smoothstep so the bar eases in and out between
     /// each discrete progress update.
@@ -2866,8 +2907,73 @@ pub struct ActiveTask {
     pub anim_t: f64,
     pub kind: TaskKind,
     pub state: TaskState,
+    /// When this task started running. Used to gate visibility (CP-4): a
+    /// task that starts and finishes inside `TASK_VISIBLE_AFTER` must never
+    /// render, so this is distinct from `last_anim` (bumped every tick) and
+    /// `completed_at` (terminal-only).
+    pub started_at: Instant,
     pub completed_at: Option<Instant>,
     pub last_anim: Instant,
+}
+
+/// A task must run for at least this long before it renders a row, so a
+/// fast task never flashes into view and vanishes. `Error` is exempt — a
+/// failure is always worth showing regardless of how fast it arrived.
+pub const TASK_VISIBLE_AFTER: Duration = Duration::from_millis(150);
+
+impl ActiveTask {
+    /// Apply a `TaskMsg::Progress` update, handling every `Option`
+    /// transition explicitly rather than diffing raw floats:
+    /// - `Some → Some`: today's diff-check — animate only on a real change.
+    /// - `None → Some`: entering determinate — reset the animation so the
+    ///   bar eases in from wherever the marquee left `display_fraction`.
+    /// - `* → None`: entering indeterminate. The marquee animates off
+    ///   wall-clock at render time, not smoothstep, so no reset is needed.
+    fn apply_progress(&mut self, action: String, fraction: Option<f64>) {
+        self.action = action;
+        match (self.fraction, fraction) {
+            (Some(old), Some(new)) if (new - old).abs() > 0.001 => {
+                self.anim_from = self.display_fraction;
+                self.anim_t = 0.0;
+            }
+            (None, Some(_)) => {
+                self.anim_from = self.display_fraction;
+                self.anim_t = 0.0;
+            }
+            _ => {}
+        }
+        self.fraction = fraction;
+    }
+
+    /// Apply a `TaskMsg::Complete` update. Always finishes as a full
+    /// determinate bar — even a task that was indeterminate animates to
+    /// 100% and prunes via the normal `display_fraction < 0.999` check,
+    /// never lingering as an unprunable marquee.
+    fn apply_complete(&mut self, now: Instant) {
+        self.anim_from = self.display_fraction;
+        self.anim_t = 0.0;
+        self.fraction = Some(1.0);
+        self.state = TaskState::Completed;
+        self.completed_at = Some(now);
+    }
+
+    /// Whether this task has earned a row in the overlay yet (CP-4).
+    ///
+    /// `Error` is always visible. A still-`Running` task gates on wall-clock
+    /// age (`now - started_at`) since it has no end yet. A terminal task
+    /// (`Completed`/`Superseded`) gates on how long it actually *ran*
+    /// (`completed_at - started_at`), not on wall-clock age — gating on age
+    /// would wrongly reveal a fast task partway through its post-complete
+    /// linger window, ~150ms after it started.
+    pub fn is_visible(&self, now: Instant) -> bool {
+        match self.state {
+            TaskState::Error => true,
+            TaskState::Running => now.duration_since(self.started_at) >= TASK_VISIBLE_AFTER,
+            TaskState::Completed | TaskState::Superseded => self
+                .completed_at
+                .is_some_and(|c| c.duration_since(self.started_at) >= TASK_VISIBLE_AFTER),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2930,6 +3036,137 @@ fn spawn_tile_gen(
 mod tests {
     use super::*;
 
+    /// No cheap way to drive `App::drain_task_messages` end-to-end (`App`
+    /// has no lightweight test constructor — dozens of provider/config
+    /// fields). `ActiveTask` is a plain `pub`-field struct though, so these
+    /// tests drive the extracted `apply_progress` / `apply_complete`
+    /// transition methods directly at the field level.
+    fn test_task(fraction: Option<f64>) -> ActiveTask {
+        ActiveTask {
+            id: 1,
+            label: "test".into(),
+            action: String::new(),
+            fraction,
+            display_fraction: 0.4,
+            anim_from: 0.4,
+            anim_t: 1.0, // animation already settled
+            kind: TaskKind::RadarFrame,
+            state: TaskState::Running,
+            started_at: Instant::now(),
+            completed_at: None,
+            last_anim: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn progress_some_to_some_below_threshold_leaves_animation_untouched() {
+        let mut task = test_task(Some(0.5));
+        task.apply_progress("still going".into(), Some(0.5005));
+        assert_eq!(task.fraction, Some(0.5005));
+        assert_eq!(task.anim_t, 1.0, "sub-threshold change must not reset anim");
+        assert_eq!(task.anim_from, 0.4);
+    }
+
+    #[test]
+    fn progress_some_to_some_above_threshold_resets_animation() {
+        let mut task = test_task(Some(0.5));
+        task.apply_progress("jumped".into(), Some(0.7));
+        assert_eq!(task.fraction, Some(0.7));
+        assert_eq!(task.anim_t, 0.0, "real change must reset anim_t");
+        assert_eq!(
+            task.anim_from, 0.4,
+            "anim_from must snapshot display_fraction"
+        );
+    }
+
+    #[test]
+    fn progress_none_to_some_resets_animation() {
+        // Entering determinate from indeterminate must animate in, not jump.
+        let mut task = test_task(None);
+        task.apply_progress("found a fraction".into(), Some(0.2));
+        assert_eq!(task.fraction, Some(0.2));
+        assert_eq!(task.anim_t, 0.0, "None→Some must reset anim_t");
+        assert_eq!(task.anim_from, 0.4);
+    }
+
+    #[test]
+    fn progress_to_none_sets_indeterminate_without_animation_reset() {
+        // Entering indeterminate: the marquee runs off wall-clock, not
+        // smoothstep, so no anim reset is needed or expected.
+        let mut task = test_task(Some(0.5));
+        task.apply_progress("no measurable progress".into(), None);
+        assert_eq!(task.fraction, None);
+        assert_eq!(
+            task.anim_t, 1.0,
+            "Some→None must not touch the smoothstep state"
+        );
+    }
+
+    #[test]
+    fn complete_always_sets_full_determinate_bar() {
+        // Falsified by reverting `apply_complete` to leave `fraction`
+        // untouched: a task that was `None` would then never reach
+        // `Some(1.0)`, fail the `< 0.999` prune check's implicit
+        // determinate assumption, and the percent column would keep
+        // printing blank on a "completed" row.
+        let mut task = test_task(None);
+        let now = Instant::now();
+        task.apply_complete(now);
+        assert_eq!(task.fraction, Some(1.0));
+        assert_eq!(task.state, TaskState::Completed);
+        assert_eq!(task.completed_at, Some(now));
+        assert_eq!(
+            task.anim_t, 0.0,
+            "completion must restart the fill animation"
+        );
+        assert_eq!(task.anim_from, 0.4);
+    }
+
+    #[test]
+    fn fast_completed_task_never_becomes_visible() {
+        // Started and finished inside the threshold: must never render, even
+        // though "now" below is well past the threshold (mid post-complete
+        // linger) — gating on run duration, not wall-clock age, is the point.
+        let start = Instant::now();
+        let mut task = test_task(Some(1.0));
+        task.state = TaskState::Completed;
+        task.started_at = start;
+        task.completed_at = Some(start + Duration::from_millis(50));
+        let now = start + Duration::from_millis(200);
+        assert!(!task.is_visible(now));
+    }
+
+    #[test]
+    fn slow_completed_task_becomes_visible() {
+        let start = Instant::now();
+        let mut task = test_task(Some(1.0));
+        task.state = TaskState::Completed;
+        task.started_at = start;
+        task.completed_at = Some(start + Duration::from_millis(200));
+        assert!(task.is_visible(start + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn fast_error_task_is_always_visible() {
+        // Error is exempt from the threshold entirely.
+        let start = Instant::now();
+        let mut task = test_task(Some(1.0));
+        task.state = TaskState::Error;
+        task.started_at = start;
+        task.completed_at = Some(start + Duration::from_millis(50));
+        assert!(task.is_visible(start + Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn running_task_crosses_the_threshold_at_150ms() {
+        let start = Instant::now();
+        let mut task = test_task(Some(0.5));
+        task.state = TaskState::Running;
+        task.started_at = start;
+        assert!(!task.is_visible(start + Duration::from_millis(50)));
+        assert!(task.is_visible(start + Duration::from_millis(200)));
+    }
+
     #[test]
     fn frame_cache_eviction_keeps_the_window_around_the_playhead() {
         // A full 24 h timeline with every slot cached.
@@ -2978,6 +3215,27 @@ mod tests {
         }
     }
 
+    /// `note_frame_failure` has no seam to drive without a fully constructed
+    /// `App`, so this asserts the policy call it now delegates to
+    /// (`FRAME_RETRY_POLICY.delay_for(entry.attempts)`, `attempts` already
+    /// incremented to 1 on the first failure — see the doc comment on
+    /// `FRAME_RETRY_POLICY`) against today's hand-rolled sequence: 4, 8, 16,
+    /// 32, 64, then clamps to 90, and gives up at attempt 8.
+    #[test]
+    fn frame_retry_sequence_matches_today() {
+        let expected = [4u64, 8, 16, 32, 64, 90, 90];
+        for (i, secs) in expected.into_iter().enumerate() {
+            let attempts = i as u32 + 1; // first failure increments to 1 before use
+            assert_eq!(
+                FRAME_RETRY_POLICY.delay_for(attempts),
+                Duration::from_secs(secs),
+                "attempts {attempts}"
+            );
+        }
+        assert!(!FRAME_RETRY_POLICY.exhausted(7));
+        assert!(FRAME_RETRY_POLICY.exhausted(8));
+    }
+
     #[test]
     fn ring_distance_measures_across_the_wrap() {
         // 10 slots: index 0 is newest, 9 oldest, and playback joins them.
@@ -3010,6 +3268,42 @@ mod tests {
         assert!(kept.contains(&timestamps[286]));
         // The genuinely distant middle of the timeline is what goes.
         assert!(!kept.contains(&timestamps[144]));
+    }
+
+    fn dummy_obs_point() -> ObservationPoint {
+        ObservationPoint {
+            point: GeoPoint { lon: 0.0, lat: 0.0 },
+            world: WorldPoint { x: 0.0, y: 0.0 },
+            station_id: "test".into(),
+            wigos_id: "0-0-0-test".into(),
+            temperature: None,
+            wind_speed: None,
+            wind_direction: None,
+            humidity: None,
+            pressure: None,
+        }
+    }
+
+    #[test]
+    fn reset_obs_accumulator_clears_stale_partial_from_a_prior_refresh() {
+        // Refresh A accumulated data via PartialCommit (e.g. capitals phase)
+        // but never reached `Ready` — it errored out mid-flight, so
+        // `obs_partial` is left holding A's data.
+        let mut obs_incoming = vec![dummy_obs_point()];
+        let mut obs_incoming_id = 1u64;
+        let mut obs_partial = vec![dummy_obs_point(), dummy_obs_point()];
+
+        // Refresh B kicks off with a new id. It is about to produce zero
+        // `Point`s before erroring — the scenario the lazy, first-Point-only
+        // reset could never catch.
+        reset_obs_accumulator(&mut obs_incoming, &mut obs_incoming_id, &mut obs_partial, 2);
+
+        assert!(
+            obs_partial.is_empty(),
+            "A's stale partial state must not survive B's kickoff"
+        );
+        assert!(obs_incoming.is_empty());
+        assert_eq!(obs_incoming_id, 2);
     }
 
     #[test]
@@ -3109,5 +3403,29 @@ mod tests {
     fn unknown_slot_is_not_a_removal() {
         let ts = [500i64, 400, 300];
         assert!(timeline_without_phantom(&ts, 0, 999, 300, false).is_none());
+    }
+
+    /// A coarse GeoIP-only first fix (this dev box measures 10 km) must still
+    /// move the viewport to the fix's own point — it is far better than the
+    /// Europe fallback — even though the same fix is too imprecise to draw a
+    /// marker for. The display gate and the boot placement are independent.
+    #[test]
+    fn a_coarse_first_fix_still_moves_the_viewport_though_it_would_not_draw_a_marker() {
+        let fix = LocationFix::new(
+            GeoPoint::new(14.5, 46.0),
+            Some(10_000.0),
+            LocationSource::Ip,
+        );
+        assert!(
+            !fix.is_displayable(),
+            "sanity check: a 10 km fix must not be displayable"
+        );
+
+        let viewport = viewport_for_fix(&fix, None);
+        let expected = Viewport::from_lat_lon(46.0, 14.5, 5.0);
+        assert_eq!(
+            viewport.center, expected.center,
+            "viewport must centre on the fix's point regardless of accuracy"
+        );
     }
 }

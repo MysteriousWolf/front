@@ -1570,8 +1570,20 @@ pub struct ObservationPoint {
     pub point: GeoPoint,
     /// World-coordinate position (pre-computed).
     pub world: WorldPoint,
-    /// Station identifier or name.
+    /// Human-readable station name, falling back to the WIGOS id when the
+    /// name cache is cold. Not yet read anywhere for rendering.
     pub station_id: String,
+    /// WIGOS station identifier. Geometry-independent identity — stable
+    /// across fetch phases regardless of whether the name cache has warmed,
+    /// unlike `station_id`. Dedup keys on this field.
+    ///
+    /// `#[serde(default)]`: `ObservationPoint` is persisted in the on-disk
+    /// viewport cache (`DiskCacheEntry`); this keeps cache entries written by
+    /// an older build deserializable instead of dropping the whole layer on
+    /// upgrade. A migrated entry with an empty id only mis-dedups until the
+    /// short-lived cache TTL expires and a refetch repopulates it.
+    #[serde(default)]
+    pub wigos_id: String,
     /// Air temperature in °C.
     pub temperature: Option<f64>,
     /// Wind speed in m/s.

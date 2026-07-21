@@ -6,4 +6,5 @@ pub mod geo;
 pub mod keys;
 pub mod layers;
 pub mod providers;
+pub mod retry;
 pub mod ui;

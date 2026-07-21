@@ -88,7 +88,22 @@ impl LocationFix {
             None => self.source.label().to_string(),
         }
     }
+
+    /// Whether this fix is precise enough to draw a "you are here" marker.
+    ///
+    /// `None` accuracy fails the gate — consistent with the arbiter already
+    /// treating unknown as worse than any known accuracy — except for
+    /// [`Manual`](LocationSource::Manual), which is a user assertion
+    /// (`--lat/--lon`), not a measurement, and always renders.
+    pub fn is_displayable(&self) -> bool {
+        self.source == LocationSource::Manual
+            || self.accuracy_m.is_some_and(|a| a < DISPLAY_ACCURACY_M)
+    }
 }
+
+/// Largest horizontal error at which the marker still means something. Above
+/// this the dot would imply a precision the fix does not have.
+pub const DISPLAY_ACCURACY_M: f64 = 5_000.0;
 
 /// A fix is considered stale once it is this old.  A stale incumbent loses to
 /// any fresh fix regardless of accuracy, so a laptop that moved while the GPS
@@ -149,9 +164,7 @@ impl LocationArbiter {
 /// refine later over WiFi or GPS.
 fn is_better(candidate: &LocationFix, incumbent: &LocationFix) -> bool {
     match (candidate.accuracy_m, incumbent.accuracy_m) {
-        (Some(new), Some(old)) => {
-            new < old || (new == old && candidate.source > incumbent.source)
-        }
+        (Some(new), Some(old)) => new < old || (new == old && candidate.source > incumbent.source),
         (Some(_), None) => true,
         (None, Some(_)) => false,
         (None, None) => candidate.source > incumbent.source,
@@ -328,6 +341,34 @@ mod tests {
         arb.offer(fix(LocationSource::Ip, None));
         assert!(arb.offer(fix(LocationSource::Platform, None)));
         assert_eq!(arb.current().unwrap().source, LocationSource::Platform);
+    }
+
+    #[test]
+    fn accuracy_just_inside_the_threshold_is_displayable() {
+        assert!(fix(LocationSource::Platform, Some(4999.9)).is_displayable());
+    }
+
+    #[test]
+    fn accuracy_at_the_threshold_is_not_displayable() {
+        assert!(!fix(LocationSource::Platform, Some(5000.0)).is_displayable());
+    }
+
+    #[test]
+    fn unknown_accuracy_is_not_displayable() {
+        assert!(!fix(LocationSource::Platform, None).is_displayable());
+    }
+
+    #[test]
+    fn manual_fix_is_always_displayable_even_with_unknown_accuracy() {
+        // `--lat/--lon` produces exactly this shape: Manual with accuracy_m
+        // None. It is a user assertion, not a measurement, so the "None
+        // means hidden" rule must not apply to it.
+        assert!(fix(LocationSource::Manual, None).is_displayable());
+    }
+
+    #[test]
+    fn manual_fix_is_displayable_even_with_a_coarse_accuracy() {
+        assert!(fix(LocationSource::Manual, Some(50_000.0)).is_displayable());
     }
 
     #[test]

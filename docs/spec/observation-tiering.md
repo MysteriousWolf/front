@@ -69,3 +69,67 @@ Checkpoints 1, 2 and 6 are independent and can land in any order. 4 depends on 3
 | WIGOS ids turn out not to be stable across responses | low | Checkpoint 3 lands independently; if identity proves unstable, checkpoints 4-5 are abandoned and 1-2 still deliver the ordering requirement |
 
 ## Change log
+
+- **2026-07-20 — checkpoint 2 landed** (uncommitted). Cell fetch order is now
+  `(overlaps viewport desc, best city tier asc, centre distance asc)`, extracted
+  as pure `order_cells` alongside `CityTier`, `cell_tier` and `cell_bounds`
+  (`eumetnet.rs:152-235`). This matters because the budget can be exhausted
+  partway through a refresh, so fetch order decides what the user actually
+  receives; the previous nearest-centre-first sort was arbitrary with respect to
+  what was on screen.
+
+  Tier lookup takes the capitals and majors lists as slices rather than reading
+  the `EUROPEAN_*` constants directly, so tests can inject fixtures that vary
+  each sort key independently — which is what makes the precedence testable at
+  all. Overlap reuses the existing `Bounds::intersects` rather than a new
+  intersection test. When the viewport is unknown (`bounds: None`) the ordering
+  falls back to a whole-world box, so every cell overlaps and the order degrades
+  to tier-then-distance instead of behaving arbitrarily.
+
+- **2026-07-20 — checkpoint 3 landed** (uncommitted). `ObservationPoint` now
+  carries `wigos_id` (`src/layers.rs`) and all four dedup sites key on it
+  instead of the display name. The two construction sites were collapsed into
+  one pure `station_to_point` helper, which is what made the identity test
+  possible without an HTTP mock.
+
+  **`#[serde(default)]` on the new field required a second fix.**
+  `ObservationPoint` is persisted inside `DiskCacheEntry`, so a cache entry
+  written by a build predating `wigos_id` deserializes with every id defaulted
+  to `""`. Keying those through a plain `HashSet::insert` collapses them all
+  onto the single empty key — measured: a 3-station pre-upgrade layer survived
+  dedup as **1 station**, and would render that way until the 600 s viewport
+  TTL expired. Dedup now goes through `admit_point`, which admits an empty id
+  unconditionally instead of inserting it: a point with no identity cannot be
+  shown to duplicate anything, so the safe reading is "keep it". Ids repopulate
+  on the next successful fetch.
+
+  Closes follow-up `obs-station-identity-is-the-name`. Unblocks checkpoints 4
+  and 5, which still need the `/area` cap probe before they can start.
+
+- **2026-07-20 — checkpoint 6 landed** (uncommitted). `fetch_station_list` now
+  reserves through `try_spend` before its `/locations` GET, between the
+  fresh-cache early return and the network call; a refusal falls back to the
+  stale cache, matching the five existing degrade-gracefully returns in that
+  function. The budget is now a true total.
+
+  **The spec's own test recipe was wrong and was corrected during
+  implementation.** It proposed draining the budget to zero and asserting
+  `budget_remaining()` was unchanged. That is not falsifiable:
+  `RequestBudget::try_spend` only decrements on success, so a refused
+  reservation leaves the count at zero whether or not the reservation is
+  attempted — the assertion passes on the unfixed code. The test instead starts
+  with budget *available*, points at an unroutable endpoint, and asserts the
+  count drops by exactly 1 even though the request itself fails. Verified to
+  fail on the pre-fix code (`left: 40, right: 39`). Closes follow-up
+  `obs-station-list-off-budget`.
+
+- **2026-07-20 — checkpoint 1 landed** (`4d8bba2`). The two zoom cutoffs are now
+  one shared `OBS_TIER_ZOOM_CUTOFF = 5.5` in `src/geo.rs`; the regional backdrop
+  is gated behind the pure predicate `should_fetch_backdrop(zoom)` in
+  `src/providers/eumetnet.rs`. 5.5 was chosen over 5.0 because the viewport
+  query is the expensive one — deferring the switch to it keeps the anonymous
+  quota intact longer, at the cost of major-city stations rendering one display
+  tier later. `ALL_OBS_ZOOM_CUTOFF` (6.5) and `STATION_NAMES_ZOOM` (5.5) were
+  deliberately left alone: they gate display density, not the fetch/display tier
+  boundary. Closes follow-ups `obs-zoom-cutoff-mismatch` and
+  `obs-backdrop-not-zoom-gated`.

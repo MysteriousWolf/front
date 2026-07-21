@@ -108,6 +108,137 @@ fn should_fetch_backdrop(zoom: f64) -> bool {
     zoom < OBS_TIER_ZOOM_CUTOFF
 }
 
+/// Dedup admission: is this point new to `seen`?
+///
+/// Keyed on the WIGOS id, which — unlike the display name — does not change as
+/// the name cache warms.
+///
+/// An **empty** id is admitted unconditionally rather than inserted. Empty ids
+/// only arise from `#[serde(default)]` when an on-disk cache entry written by a
+/// build predating `wigos_id` is loaded. Inserting them would make every such
+/// point collide on the one empty key and collapse the whole cached layer to a
+/// single station — verified: a 3-station pre-upgrade entry survives as 1.
+/// A point with no identity cannot be shown to duplicate anything, so the safe
+/// reading is "keep it"; the ids repopulate on the next fetch.
+fn admit_point(seen: &mut HashSet<String>, wigos_id: &str) -> bool {
+    if wigos_id.is_empty() {
+        return true;
+    }
+    seen.insert(wigos_id.to_string())
+}
+
+/// Convert one parsed `AreaStation` into an `ObservationPoint`.
+///
+/// `station_id` (display name) is resolved from `names`, which may still be
+/// cold; `wigos_id` is carried straight through regardless, so identity never
+/// depends on whether the name cache has warmed up.
+fn station_to_point(s: AreaStation, names: &HashMap<String, String>) -> ObservationPoint {
+    ObservationPoint {
+        station_id: names
+            .get(&s.wigos_id)
+            .cloned()
+            .unwrap_or_else(|| s.wigos_id.clone()),
+        wigos_id: s.wigos_id.clone(),
+        point: GeoPoint::new(s.lon, s.lat),
+        world: lat_lon_to_world(s.lat, s.lon),
+        temperature: s.values.get("air_temperature").copied(),
+        wind_speed: s.values.get("wind_speed").copied(),
+        wind_direction: s.values.get("wind_from_direction").copied(),
+        humidity: s.values.get("relative_humidity").copied(),
+        pressure: s.values.get("air_pressure_at_mean_sea_level").copied(),
+    }
+}
+
+/// A cell's importance, used as the ordering's second sort key. Lower ranks
+/// come first — a capital-bearing cell is fetched before a major-city-only
+/// one, at equal viewport overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CityTier {
+    Capital,
+    Major,
+    None,
+}
+
+/// Best (lowest-rank) tier of any city in `capitals`/`majors` that snaps onto
+/// the `cell_deg` grid cell `(cell_lat, cell_lon)` — the same rounding
+/// `region_cells` uses to build cells, so tiers line up with how the cells
+/// were derived.
+fn cell_tier(
+    cell_lat: f64,
+    cell_lon: f64,
+    capitals: &[(f64, f64)],
+    majors: &[(f64, f64)],
+    cell_deg: f64,
+) -> CityTier {
+    let snaps_here = |&(lat, lon): &(f64, f64)| {
+        (lat / cell_deg).round() * cell_deg == cell_lat
+            && (lon / cell_deg).round() * cell_deg == cell_lon
+    };
+    if capitals.iter().any(snaps_here) {
+        CityTier::Capital
+    } else if majors.iter().any(snaps_here) {
+        CityTier::Major
+    } else {
+        CityTier::None
+    }
+}
+
+/// World-space bounding box of the `cell_deg`-wide cell centred on
+/// `(cell_lat, cell_lon)`, used for the viewport-overlap sort key.
+fn cell_bounds(cell_lat: f64, cell_lon: f64, cell_deg: f64) -> Bounds {
+    let half = cell_deg / 2.0;
+    let corner_a = lat_lon_to_world(cell_lat + half, cell_lon - half);
+    let corner_b = lat_lon_to_world(cell_lat - half, cell_lon + half);
+    Bounds {
+        min_x: corner_a.x.min(corner_b.x),
+        max_x: corner_a.x.max(corner_b.x),
+        min_y: corner_a.y.min(corner_b.y),
+        max_y: corner_a.y.max(corner_b.y),
+    }
+}
+
+/// Order cells by what the user gets first when the budget runs out partway:
+/// visible before invisible, important before minor, near before far.
+///
+/// `capitals`/`majors` supply the tier lookup and `cell_deg` must match the
+/// grid `cells` was built on (see `region_cells`); `viewport` and `center`
+/// are both in the same normalised world space as `cells`' cell centres once
+/// converted through `lat_lon_to_world`.
+fn order_cells(
+    cells: &[(f64, f64)],
+    capitals: &[(f64, f64)],
+    majors: &[(f64, f64)],
+    cell_deg: f64,
+    viewport: Bounds,
+    center: WorldPoint,
+) -> Vec<(f64, f64)> {
+    let mut out = cells.to_vec();
+    out.sort_by(|&(la, lo_a), &(lb, lo_b)| {
+        let overlap_a = viewport.intersects(cell_bounds(la, lo_a, cell_deg));
+        let overlap_b = viewport.intersects(cell_bounds(lb, lo_b, cell_deg));
+        // Descending: overlapping (true) sorts before non-overlapping.
+        overlap_b
+            .cmp(&overlap_a)
+            .then_with(|| {
+                let tier_a = cell_tier(la, lo_a, capitals, majors, cell_deg);
+                let tier_b = cell_tier(lb, lo_b, capitals, majors, cell_deg);
+                tier_a.cmp(&tier_b)
+            })
+            .then_with(|| {
+                let da = {
+                    let w = lat_lon_to_world(la, lo_a);
+                    (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
+                };
+                let db = {
+                    let w = lat_lon_to_world(lb, lo_b);
+                    (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
+                };
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    out
+}
+
 /// Distinct regional cell centres covering `points`.
 ///
 /// Points are snapped to a `cell_deg` grid and de-duplicated, so nearby cities
@@ -437,18 +568,24 @@ impl EumetnetProvider {
                 .chain(EUROPEAN_MAJOR_CITIES.iter())
                 .copied()
                 .collect();
-            let mut all_locations = region_cells(&cities, REGION_CELL_DEG);
-            all_locations.sort_by(|&(la, lo_a), &(lb, lo_b)| {
-                let da = {
-                    let w = lat_lon_to_world(la, lo_a);
-                    (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
-                };
-                let db = {
-                    let w = lat_lon_to_world(lb, lo_b);
-                    (w.x - center.x).powi(2) + (w.y - center.y).powi(2)
-                };
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            let cell_list = region_cells(&cities, REGION_CELL_DEG);
+            // A cell that overlaps nothing (bounds unknown) falls back to the
+            // full world so overlap can never disqualify a cell it has no
+            // evidence against — tier and distance still decide.
+            let viewport = bounds.unwrap_or(Bounds {
+                min_x: 0.0,
+                max_x: 1.0,
+                min_y: 0.0,
+                max_y: 1.0,
             });
+            let all_locations = order_cells(
+                &cell_list,
+                EUROPEAN_CAPITALS,
+                EUROPEAN_MAJOR_CITIES,
+                REGION_CELL_DEG,
+                viewport,
+                center,
+            );
 
             self.fetch_location_batch(
                 endpoint,
@@ -477,7 +614,7 @@ impl EumetnetProvider {
             if let Ok(pts) = task.await {
                 let mut sent_any = false;
                 for pt in pts {
-                    if seen_wigos.insert(pt.station_id.clone()) {
+                    if admit_point(&mut seen_wigos, &pt.wigos_id) {
                         let _ = point_tx.send(pt);
                         sent_any = true;
                     }
@@ -636,7 +773,7 @@ impl EumetnetProvider {
                         let key = (lat.to_bits(), lon.to_bits());
                         if let Some((pts, _)) = cache.get(&key) {
                             for pt in pts {
-                                if seen_wigos.insert(pt.station_id.clone()) {
+                                if admit_point(seen_wigos, &pt.wigos_id) {
                                     let _ = point_tx.send(pt.clone());
                                 }
                             }
@@ -658,7 +795,7 @@ impl EumetnetProvider {
                 match cache.get(&key) {
                     Some((pts, t)) if t.elapsed() < CAPITAL_DATA_TTL => {
                         for pt in pts {
-                            if seen_wigos.insert(pt.station_id.clone()) {
+                            if admit_point(seen_wigos, &pt.wigos_id) {
                                 let _ = point_tx.send(pt.clone());
                             }
                         }
@@ -743,19 +880,7 @@ impl EumetnetProvider {
                 AreaFetch::Ok(stations) => {
                     let pts: Vec<ObservationPoint> = stations
                         .into_iter()
-                        .map(|s| ObservationPoint {
-                            station_id: names
-                                .get(&s.wigos_id)
-                                .cloned()
-                                .unwrap_or_else(|| s.wigos_id.clone()),
-                            point: GeoPoint::new(s.lon, s.lat),
-                            world: lat_lon_to_world(s.lat, s.lon),
-                            temperature: s.values.get("air_temperature").copied(),
-                            wind_speed: s.values.get("wind_speed").copied(),
-                            wind_direction: s.values.get("wind_from_direction").copied(),
-                            humidity: s.values.get("relative_humidity").copied(),
-                            pressure: s.values.get("air_pressure_at_mean_sea_level").copied(),
-                        })
+                        .map(|s| station_to_point(s, names))
                         .collect();
                     {
                         let mut cache = cache.lock().await;
@@ -763,7 +888,7 @@ impl EumetnetProvider {
                     }
                     let mut sent_any = false;
                     for pt in pts {
-                        if seen_wigos.insert(pt.station_id.clone()) {
+                        if admit_point(seen_wigos, &pt.wigos_id) {
                             let _ = point_tx.send(pt);
                             sent_any = true;
                         }
@@ -843,6 +968,10 @@ impl EumetnetProvider {
         }
 
         // Cache miss or stale bounds-scoped entry — fetch the full collection.
+        if !self.try_spend().await {
+            return stale_cache.unwrap_or_default();
+        }
+
         let url = format!("{endpoint}/collections/{collection_id}/locations");
         let t = Instant::now();
         write_log(log, format!("eumetnet: fetching station list {url}"));
@@ -1102,16 +1231,7 @@ impl EumetnetProvider {
 
         stations
             .into_iter()
-            .map(|s| ObservationPoint {
-                point: GeoPoint::new(s.lon, s.lat),
-                world: lat_lon_to_world(s.lat, s.lon),
-                station_id: names.get(&s.wigos_id).cloned().unwrap_or(s.wigos_id),
-                temperature: s.values.get("air_temperature").copied(),
-                wind_speed: s.values.get("wind_speed").copied(),
-                wind_direction: s.values.get("wind_from_direction").copied(),
-                humidity: s.values.get("relative_humidity").copied(),
-                pressure: s.values.get("air_pressure_at_mean_sea_level").copied(),
-            })
+            .map(|s| station_to_point(s, names))
             .collect()
     }
 
@@ -1354,6 +1474,95 @@ mod tests {
         assert!(!should_fetch_backdrop(OBS_TIER_ZOOM_CUTOFF + 1.0));
     }
 
+    // ── WIGOS dedup identity ────────────────────────────────────────────
+
+    /// An on-disk cache entry written before `wigos_id` existed deserializes
+    /// with every id defaulted to `""`. Those points must all survive dedup.
+    ///
+    /// Keying them through a plain `HashSet::insert` collapses them onto the
+    /// single empty key: a 3-station pre-upgrade layer renders as 1 station
+    /// until the 10-minute viewport TTL expires. Verified before the guard
+    /// existed — survivors were 1 of 3.
+    #[test]
+    fn empty_wigos_ids_from_a_pre_upgrade_cache_all_survive_dedup() {
+        let old_layer = r#"{"points":[
+          {"point":{"lat":46.0,"lon":14.5},"world":{"x":0.5,"y":0.3},
+           "station_id":"Ljubljana","temperature":21.0,"wind_speed":null,
+           "wind_direction":null,"humidity":null,"pressure":null},
+          {"point":{"lat":48.2,"lon":16.4},"world":{"x":0.5,"y":0.3},
+           "station_id":"Vienna","temperature":19.0,"wind_speed":null,
+           "wind_direction":null,"humidity":null,"pressure":null},
+          {"point":{"lat":45.8,"lon":15.9},"world":{"x":0.5,"y":0.3},
+           "station_id":"Zagreb","temperature":23.0,"wind_speed":null,
+           "wind_direction":null,"humidity":null,"pressure":null}
+        ]}"#;
+        let layer: crate::layers::ObservationLayer =
+            serde_json::from_str(old_layer).expect("pre-upgrade entry must still deserialize");
+        assert_eq!(layer.points.len(), 3);
+        assert!(
+            layer.points.iter().all(|p| p.wigos_id.is_empty()),
+            "serde default must yield empty ids for the old format"
+        );
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let kept = layer
+            .points
+            .iter()
+            .filter(|p| admit_point(&mut seen, &p.wigos_id))
+            .count();
+        assert_eq!(
+            kept, 3,
+            "identity-less points must not collapse onto each other"
+        );
+    }
+
+    /// Real ids still dedup normally — the empty-id escape hatch must not
+    /// disable dedup for everything else.
+    #[test]
+    fn real_wigos_ids_still_dedup() {
+        let mut seen: HashSet<String> = HashSet::new();
+        assert!(admit_point(&mut seen, "0-20000-0-11035"));
+        assert!(!admit_point(&mut seen, "0-20000-0-11035"));
+        assert!(admit_point(&mut seen, "0-20000-0-06260"));
+    }
+
+    /// The same physical station reported cold (no name cache yet) and warm
+    /// (name cache populated later in the session) must dedup to one entry.
+    /// `station_id` legitimately differs between the two calls — that's the
+    /// conflation this checkpoint exists to stop dedup from keying on.
+    #[test]
+    fn wigos_dedup_key_is_stable_across_cold_and_warm_name_cache() {
+        let station = || AreaStation {
+            wigos_id: "0-20000-0-06260".to_string(),
+            lon: 5.18,
+            lat: 52.1,
+            values: HashMap::new(),
+        };
+
+        let cold_names: HashMap<String, String> = HashMap::new();
+        let mut warm_names: HashMap<String, String> = HashMap::new();
+        warm_names.insert("0-20000-0-06260".to_string(), "De Bilt".to_string());
+
+        let phase1 = station_to_point(station(), &cold_names);
+        let phase2 = station_to_point(station(), &warm_names);
+
+        // Sanity check that this scenario actually reproduces the
+        // conflation: the display name differs between phases.
+        assert_ne!(phase1.station_id, phase2.station_id);
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut surviving = 0;
+        for pt in [phase1, phase2] {
+            if seen.insert(pt.wigos_id.clone()) {
+                surviving += 1;
+            }
+        }
+        assert_eq!(
+            surviving, 1,
+            "same station across a cold/warm name cache must dedup to one entry"
+        );
+    }
+
     // ── region clustering ──────────────────────────────────────────────
 
     /// The regression that made observations appear at random: 113 city boxes
@@ -1414,6 +1623,91 @@ mod tests {
                 "city {lat},{lon} is not covered by any cell"
             );
         }
+    }
+
+    // ── order_cells ────────────────────────────────────────────────────
+
+    /// Equator/prime-meridian centre, shared by the three tests below so
+    /// distance comparisons line up with the symmetric fixture cells.
+    fn equator_center() -> WorldPoint {
+        lat_lon_to_world(0.0, 0.0)
+    }
+
+    /// Overlap must win regardless of tier or distance: two cells at equal
+    /// distance from centre, neither holding a tiered city, one overlapping
+    /// the viewport and one not.
+    #[test]
+    fn order_cells_prefers_viewport_overlap_at_equal_tier_and_distance() {
+        let overlapping = (0.0, 12.0); // world x ~0.533, box x ~[0.517, 0.55]
+        let non_overlapping = (0.0, -12.0); // world x ~0.467, box x ~[0.45, 0.483]
+        let viewport = Bounds {
+            min_x: 0.52,
+            max_x: 0.6,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
+
+        let ordered = order_cells(
+            &[non_overlapping, overlapping],
+            &[],
+            &[],
+            REGION_CELL_DEG,
+            viewport,
+            equator_center(),
+        );
+
+        assert_eq!(ordered, vec![overlapping, non_overlapping]);
+    }
+
+    /// Tier must win when overlap is tied: two cells at equal distance from
+    /// centre, both inside the viewport, one holding a capital and one
+    /// holding only a major city.
+    #[test]
+    fn order_cells_prefers_capital_tier_at_equal_overlap_and_distance() {
+        let capital_cell = (0.0, 12.0);
+        let major_cell = (0.0, -12.0);
+        let whole_world = Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
+
+        let ordered = order_cells(
+            &[major_cell, capital_cell],
+            &[(0.0, 12.0)],
+            &[(0.0, -12.0)],
+            REGION_CELL_DEG,
+            whole_world,
+            equator_center(),
+        );
+
+        assert_eq!(ordered, vec![capital_cell, major_cell]);
+    }
+
+    /// Distance must decide when overlap and tier are tied: two untiered
+    /// cells both inside the viewport, one nearer to centre than the other.
+    #[test]
+    fn order_cells_prefers_nearer_cell_at_equal_overlap_and_tier() {
+        let near = (0.0, 12.0);
+        let far = (0.0, 24.0);
+        let whole_world = Bounds {
+            min_x: 0.0,
+            max_x: 1.0,
+            min_y: 0.0,
+            max_y: 1.0,
+        };
+
+        let ordered = order_cells(
+            &[far, near],
+            &[],
+            &[],
+            REGION_CELL_DEG,
+            whole_world,
+            equator_center(),
+        );
+
+        assert_eq!(ordered, vec![near, far]);
     }
 
     // ── RequestBudget ──────────────────────────────────────────────────
@@ -1477,6 +1771,82 @@ mod tests {
             ..EumetnetConfig::default()
         };
         assert_eq!(cfg.hourly_quota(), crate::config::ANON_HOURLY_QUOTA);
+    }
+
+    // ── fetch_station_list budget reservation ───────────────────────────
+
+    /// `fetch_station_list` must reserve budget through `try_spend` before
+    /// firing its `/locations` request, or the client-side budget under-counts
+    /// what the gateway actually sees. A cache miss against an unroutable
+    /// endpoint still spends one unit even though the request itself fails,
+    /// proving the reservation happens ahead of the network call rather than
+    /// never happening at all.
+    #[tokio::test]
+    async fn fetch_station_list_reserves_budget_before_the_network_request() {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("front-eumetnet-test-{nanos}"));
+        let log_path = base.join("front.log");
+        let dirs = FrontDirs {
+            config_dir: base.clone(),
+            cache_dir: base.clone(),
+            maps_dir: base.clone(),
+            radar_dir: base.clone(),
+            log_path: log_path.clone(),
+        };
+        let stations_cache_path = base.join("stations.json");
+
+        // Populate a stale (past the 24 h fresh TTL, but usable as a
+        // fallback) station-list cache so a network failure has something to
+        // degrade to.
+        let stale = StationListEntry {
+            bounds: None,
+            stations: vec![StationInfo {
+                wigos_id: "0-20000-0-99999".to_string(),
+                name: "Test Station".to_string(),
+                lon: 14.5,
+                lat: 46.0,
+            }],
+        };
+        write_atomic(&stations_cache_path, &serde_json::to_vec(&stale).unwrap()).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&stations_cache_path)
+            .unwrap();
+        file.set_modified(SystemTime::now() - STATION_LIST_TTL - Duration::from_secs(3600))
+            .unwrap();
+        drop(file);
+
+        let provider = EumetnetProvider::new(Client::new(), dirs, EumetnetConfig::default());
+
+        let before = provider.budget_remaining().await;
+        assert!(before > 0, "test needs budget available to spend");
+
+        // Nothing listens here, so the request fails fast; the point is
+        // whether budget was reserved *before* that failure.
+        let result = provider
+            .fetch_station_list(
+                &stations_cache_path,
+                "http://127.0.0.1:1",
+                "observations",
+                &log_path,
+            )
+            .await;
+
+        // Network failed, so the stale cache is what comes back.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].wigos_id, "0-20000-0-99999");
+
+        let after = provider.budget_remaining().await;
+        assert_eq!(
+            after,
+            before - 1,
+            "fetch_station_list must call try_spend before issuing its /locations request"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── normalize_station_name ─────────────────────────────────────────
