@@ -6,3 +6,4 @@ pub mod location;
 pub mod maps;
 pub mod meteoalarm;
 pub mod meteogate;
+pub mod verify;

@@ -17,6 +17,7 @@ use crate::geo::{
     EUROPEAN_MAJOR_CITIES, EUROPE_LAT, EUROPE_LON, OBS_TIER_ZOOM_CUTOFF,
 };
 use crate::layers::{ObservationLayer, ObservationPoint};
+use crate::providers::verify::{classify_verify_status, VerifyOutcome};
 
 // ---------------------------------------------------------------------------
 // Disk-cache helpers
@@ -527,6 +528,33 @@ impl EumetnetProvider {
         } else {
             req.header("apikey", key)
         }
+    }
+
+    /// Check a **candidate** API key against the live gateway — the staged
+    /// value from the settings modal, not necessarily `self.config.api_key`.
+    ///
+    /// Hits the cheapest authed collection endpoint (`/locations`, a small
+    /// station list, versus the much larger `/area` response) with the
+    /// candidate key attached the same way [`Self::authed`] attaches the
+    /// configured one. Never logs the key itself — only the classified
+    /// outcome.
+    pub async fn verify_api_key(&self, candidate_key: &str) -> VerifyOutcome {
+        let key = candidate_key.trim();
+        let url = format!(
+            "{}/collections/observations/locations",
+            self.config.surface_endpoint
+        );
+        let mut req = self.client.get(&url);
+        if !key.is_empty() {
+            req = req.header("apikey", key);
+        }
+        let status = req.send().await.ok().map(|r| r.status().as_u16());
+        let outcome = classify_verify_status(status);
+        write_log(
+            &self.dirs.log_path,
+            format!("eumetnet: verify probe -> {outcome:?}"),
+        );
+        outcome
     }
 
     // ------------------------------------------------------------------
@@ -1198,9 +1226,11 @@ impl EumetnetProvider {
         let entries = {
             let cache = self.location_cache.lock().await;
             backdrop_to_disk(
-                cache.iter().map(|(&(lat_bits, lon_bits), (points, fetched))| {
-                    (lat_bits, lon_bits, fetched.elapsed(), points.clone())
-                }),
+                cache
+                    .iter()
+                    .map(|(&(lat_bits, lon_bits), (points, fetched))| {
+                        (lat_bits, lon_bits, fetched.elapsed(), points.clone())
+                    }),
                 now_unix,
                 BACKDROP_HISTORY_TTL,
             )
@@ -1647,7 +1677,12 @@ mod tests {
     #[test]
     fn backdrop_round_trip_preserves_key_points_and_age() {
         let now = 100_000u64;
-        let cells = vec![(1u64, 2u64, Duration::from_secs(3600), vec![obs_point("0-1")])];
+        let cells = vec![(
+            1u64,
+            2u64,
+            Duration::from_secs(3600),
+            vec![obs_point("0-1")],
+        )];
         let disk = backdrop_to_disk(cells.into_iter(), now, BACKDROP_HISTORY_TTL);
         assert_eq!(disk.len(), 1);
         assert_eq!(disk[0].fetched_unix, now - 3600);
@@ -1665,7 +1700,12 @@ mod tests {
     #[test]
     fn backdrop_to_disk_drops_cells_older_than_the_retention_window() {
         let cells = vec![
-            (1u64, 1u64, BACKDROP_HISTORY_TTL + Duration::from_secs(1), vec![]),
+            (
+                1u64,
+                1u64,
+                BACKDROP_HISTORY_TTL + Duration::from_secs(1),
+                vec![],
+            ),
             (2u64, 2u64, Duration::from_secs(3600), vec![]),
         ];
         let disk = backdrop_to_disk(cells.into_iter(), 100_000, BACKDROP_HISTORY_TTL);

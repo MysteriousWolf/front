@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::cache::write_atomic;
 use crate::geo::{EUROPE_LAT, EUROPE_LON, EUROPE_ZOOM};
@@ -406,6 +407,77 @@ api_key = "{eu_key}"
     }
 }
 
+// ---------------------------------------------------------------------------
+// Surgical config write-back (settings editor persistence primitive)
+// ---------------------------------------------------------------------------
+
+/// A single key edit for [`apply_config_edits`]: a dotted key path
+/// (`"meteogate.api_key"`) and the new value.
+#[derive(Debug, Clone)]
+pub struct ConfigEdit {
+    pub key: String,
+    pub value: ConfigEditValue,
+}
+
+/// The value types the settings editor writes: secret strings and bool
+/// preferences. Extend as new field types are added.
+#[derive(Debug, Clone)]
+pub enum ConfigEditValue {
+    Str(String),
+    Bool(bool),
+}
+
+/// Surgically update named keys in an existing `config.toml`, in place.
+///
+/// Unlike [`Config::write_default`], this never regenerates the file: it
+/// parses the existing document, mutates only the given dotted keys
+/// (creating missing tables/keys as needed), and writes the result back
+/// through the atomic-write path. Comments, key ordering, and any
+/// hand-added keys the user wrote elsewhere in the file are left untouched.
+///
+/// Refuses to save — returns an error — if the existing file cannot be
+/// parsed as TOML, rather than silently clobbering it with a fresh default.
+pub fn apply_config_edits(path: &Path, edits: &[ConfigEdit]) -> color_eyre::eyre::Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(color_eyre::eyre::eyre!(
+                "read config {}: {e}",
+                path.display()
+            ))
+        }
+    };
+    let mut doc: DocumentMut = content
+        .parse()
+        .map_err(|e| color_eyre::eyre::eyre!("parse config {}: {e}", path.display()))?;
+
+    for edit in edits {
+        let mut segments = edit.key.split('.').peekable();
+        let mut table: &mut Table = doc.as_table_mut();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_some() {
+                let entry = table
+                    .entry(segment)
+                    .or_insert_with(|| Item::Table(Table::new()));
+                if entry.as_table().is_none() {
+                    *entry = Item::Table(Table::new());
+                }
+                table = entry
+                    .as_table_mut()
+                    .expect("entry was just forced to Item::Table above");
+            } else {
+                match &edit.value {
+                    ConfigEditValue::Str(s) => table[segment] = toml_edit::value(s.as_str()),
+                    ConfigEditValue::Bool(b) => table[segment] = toml_edit::value(*b),
+                }
+            }
+        }
+    }
+
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
 impl StateConfig {
     /// Load runtime state from a TOML file.
     pub fn load(path: &Path) -> color_eyre::eyre::Result<Option<Self>> {
@@ -542,6 +614,122 @@ mod tests {
             loaded.render_modes.is_empty(),
             "no render_modes in legacy TOML"
         );
+    }
+
+    /// Editing one key must preserve surrounding comments and a hand-added
+    /// extra key the user wrote outside the generated schema, and the edited
+    /// key must round-trip to the new value on re-read.
+    #[test]
+    fn test_apply_config_edits_preserves_comments_and_extra_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "front-config-edit-test-{}-{}",
+            std::process::id(),
+            "preserve"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# top-of-file comment
+[meteogate]
+# a comment right above the key
+api_key = "old-key"
+my_extra_hand_written_setting = "keep-me"
+s3_endpoint = "https://s3.example.invalid"
+"#,
+        )
+        .unwrap();
+
+        apply_config_edits(
+            &path,
+            &[ConfigEdit {
+                key: "meteogate.api_key".to_string(),
+                value: ConfigEditValue::Str("new-key".to_string()),
+            }],
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# top-of-file comment"),
+            "top-of-file comment must survive: {written}"
+        );
+        assert!(
+            written.contains("# a comment right above the key"),
+            "comment above edited key must survive: {written}"
+        );
+        assert!(
+            written.contains("my_extra_hand_written_setting = \"keep-me\""),
+            "hand-added extra key must survive: {written}"
+        );
+
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.meteogate.api_key, "new-key");
+        assert_eq!(reloaded.meteogate.s3_endpoint, "https://s3.example.invalid");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_apply_config_edits_bool_and_string_and_missing_section() {
+        let dir = std::env::temp_dir().join(format!(
+            "front-config-edit-test-{}-{}",
+            std::process::id(),
+            "missing-section"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // No [location] section at all -- predates that field, per the spec risk.
+        std::fs::write(&path, "[viewport]\nlat = 46.05\n").unwrap();
+
+        apply_config_edits(
+            &path,
+            &[
+                ConfigEdit {
+                    key: "location.ip_fallback".to_string(),
+                    value: ConfigEditValue::Bool(false),
+                },
+                ConfigEdit {
+                    key: "eumetnet.api_key".to_string(),
+                    value: ConfigEditValue::Str("euk".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert!(!reloaded.location.ip_fallback);
+        assert_eq!(reloaded.eumetnet.api_key, "euk");
+        assert_eq!(reloaded.viewport.lat, 46.05);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_apply_config_edits_refuses_malformed_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "front-config-edit-test-{}-{}",
+            std::process::id(),
+            "malformed"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is [ not valid toml").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = apply_config_edits(
+            &path,
+            &[ConfigEdit {
+                key: "meteogate.api_key".to_string(),
+                value: ConfigEditValue::Str("new-key".to_string()),
+            }],
+        );
+
+        assert!(result.is_err(), "malformed file must be refused");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "malformed file must be left untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

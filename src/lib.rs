@@ -7,4 +7,5 @@ pub mod keys;
 pub mod layers;
 pub mod providers;
 pub mod retry;
+pub mod settings;
 pub mod ui;

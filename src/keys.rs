@@ -41,6 +41,7 @@ pub enum Action {
     ExitGroup,
     RefetchMap,
     OpenSearch,
+    OpenSettings,
 }
 
 /// The help modal's sections, rendered in declaration order.
@@ -144,7 +145,7 @@ pub static BINDINGS: &[Binding] = &[
         description: "move the viewport",
         chords: &[Chord::plain(KeyCode::Left)],
         help_keys: Some("← ↑ ↓ →"),
-        footer: hint("arrows", "pan", 2),
+        footer: hint("arrows", "pan", 3),
     },
     Binding {
         action: Some(Action::PanRight),
@@ -183,7 +184,7 @@ pub static BINDINGS: &[Binding] = &[
             Chord::plain(KeyCode::Char('=')),
         ],
         help_keys: Some("+ / -"),
-        footer: hint("+/-", "zoom", 3),
+        footer: hint("+/-", "zoom", 4),
     },
     Binding {
         action: Some(Action::ZoomOut),
@@ -220,7 +221,7 @@ pub static BINDINGS: &[Binding] = &[
         description: "back / forward one radar frame",
         chords: &[Chord::plain(KeyCode::Char(']'))],
         help_keys: Some("] / ["),
-        footer: hint("[/]", "frame", 4),
+        footer: hint("[/]", "frame", 5),
     },
     Binding {
         action: Some(Action::FrameForward),
@@ -238,7 +239,7 @@ pub static BINDINGS: &[Binding] = &[
         description: "animate the loaded frames",
         chords: &[Chord::plain(KeyCode::Char(' '))],
         help_keys: Some("space"),
-        footer: hint("space", "play", 5),
+        footer: hint("space", "play", 6),
     },
     Binding {
         action: Some(Action::JumpToLive),
@@ -247,7 +248,7 @@ pub static BINDINGS: &[Binding] = &[
         description: "return to the newest frame",
         chords: &[Chord::plain(KeyCode::Char('0'))],
         help_keys: Some("0"),
-        footer: hint("0", "live", 6),
+        footer: hint("0", "live", 7),
     },
     Binding {
         action: Some(Action::SpeedFaster),
@@ -274,7 +275,7 @@ pub static BINDINGS: &[Binding] = &[
         description: "cycle 3 / 6 / 12 / 24 hours",
         chords: &[Chord::plain(KeyCode::Char('i'))],
         help_keys: Some("i"),
-        footer: hint("i", "history", 7),
+        footer: hint("i", "history", 8),
     },
     // ── Layers ──────────────────────────────────────────────────────────
     Binding {
@@ -284,7 +285,7 @@ pub static BINDINGS: &[Binding] = &[
         description: "enable or disable the selection",
         chords: &[Chord::plain(KeyCode::Enter)],
         help_keys: Some("enter"),
-        footer: hint("enter", "toggle", 8),
+        footer: hint("enter", "toggle", 9),
     },
     Binding {
         action: Some(Action::SelectPrevious),
@@ -310,10 +311,7 @@ pub static BINDINGS: &[Binding] = &[
         category: Category::Layers,
         description: "enter / leave the selected layer's options",
         // Enhanced terminals send Alt+arrow; Terminal.app sends ESC+f/b.
-        chords: &[
-            Chord::alt(KeyCode::Right),
-            Chord::alt(KeyCode::Char('f')),
-        ],
+        chords: &[Chord::alt(KeyCode::Right), Chord::alt(KeyCode::Char('f'))],
         help_keys: Some("alt+←→"),
         footer: None,
     },
@@ -322,10 +320,7 @@ pub static BINDINGS: &[Binding] = &[
         name: "Leave layer options",
         category: Category::Layers,
         description: "step back out to the layer list",
-        chords: &[
-            Chord::alt(KeyCode::Left),
-            Chord::alt(KeyCode::Char('b')),
-        ],
+        chords: &[Chord::alt(KeyCode::Left), Chord::alt(KeyCode::Char('b'))],
         help_keys: None,
         footer: None,
     },
@@ -373,7 +368,16 @@ pub static BINDINGS: &[Binding] = &[
         description: "type a place name, enter to pin it",
         chords: &[Chord::plain(KeyCode::Char('/'))],
         help_keys: Some("/"),
-        footer: hint("/", "search", 9),
+        footer: hint("/", "search", 10),
+    },
+    Binding {
+        action: Some(Action::OpenSettings),
+        name: "Settings",
+        category: Category::General,
+        description: "edit the EUMETNET API key / IP fallback",
+        chords: &[Chord::plain(KeyCode::Char('s'))],
+        help_keys: Some("s"),
+        footer: hint("s", "settings", 2),
     },
     Binding {
         action: Some(Action::RefetchMap),
@@ -389,10 +393,7 @@ pub static BINDINGS: &[Binding] = &[
         name: "Quit",
         category: Category::General,
         description: "saves the viewport and layer state",
-        chords: &[
-            Chord::plain(KeyCode::Char('q')),
-            Chord::plain(KeyCode::Esc),
-        ],
+        chords: &[Chord::plain(KeyCode::Char('q')), Chord::plain(KeyCode::Esc)],
         help_keys: Some("q / esc"),
         footer: hint("q", "quit", 0),
     },
@@ -406,11 +407,55 @@ pub static BINDINGS: &[Binding] = &[
 /// folded it into the character itself — `+` arrives as Shift+`+` on many
 /// layouts and must still match a plain `+` chord.
 fn normalize(key: KeyEvent) -> (KeyCode, KeyModifiers) {
-    let mut mods = key.modifiers & (KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
+    let mut mods =
+        key.modifiers & (KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
     if matches!(key.code, KeyCode::Char(_)) {
         mods.remove(KeyModifiers::SHIFT);
     }
     (key.code, mods)
+}
+
+/// An action the settings modal's keyboard takeover derives from a raw key
+/// press. Kept pure and separate from `ui.rs` so the mapping is
+/// unit-testable without a terminal. The focused field is edited in place, so
+/// printables and Backspace only bite once a field is being edited — see
+/// `docs/spec/tui-config-editor.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsKeyAction {
+    /// Ctrl-C — quits the whole app, even mid-edit.
+    Quit,
+    FocusPrev,
+    FocusNext,
+    /// Left or Right — flips the focused bool field while editing it.
+    ToggleBool,
+    /// Enter — start editing the focused field, or save the edit in progress
+    /// (a changed key is verified automatically on save).
+    Confirm,
+    /// Esc — cancel the edit in progress, or close the modal when not editing.
+    Back,
+    PushChar(char),
+    Backspace,
+}
+
+/// Map a raw key press to a [`SettingsKeyAction`] while the settings modal
+/// owns the keyboard. `None` for keys the modal ignores.
+pub fn settings_key_action(key: KeyEvent) -> Option<SettingsKeyAction> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Some(SettingsKeyAction::Quit),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Up => Some(SettingsKeyAction::FocusPrev),
+        KeyCode::Down => Some(SettingsKeyAction::FocusNext),
+        KeyCode::Left | KeyCode::Right => Some(SettingsKeyAction::ToggleBool),
+        KeyCode::Enter => Some(SettingsKeyAction::Confirm),
+        KeyCode::Esc => Some(SettingsKeyAction::Back),
+        KeyCode::Backspace => Some(SettingsKeyAction::Backspace),
+        KeyCode::Char(c) => Some(SettingsKeyAction::PushChar(c)),
+        _ => None,
+    }
 }
 
 /// The action bound to `key`, if any.
@@ -418,11 +463,7 @@ pub fn resolve(key: KeyEvent) -> Option<Action> {
     let (code, mods) = normalize(key);
     BINDINGS
         .iter()
-        .find(|b| {
-            b.chords
-                .iter()
-                .any(|c| c.code == code && c.mods == mods)
-        })
+        .find(|b| b.chords.iter().any(|c| c.code == code && c.mods == mods))
         .and_then(|b| b.action)
 }
 
@@ -434,7 +475,9 @@ pub fn footer_hints() -> Vec<&'static FooterHint> {
 }
 
 /// The help rows for `category`, in registry order: `(keys, name, description)`.
-pub fn help_rows(category: Category) -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+pub fn help_rows(
+    category: Category,
+) -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
     BINDINGS.iter().filter_map(move |b| {
         if b.category != category {
             return None;
@@ -455,7 +498,10 @@ mod tests {
     /// survives a narrow terminal depend on declaration order.
     #[test]
     fn footer_hint_ranks_are_unique() {
-        let mut ranks: Vec<u8> = BINDINGS.iter().filter_map(|b| b.footer.map(|f| f.rank)).collect();
+        let mut ranks: Vec<u8> = BINDINGS
+            .iter()
+            .filter_map(|b| b.footer.map(|f| f.rank))
+            .collect();
         ranks.sort_unstable();
         let mut deduped = ranks.clone();
         deduped.dedup();
@@ -551,5 +597,87 @@ mod tests {
                 assert!(b.chords.is_empty(), "{} is unreachable", b.name);
             }
         }
+    }
+
+    // -- Settings modal key mapping ------------------------------------
+
+    #[test]
+    fn ctrl_c_quits_the_settings_modal() {
+        assert_eq!(
+            settings_key_action(press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(SettingsKeyAction::Quit)
+        );
+    }
+
+    #[test]
+    fn ctrl_r_and_ctrl_v_are_unbound_in_settings() {
+        // Reveal is automatic on focus and verify is automatic on save, so
+        // neither has a manual chord anymore — both fall through to None.
+        assert_eq!(
+            settings_key_action(press(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            settings_key_action(press(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn arrows_move_focus_and_left_right_toggle_bool() {
+        assert_eq!(
+            settings_key_action(press(KeyCode::Up, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::FocusPrev)
+        );
+        assert_eq!(
+            settings_key_action(press(KeyCode::Down, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::FocusNext)
+        );
+        assert_eq!(
+            settings_key_action(press(KeyCode::Left, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::ToggleBool)
+        );
+        assert_eq!(
+            settings_key_action(press(KeyCode::Right, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::ToggleBool)
+        );
+    }
+
+    #[test]
+    fn enter_confirms_and_esc_backs_out() {
+        assert_eq!(
+            settings_key_action(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::Confirm)
+        );
+        assert_eq!(
+            settings_key_action(press(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::Back)
+        );
+    }
+
+    #[test]
+    fn printable_chars_push_and_backspace_deletes() {
+        assert_eq!(
+            settings_key_action(press(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(SettingsKeyAction::PushChar('a'))
+        );
+        // A space must still edit the field — bool toggling is Left/Right
+        // only, so a secret can contain a literal space.
+        assert_eq!(
+            settings_key_action(press(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(SettingsKeyAction::PushChar(' '))
+        );
+        assert_eq!(
+            settings_key_action(press(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(SettingsKeyAction::Backspace)
+        );
+    }
+
+    #[test]
+    fn unhandled_keys_resolve_to_none() {
+        assert_eq!(
+            settings_key_action(press(KeyCode::F(1), KeyModifiers::NONE)),
+            None
+        );
     }
 }

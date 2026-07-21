@@ -15,7 +15,9 @@ use tokio::task::JoinHandle;
 
 use crate::cache::{write_log, FrontDirs};
 use crate::cli::Cli;
-use crate::config::{Config, LayerRenderMode, StateConfig};
+use crate::config::{
+    apply_config_edits, Config, ConfigEditValue, EumetnetConfig, LayerRenderMode, StateConfig,
+};
 use crate::geo::{haversine_m, world_to_lat_lon, GeoPoint, Viewport, WorldPoint};
 use crate::layers::{
     resolution_distance, BorderLayer, BorderLine, BorderLineKind, BorderResolution, LayerId,
@@ -28,7 +30,9 @@ use crate::providers::location::{LocationArbiter, LocationFix, LocationSource};
 use crate::providers::maps::NaturalEarthProvider;
 use crate::providers::meteoalarm::MeteoAlarmProvider;
 use crate::providers::meteogate::MeteoGateProvider;
+use crate::providers::verify::VerifyOutcome;
 use crate::retry::RetryPolicy;
+use crate::settings::SettingsModel;
 use crate::ui::BrailleFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +360,21 @@ pub struct App {
     location: LocationArbiter,
     /// The `/` prompt's buffer while open; `None` when the prompt is closed.
     pub search_input: Option<String>,
+    /// The settings modal's editing session; `Some` while open. One overlay
+    /// at a time — guarded against opening alongside the search prompt or
+    /// help modal in `open_settings`.
+    pub settings: Option<SettingsState>,
+    /// Screen rects of clickable provider links in the settings modal, recorded
+    /// by the renderer each frame as `(x, y, width, url)` so the event loop can
+    /// hit-test a click and open the browser. Only meaningful while the modal
+    /// is open; stale entries are never read otherwise.
+    pub settings_links: Vec<(u16, u16, u16, &'static str)>,
+    /// Index into `settings_links` the mouse is currently hovering, if any —
+    /// drives the link's hover highlight.
+    pub settings_link_hover: Option<usize>,
+    /// Index into `settings_links` currently pressed (left button down on it) —
+    /// drives the link's pressed (inverted) style until the button releases.
+    pub settings_link_pressed: Option<usize>,
     /// Status line shown under the prompt: the matched place, "searching…",
     /// or why the search failed.
     pub search_status: Option<String>,
@@ -363,6 +382,10 @@ pub struct App {
     search_pin: Option<GeoPoint>,
     pub dirs: FrontDirs,
     pub config: Config,
+    /// HTTP client shared with every provider. `Client` is cheap to clone
+    /// (internally `Arc`-backed), kept here so an edited provider can be
+    /// rebuilt (see `rebuild_eumetnet_provider`) without re-building a client.
+    client: Client,
     pub warning_layer: Option<WarningLayer>,
     pub obs_cache: Option<ObservationLayer>,
     /// Points streaming in from the in-flight observation refresh.
@@ -431,6 +454,15 @@ pub struct App {
     warn_rx: UnboundedReceiver<WarnRefreshResult>,
     warn_task: Option<JoinHandle<()>>,
     warn_refresh_id: u64,
+    verify_tx: UnboundedSender<VerifyResult>,
+    verify_rx: UnboundedReceiver<VerifyResult>,
+    verify_task: Option<JoinHandle<()>>,
+    verify_refresh_id: u64,
+    /// Outcome of the most recently completed verify probe, keyed by which
+    /// provider it targeted. Overwritten by each new verify; CP-5 reads this
+    /// to render Valid/Invalid/Unreachable next to the field. `None` until
+    /// the first verify for that target completes.
+    pub last_verify: Option<(VerifyTarget, VerifyOutcome)>,
     /// Fixes from every location backend.  `None` when location is disabled
     /// (`--no-location`) or fixed by `--lat/--lon`, in which case no backend
     /// is ever started.
@@ -505,6 +537,7 @@ impl App {
         let (border_tx, border_rx) = unbounded_channel();
         let (obs_tx, obs_rx) = unbounded_channel();
         let (warn_tx, warn_rx) = unbounded_channel();
+        let (verify_tx, verify_rx) = unbounded_channel();
         let (search_tx, search_rx) = unbounded_channel();
         let (location_label_tx, location_label_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
@@ -526,7 +559,7 @@ impl App {
             cancel.clone(),
         );
         let eumetnet = EumetnetProvider::new(client.clone(), dirs.clone(), config.eumetnet.clone());
-        let maps = NaturalEarthProvider::new(client, dirs.clone(), cancel.clone());
+        let maps = NaturalEarthProvider::new(client.clone(), dirs.clone(), cancel.clone());
         let mut app = Self {
             viewport,
             layers: LayerRegistry::new(),
@@ -553,6 +586,10 @@ impl App {
             location,
             location_rx,
             search_input: None,
+            settings: None,
+            settings_links: Vec::new(),
+            settings_link_hover: None,
+            settings_link_pressed: None,
             search_status: None,
             search_pin: None,
             geocode: Arc::new(
@@ -588,6 +625,7 @@ impl App {
             radar_preload_rx,
             dirs,
             config,
+            client,
             maps,
             meteogate,
             meteoalarm,
@@ -610,6 +648,11 @@ impl App {
             warn_rx,
             warn_task: None,
             warn_refresh_id: 0,
+            verify_tx,
+            verify_rx,
+            verify_task: None,
+            verify_refresh_id: 0,
+            last_verify: None,
             task_tx,
             task_rx,
             active_tasks: Vec::new(),
@@ -1175,6 +1218,96 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Spawn a background verify probe for `target` against `candidate_key`
+    /// — the staged value in the settings modal, not necessarily the stored
+    /// config value — and report through the task overlay as an
+    /// indeterminate task (CP-5 will call this from the modal). The outcome
+    /// is delivered back via `drain_verify_results` into `self.last_verify`.
+    pub fn request_verify(&mut self, target: VerifyTarget, candidate_key: String) {
+        if let Some(task) = self.verify_task.take() {
+            task.abort();
+        }
+        self.verify_refresh_id = self.verify_refresh_id.wrapping_add(1);
+        let id = self.verify_refresh_id;
+        let task_id = next_task_id();
+        let task_tx = self.task_tx.clone();
+        let _ = task_tx.send(TaskMsg::Start {
+            id: task_id,
+            label: "verify".into(),
+            kind: TaskKind::Verify,
+        });
+        // Verify has no measurable progress steps — flip to an indeterminate
+        // marquee immediately so the row doesn't freeze at a determinate 0%.
+        let _ = task_tx.send(TaskMsg::Progress {
+            id: task_id,
+            action: String::new(),
+            fraction: None,
+        });
+        let tx = self.verify_tx.clone();
+        let eumetnet = self.eumetnet.clone();
+        self.verify_task = Some(tokio::spawn(async move {
+            let outcome = match target {
+                VerifyTarget::Eumetnet => eumetnet.verify_api_key(&candidate_key).await,
+            };
+            match outcome {
+                VerifyOutcome::Unreachable => {
+                    let _ = task_tx.send(TaskMsg::Error {
+                        id: task_id,
+                        error: "unreachable".into(),
+                    });
+                }
+                VerifyOutcome::Valid | VerifyOutcome::Invalid => {
+                    let _ = task_tx.send(TaskMsg::Complete { id: task_id });
+                }
+            }
+            let _ = tx.send(VerifyResult {
+                id,
+                target,
+                outcome,
+            });
+        }));
+    }
+
+    pub fn drain_verify_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.verify_rx.try_recv() {
+            if result.id != self.verify_refresh_id {
+                continue;
+            }
+            self.verify_task = None;
+            self.last_verify = Some((result.target, result.outcome));
+            changed = true;
+        }
+        changed
+    }
+
+    /// Whether an edited eumetnet config requires rebuilding the provider.
+    /// Only `api_key` affects provider behavior (budget/quota, auth header);
+    /// trims both sides so whitespace-only edits don't trigger a needless
+    /// rebuild (which would reset `backdrop_loaded` and the request budget).
+    pub fn eumetnet_rebuild_needed(old: &EumetnetConfig, new: &EumetnetConfig) -> bool {
+        old.api_key.trim() != new.api_key.trim()
+    }
+
+    /// Rebuild the eumetnet provider from the current config and re-kick its
+    /// refresh so an edited `api_key` takes effect without a restart.
+    ///
+    /// Precondition: the caller has already mutated `self.config.eumetnet`
+    /// (e.g. after a settings-modal save) — this method does not write
+    /// config to disk. `request_obs_refresh` bumps `obs_refresh_id`, so
+    /// results already in flight from the old provider are discarded by the
+    /// existing staleness check.
+    pub fn rebuild_eumetnet_provider(&mut self) {
+        self.eumetnet = EumetnetProvider::new(
+            self.client.clone(),
+            self.dirs.clone(),
+            self.config.eumetnet.clone(),
+        );
+        // Intentional no-op when no obs layer is enabled: the swap above still
+        // happens, there's just nothing to refresh.
+        self.request_obs_refresh();
     }
 
     pub fn request_obs_refresh(&mut self) {
@@ -1797,6 +1930,166 @@ impl App {
             }
         }
         changed
+    }
+
+    // ── Settings modal ───────────────────────────────────────────────
+
+    /// Open the settings modal, staged from the current config. No-op while
+    /// the search prompt or help modal already owns the screen — one
+    /// overlay at a time.
+    pub fn open_settings(&mut self) {
+        if self.search_is_open() || self.show_help {
+            return;
+        }
+        self.settings = Some(SettingsState {
+            model: SettingsModel::from_config(&self.config),
+            editing: false,
+            apply_error: None,
+        });
+        // Show the current key's status right away: verify it on open when one
+        // is set (empty = anonymous, nothing to check).
+        self.last_verify = None;
+        let key = self.config.eumetnet.api_key.trim().to_string();
+        if !key.is_empty() {
+            self.request_verify(VerifyTarget::Eumetnet, key);
+        }
+    }
+
+    pub fn settings_is_open(&self) -> bool {
+        self.settings.is_some()
+    }
+
+    /// Index into `settings_links` whose rendered link contains screen cell
+    /// `(col, row)`, if any — used for hover, press, and click hit-testing in
+    /// the settings modal.
+    pub fn settings_link_index_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.settings_links
+            .iter()
+            .position(|(x, y, w, _)| row == *y && col >= *x && col < x.saturating_add(*w))
+    }
+
+    /// Up/Down — move between fields, only while browsing (not mid-edit). The
+    /// verify status persists across focus moves (it's cleared on edit, not
+    /// navigation) so the key's green/red stays put while you browse.
+    pub fn settings_focus_next(&mut self) {
+        if let Some(s) = self.settings.as_mut().filter(|s| !s.editing) {
+            s.model.focus_next();
+        }
+    }
+
+    pub fn settings_focus_prev(&mut self) {
+        if let Some(s) = self.settings.as_mut().filter(|s| !s.editing) {
+            s.model.focus_prev();
+        }
+    }
+
+    /// A printable key — edits the focused secret, only while editing it.
+    pub fn settings_push_char(&mut self, c: char) {
+        if let Some(s) = self.settings.as_mut().filter(|s| s.editing) {
+            s.model.push_char(c);
+            s.apply_error = None;
+            self.last_verify = None;
+        }
+    }
+
+    pub fn settings_backspace(&mut self) {
+        if let Some(s) = self.settings.as_mut().filter(|s| s.editing) {
+            s.model.backspace();
+            s.apply_error = None;
+            self.last_verify = None;
+        }
+    }
+
+    /// Left/Right — flips the focused bool, only while editing it.
+    pub fn settings_toggle_bool(&mut self) {
+        if let Some(s) = self.settings.as_mut().filter(|s| s.editing) {
+            s.model.toggle_bool();
+            s.apply_error = None;
+        }
+    }
+
+    /// Enter — start editing the focused field, or (already editing) save it:
+    /// persist to `config.toml`, mirror into `self.config`, and for the
+    /// eumetnet key rebuild the provider live and verify the new value
+    /// automatically. A write-back failure is surfaced on `apply_error`.
+    pub fn settings_confirm(&mut self) {
+        let Some(editing) = self.settings.as_ref().map(|s| s.editing) else {
+            return;
+        };
+        if !editing {
+            if let Some(s) = self.settings.as_mut() {
+                s.editing = true;
+                s.apply_error = None;
+            }
+            return;
+        }
+
+        // Editing → save the focused field.
+        let Some(edit) = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.model.focused_pending_edit())
+        else {
+            // No change — just leave edit mode.
+            if let Some(s) = self.settings.as_mut() {
+                s.editing = false;
+            }
+            return;
+        };
+
+        let path = self.dirs.config_dir.join("config.toml");
+        if let Err(e) = apply_config_edits(&path, std::slice::from_ref(&edit)) {
+            write_log(
+                &self.dirs.log_path,
+                format!("settings: apply_config_edits failed: {e}"),
+            );
+            if let Some(s) = self.settings.as_mut() {
+                s.apply_error = Some("save failed — see log".to_string());
+                s.editing = false;
+            }
+            return;
+        }
+
+        if let Some(s) = self.settings.as_mut() {
+            s.model.commit_focused();
+            s.editing = false;
+            s.apply_error = None;
+        }
+
+        match (edit.key.as_str(), &edit.value) {
+            ("eumetnet.api_key", ConfigEditValue::Str(v)) => {
+                self.config.eumetnet.api_key = v.clone();
+                self.rebuild_eumetnet_provider();
+                // Verify the new key automatically, unless it was cleared —
+                // an empty key is valid anonymous access, nothing to check.
+                if !v.trim().is_empty() {
+                    self.request_verify(VerifyTarget::Eumetnet, v.clone());
+                }
+            }
+            ("location.ip_fallback", ConfigEditValue::Bool(b)) => {
+                self.config.location.ip_fallback = *b;
+            }
+            _ => {}
+        }
+    }
+
+    /// Esc — cancel the edit in progress (revert the focused field), or close
+    /// the modal when not editing.
+    pub fn settings_back(&mut self) {
+        let Some(editing) = self.settings.as_ref().map(|s| s.editing) else {
+            return;
+        };
+        if editing {
+            if let Some(s) = self.settings.as_mut() {
+                s.model.revert_focused();
+                s.editing = false;
+                s.apply_error = None;
+            }
+            self.last_verify = None;
+        } else {
+            self.settings = None;
+            self.last_verify = None;
+        }
     }
 
     /// Drain fixes from the location backends.
@@ -2703,6 +2996,33 @@ enum WarnRefreshPayload {
     Error(String),
 }
 
+/// Which provider a verify probe targeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyTarget {
+    Eumetnet,
+}
+
+/// The settings modal's in-progress editing session, layered over the pure
+/// [`SettingsModel`]: whether the focused field is being actively edited, and
+/// the last apply failure to surface instead of crashing.
+#[derive(Debug)]
+pub struct SettingsState {
+    pub model: SettingsModel,
+    /// `false` = browsing the field list; `true` = editing the focused field
+    /// (typing into a secret, or toggling a bool) before Enter saves it.
+    pub editing: bool,
+    /// Set when `apply_config_edits` fails (malformed `config.toml`); shown
+    /// in the modal instead of crashing. Cleared on the next edit or open.
+    pub apply_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct VerifyResult {
+    id: u64,
+    target: VerifyTarget,
+    outcome: VerifyOutcome,
+}
+
 #[derive(Debug)]
 struct ObsRefreshResult {
     id: u64,
@@ -2757,7 +3077,11 @@ async fn initial_viewport(
     cli: &Cli,
     config: &Config,
     log_path: &Path,
-) -> (Viewport, LocationArbiter, Option<UnboundedReceiver<LocationFix>>) {
+) -> (
+    Viewport,
+    LocationArbiter,
+    Option<UnboundedReceiver<LocationFix>>,
+) {
     let mut arbiter = LocationArbiter::new();
 
     if let (Some(lat), Some(lon)) = (cli.lat, cli.lon) {
@@ -2839,6 +3163,7 @@ pub enum TaskKind {
     Observation,
     Warning,
     FrameList,
+    Verify,
 }
 
 impl TaskKind {
@@ -2850,6 +3175,7 @@ impl TaskKind {
             Self::Observation => ratatui::style::Color::LightMagenta,
             Self::Warning => ratatui::style::Color::LightRed,
             Self::FrameList => ratatui::style::Color::LightCyan,
+            Self::Verify => ratatui::style::Color::White,
         }
     }
 
@@ -2861,6 +3187,7 @@ impl TaskKind {
             Self::Observation => "obs",
             Self::Warning => "warn",
             Self::FrameList => "frames",
+            Self::Verify => "verify",
         }
     }
 }
@@ -3244,7 +3571,11 @@ mod tests {
         assert_eq!(ring_distance(0, 9, 10), 1, "and symmetrically back");
         assert_eq!(ring_distance(5, 0, 10), 5, "the far side stays far");
         assert_eq!(ring_distance(8, 1, 10), 3);
-        assert_eq!(ring_distance(0, 0, 0), 0, "an empty timeline has no distance");
+        assert_eq!(
+            ring_distance(0, 0, 0),
+            0,
+            "an empty timeline has no distance"
+        );
     }
 
     #[test]
@@ -3427,5 +3758,33 @@ mod tests {
             viewport.center, expected.center,
             "viewport must centre on the fix's point regardless of accuracy"
         );
+    }
+
+    fn eumetnet_config(api_key: &str) -> EumetnetConfig {
+        EumetnetConfig {
+            surface_endpoint: "https://example.test".into(),
+            api_key: api_key.into(),
+        }
+    }
+
+    #[test]
+    fn eumetnet_rebuild_not_needed_when_key_unchanged() {
+        let old = eumetnet_config("abc123");
+        let new = eumetnet_config("abc123");
+        assert!(!App::eumetnet_rebuild_needed(&old, &new));
+    }
+
+    #[test]
+    fn eumetnet_rebuild_needed_when_key_changed() {
+        let old = eumetnet_config("abc123");
+        let new = eumetnet_config("xyz789");
+        assert!(App::eumetnet_rebuild_needed(&old, &new));
+    }
+
+    #[test]
+    fn eumetnet_rebuild_not_needed_for_whitespace_only_difference() {
+        let old = eumetnet_config("abc123");
+        let new = eumetnet_config("  abc123  ");
+        assert!(!App::eumetnet_rebuild_needed(&old, &new));
     }
 }

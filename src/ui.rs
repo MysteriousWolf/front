@@ -26,7 +26,7 @@ use ratatui::Terminal;
 
 use crate::app::{
     ActiveTask, App, BorderMask, BorderMaskPoint, BorderMaskStamp, PlaybackMode, TaskState,
-    LIGHTNING_IMPACT_MS,
+    VerifyTarget, LIGHTNING_IMPACT_MS,
 };
 use crate::cache::write_log;
 use crate::geo::{
@@ -39,6 +39,7 @@ use crate::layers::{
     MainItem, ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
 };
 use crate::providers::location::LocationFix;
+use crate::providers::verify::VerifyOutcome;
 
 const INTERACTION_REFRESH_DEBOUNCE_MS: u64 = 60;
 
@@ -378,6 +379,7 @@ async fn run_loop(
             | app.drain_task_messages()
             | app.drain_obs_results()
             | app.drain_warning_results()
+            | app.drain_verify_results()
             | app.drain_lightning_results()
             | app.drain_location_updates()
             | app.drain_search_results()
@@ -542,6 +544,28 @@ async fn run_loop(
                     }
                     dirty = true;
                 }
+                // While the settings modal is open it owns the keyboard, same
+                // rationale as the search prompt above: printable keys edit
+                // the focused secret, so this must run before `keys::resolve`.
+                Event::Key(key) if key.kind == KeyEventKind::Press && app.settings_is_open() => {
+                    if let Some(action) = keys::settings_key_action(key) {
+                        match action {
+                            keys::SettingsKeyAction::Quit => {
+                                app.shutdown();
+                                quit = true;
+                                break;
+                            }
+                            keys::SettingsKeyAction::FocusPrev => app.settings_focus_prev(),
+                            keys::SettingsKeyAction::FocusNext => app.settings_focus_next(),
+                            keys::SettingsKeyAction::ToggleBool => app.settings_toggle_bool(),
+                            keys::SettingsKeyAction::Confirm => app.settings_confirm(),
+                            keys::SettingsKeyAction::Back => app.settings_back(),
+                            keys::SettingsKeyAction::PushChar(c) => app.settings_push_char(c),
+                            keys::SettingsKeyAction::Backspace => app.settings_backspace(),
+                        }
+                    }
+                    dirty = true;
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Set a render mode on the selected layer, if it accepts one.
                     let set_mode = |app: &mut App, mode: RenderMode, refresh: &mut bool| {
@@ -563,119 +587,172 @@ async fn run_loop(
                     // below: skipping it would block on the next `read` with
                     // the rest of the batch still unrendered.
                     if let Some(action) = keys::resolve(key) {
-                    match action {
-                        Action::Quit => {
-                            if app.show_help {
-                                app.show_help = false;
+                        match action {
+                            Action::Quit => {
+                                if app.show_help {
+                                    app.show_help = false;
+                                    dirty = true;
+                                } else {
+                                    app.shutdown();
+                                    quit = true;
+                                    break;
+                                }
+                            }
+                            Action::ToggleHelp => {
+                                app.show_help = !app.show_help;
                                 dirty = true;
-                            } else {
-                                app.shutdown();
-                                quit = true;
-                                break;
                             }
-                        }
-                        Action::ToggleHelp => {
-                            app.show_help = !app.show_help;
-                            dirty = true;
-                        }
-                        Action::ToggleLayer => {
-                            app.layer_panel_focused = true;
-                            if let Some(id) = app.layers.activate_selected() {
-                                handle_layer_enable(app, id, &mut refresh);
-                            }
-                            dirty = true;
-                        }
-                        Action::ModeBraille => dirty |= set_mode(app, RenderMode::Braille, &mut refresh),
-                        Action::ModeColor => dirty |= set_mode(app, RenderMode::Color, &mut refresh),
-                        Action::ModeText => dirty |= set_mode(app, RenderMode::Text, &mut refresh),
-                        Action::SelectPrevious => {
-                            app.layer_panel_focused = true;
-                            app.layers.select_previous();
-                            dirty = true;
-                        }
-                        Action::SelectNext => {
-                            app.layer_panel_focused = true;
-                            app.layers.select_next();
-                            dirty = true;
-                        }
-                        Action::EnterGroup => {
-                            app.layer_panel_focused = true;
-                            dirty |= app.layers.enter_options();
-                        }
-                        // Exit options → defocus the root list → refocus.
-                        Action::ExitGroup => {
-                            if !app.layer_panel_focused {
+                            Action::ToggleLayer => {
                                 app.layer_panel_focused = true;
-                                dirty = true;
-                            } else if app.layers.is_in_options() {
-                                dirty |= app.layers.exit_options();
-                            } else {
-                                app.layer_panel_focused = false;
+                                if let Some(id) = app.layers.activate_selected() {
+                                    handle_layer_enable(app, id, &mut refresh);
+                                }
                                 dirty = true;
                             }
-                        }
-                        Action::RefetchMap => {
-                            app.request_border_refetch();
-                            dirty = true;
-                        }
-                        Action::OpenSearch => {
-                            app.open_search();
-                            dirty = true;
-                        }
-                        // Zoom / pan — defocus the panel so the map fills the screen.
-                        Action::ZoomIn | Action::ZoomOut => {
-                            app.layer_panel_focused = false;
-                            let delta = if action == Action::ZoomIn { 0.25 } else { -0.25 };
-                            app.viewport.zoom_by(delta);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        Action::PanLeft | Action::PanRight | Action::PanUp | Action::PanDown => {
-                            app.layer_panel_focused = false;
-                            let (dx, dy) = match action {
-                                Action::PanLeft => (-1.0, 0.0),
-                                Action::PanRight => (1.0, 0.0),
-                                Action::PanUp => (0.0, -1.0),
-                                _ => (0.0, 1.0),
-                            };
-                            app.viewport.pan(dx, dy);
-                            refresh = true;
-                            dirty = true;
-                        }
-                        Action::FrameBack => {
-                            app.previous_frame();
-                            refresh = true;
-                            dirty = true;
-                        }
-                        Action::FrameForward => {
-                            app.next_frame();
-                            refresh = true;
-                            dirty = true;
-                        }
-                        Action::TogglePlayback => {
-                            app.toggle_play_pause();
-                            last_playback_step = Instant::now();
-                            dirty = true;
-                        }
-                        Action::JumpToLive => {
-                            app.jump_to_live();
-                            app.request_meteogate_refresh(app.map_width, app.map_height);
-                            dirty = true;
-                        }
-                        Action::SpeedFaster => {
-                            app.speed_faster();
-                            dirty = true;
-                        }
-                        Action::SpeedSlower => {
-                            app.speed_slower();
-                            dirty = true;
-                        }
-                        Action::CycleHistory => {
-                            app.cycle_history();
-                            refresh = true;
-                            dirty = true;
+                            Action::ModeBraille => {
+                                dirty |= set_mode(app, RenderMode::Braille, &mut refresh)
+                            }
+                            Action::ModeColor => {
+                                dirty |= set_mode(app, RenderMode::Color, &mut refresh)
+                            }
+                            Action::ModeText => {
+                                dirty |= set_mode(app, RenderMode::Text, &mut refresh)
+                            }
+                            Action::SelectPrevious => {
+                                app.layer_panel_focused = true;
+                                app.layers.select_previous();
+                                dirty = true;
+                            }
+                            Action::SelectNext => {
+                                app.layer_panel_focused = true;
+                                app.layers.select_next();
+                                dirty = true;
+                            }
+                            Action::EnterGroup => {
+                                app.layer_panel_focused = true;
+                                dirty |= app.layers.enter_options();
+                            }
+                            // Exit options → defocus the root list → refocus.
+                            Action::ExitGroup => {
+                                if !app.layer_panel_focused {
+                                    app.layer_panel_focused = true;
+                                    dirty = true;
+                                } else if app.layers.is_in_options() {
+                                    dirty |= app.layers.exit_options();
+                                } else {
+                                    app.layer_panel_focused = false;
+                                    dirty = true;
+                                }
+                            }
+                            Action::RefetchMap => {
+                                app.request_border_refetch();
+                                dirty = true;
+                            }
+                            Action::OpenSearch => {
+                                app.open_search();
+                                dirty = true;
+                            }
+                            Action::OpenSettings => {
+                                if !app.search_is_open() && !app.show_help {
+                                    app.open_settings();
+                                    dirty = true;
+                                }
+                            }
+                            // Zoom / pan — defocus the panel so the map fills the screen.
+                            Action::ZoomIn | Action::ZoomOut => {
+                                app.layer_panel_focused = false;
+                                let delta = if action == Action::ZoomIn {
+                                    0.25
+                                } else {
+                                    -0.25
+                                };
+                                app.viewport.zoom_by(delta);
+                                refresh = true;
+                                dirty = true;
+                            }
+                            Action::PanLeft
+                            | Action::PanRight
+                            | Action::PanUp
+                            | Action::PanDown => {
+                                app.layer_panel_focused = false;
+                                let (dx, dy) = match action {
+                                    Action::PanLeft => (-1.0, 0.0),
+                                    Action::PanRight => (1.0, 0.0),
+                                    Action::PanUp => (0.0, -1.0),
+                                    _ => (0.0, 1.0),
+                                };
+                                app.viewport.pan(dx, dy);
+                                refresh = true;
+                                dirty = true;
+                            }
+                            Action::FrameBack => {
+                                app.previous_frame();
+                                refresh = true;
+                                dirty = true;
+                            }
+                            Action::FrameForward => {
+                                app.next_frame();
+                                refresh = true;
+                                dirty = true;
+                            }
+                            Action::TogglePlayback => {
+                                app.toggle_play_pause();
+                                last_playback_step = Instant::now();
+                                dirty = true;
+                            }
+                            Action::JumpToLive => {
+                                app.jump_to_live();
+                                app.request_meteogate_refresh(app.map_width, app.map_height);
+                                dirty = true;
+                            }
+                            Action::SpeedFaster => {
+                                app.speed_faster();
+                                dirty = true;
+                            }
+                            Action::SpeedSlower => {
+                                app.speed_slower();
+                                dirty = true;
+                            }
+                            Action::CycleHistory => {
+                                app.cycle_history();
+                                refresh = true;
+                                dirty = true;
+                            }
                         }
                     }
+                }
+                // While the settings modal is open it owns the mouse: no map
+                // pan / zoom / drag. Links get hover + pressed feedback and open
+                // in the platform browser on a click that lands on them.
+                Event::Mouse(mouse) if app.settings_is_open() => {
+                    let hit = app.settings_link_index_at(mouse.column, mouse.row);
+                    match mouse.kind {
+                        MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                            if app.settings_link_hover != hit {
+                                app.settings_link_hover = hit;
+                                dirty = true;
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            app.settings_link_hover = hit;
+                            app.settings_link_pressed = hit;
+                            dirty = true;
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            // A click counts only when release lands on the same
+                            // link the press started on.
+                            let pressed = app.settings_link_pressed.take();
+                            if let (Some(p), Some(h)) = (pressed, hit) {
+                                if p == h {
+                                    if let Some(&(_, _, _, url)) = app.settings_links.get(h) {
+                                        open_url(url);
+                                    }
+                                }
+                            }
+                            app.settings_link_hover = hit;
+                            dirty = true;
+                        }
+                        _ => {}
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
@@ -817,6 +894,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App, reuse_raster: bool) {
     if app.show_help {
         render_help(frame, frame.area());
     }
+    if app.settings.is_some() {
+        render_settings(frame, frame.area(), app);
+    }
 }
 
 /// A keystroke, as shown in the footer and help.
@@ -854,10 +934,7 @@ fn help_lines() -> Vec<TextLine<'static>> {
         .map(|k| k.chars().count())
         .max()
         .unwrap_or(0);
-    let name_w = rows()
-        .map(|b| b.name.chars().count())
-        .max()
-        .unwrap_or(0);
+    let name_w = rows().map(|b| b.name.chars().count()).max().unwrap_or(0);
 
     let mut lines = vec![
         TextLine::from(Span::styled(
@@ -927,6 +1004,232 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
     frame.render_widget(Clear, panel);
     frame.render_widget(block, panel);
     frame.render_widget(Paragraph::new(content), inner);
+}
+
+/// Fixed inner width of the settings modal — the panel never resizes as you
+/// browse or type, so the layout stays put. Sized to fit the widest footer.
+const SETTINGS_INNER_WIDTH: u16 = 58;
+
+/// Right-align the last `width` chars of `s` — a scrolling-textbox view that
+/// keeps the tail (and, while editing, the cursor) visible for a long value.
+fn value_window(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        s.to_string()
+    } else {
+        s.chars().skip(count - width).collect()
+    }
+}
+
+/// The status icon shown at the right of a field: grayed when there's no value
+/// to check, dim `?` when a value is present but unverified, red `✗` invalid,
+/// yellow `?` unreachable, green `✓` verified-working. Non-secret fields (no
+/// validation) get a blank.
+fn settings_status_icon(
+    field: &crate::settings::Field,
+    last_verify: Option<(VerifyTarget, VerifyOutcome)>,
+) -> (&'static str, Color) {
+    if field.kind != crate::settings::FieldKind::Secret {
+        return (" ", Color::Reset);
+    }
+    if field.is_secret_empty() {
+        return ("–", Color::DarkGray);
+    }
+    match last_verify {
+        Some((VerifyTarget::Eumetnet, VerifyOutcome::Valid)) => ("✓", Color::Green),
+        Some((VerifyTarget::Eumetnet, VerifyOutcome::Invalid)) => ("✗", Color::Red),
+        Some((VerifyTarget::Eumetnet, VerifyOutcome::Unreachable)) => ("?", Color::Yellow),
+        _ => ("?", Color::DarkGray),
+    }
+}
+
+/// The settings modal: reuses `render_help`'s Clear + rounded-border Block +
+/// Paragraph pattern at a FIXED width so it never reshapes. Fields are browsed
+/// with the arrows and edited in place (Enter to edit, Enter to save). The
+/// focused secret is revealed in a fixed-width scrolling box; a status icon on
+/// the right reflects verification. Provider URLs render as underlined "link"
+/// text; their screen rects are recorded on `app.settings_links` so the event
+/// loop can open the browser on a click (native OSC 8 links corrupt the cell
+/// grid, so we handle the click ourselves).
+fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let Some(state) = &app.settings else {
+        app.settings_links.clear();
+        app.settings_link_hover = None;
+        app.settings_link_pressed = None;
+        return;
+    };
+
+    let inner_w = SETTINGS_INNER_WIDTH;
+    // Fixed columns: marker(2) + label + value box + space + icon(1) == inner_w.
+    let label_w = state
+        .model
+        .fields
+        .iter()
+        .map(|f| f.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let val_w = (inner_w as usize).saturating_sub(2 + label_w + 2);
+    let link_indent = 4u16;
+
+    let mut lines: Vec<TextLine> = Vec::new();
+    let mut link_rows: Vec<(usize, &'static str)> = Vec::new();
+    lines.push(TextLine::from(""));
+
+    for (i, field) in state.model.fields.iter().enumerate() {
+        let focused = i == state.model.focus;
+        let editing = focused && state.editing;
+        let marker = if focused { "› " } else { "  " };
+        let label_style = if focused {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        // Value in a fixed-width, tail-scrolling box (focused secret revealed;
+        // a cursor is appended while editing).
+        let mut raw = field.display(focused);
+        if editing {
+            raw.push('▏');
+        }
+        let value = format!("{:<val_w$}", value_window(&raw, val_w));
+        let value_style = if editing {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+
+        let (icon, icon_color) = settings_status_icon(field, app.last_verify);
+
+        lines.push(TextLine::from(vec![
+            Span::raw(marker),
+            Span::styled(format!("{:<label_w$}", field.label), label_style),
+            Span::styled(value, value_style),
+            Span::raw(" "),
+            Span::styled(icon, Style::default().fg(icon_color)),
+        ]));
+
+        // Sub-line: a clickable provider link under a secret, a plain note
+        // under the restart-only bool. Keeps rows uniform so the modal's shape
+        // is constant.
+        if let Some(url) = field.help_url {
+            let idx = link_rows.len();
+            let link_style = if app.settings_link_pressed == Some(idx) {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else if app.settings_link_hover == Some(idx) {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED)
+            };
+            link_rows.push((lines.len(), url));
+            lines.push(TextLine::from(vec![
+                Span::raw(" ".repeat(link_indent as usize)),
+                Span::styled(url, link_style),
+            ]));
+        } else if field.key == "location.ip_fallback" {
+            lines.push(TextLine::from(Span::styled(
+                "    applies on next launch",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if let Some(err) = &state.apply_error {
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let legend = if state.editing {
+        match state.model.focused().kind {
+            crate::settings::FieldKind::Bool => "←→ toggle   enter save   esc cancel",
+            crate::settings::FieldKind::Secret => "type to edit   enter save   esc cancel",
+        }
+    } else {
+        "↑↓ move   enter edit   esc close   (click link to open)"
+    };
+    lines.push(TextLine::from(""));
+    lines.push(TextLine::from(Span::styled(
+        format!("  {legend}"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+
+    let block = Block::default()
+        .title(" Settings ")
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Color::Cyan);
+
+    let panel = centered_rect(inner_w + 2, lines.len() as u16 + 2, area);
+    let inner = block.inner(panel);
+
+    // Record link screen rects before the `state` borrow is released so the
+    // click handler can hit-test them. `link_rows` holds owned data only.
+    let link_screen_rects: Vec<(u16, u16, u16, &'static str)> = link_rows
+        .iter()
+        .filter_map(|&(row, url)| {
+            let y = inner.y + row as u16;
+            (y < inner.y.saturating_add(inner.height)).then_some((
+                inner.x + link_indent,
+                y,
+                url.chars().count() as u16,
+                url,
+            ))
+        })
+        .collect();
+
+    frame.render_widget(Clear, panel);
+    frame.render_widget(block, panel);
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    app.settings_links = link_screen_rects;
+}
+
+/// Open `url` in the platform's default browser, best-effort and detached.
+///
+/// `url` is always a hardcoded provider constant (never user input), so there
+/// is no injection surface. A launch failure is ignored — the worst case is
+/// nothing happens, which must never take down the TUI.
+fn open_url(url: &str) {
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // `start` is a cmd builtin; the empty "" is the window title arg.
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        use std::process::Stdio;
+        let _ = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = url;
 }
 
 /// Centre a `width` × `height` rect inside `area`, shrinking to fit when the
@@ -5138,14 +5441,21 @@ mod tests {
         // modal inherits whatever background the terminal itself uses.
         for y in 0..b.area.height {
             for x in 0..b.area.width {
-                assert_eq!(b[(x, y)].bg, Color::Reset, "cell ({x},{y}) has a background");
+                assert_eq!(
+                    b[(x, y)].bg,
+                    Color::Reset,
+                    "cell ({x},{y}) has a background"
+                );
             }
         }
     }
 
     #[test]
     fn footer_hints_come_from_the_registry() {
-        let keys: Vec<_> = crate::keys::footer_hints().into_iter().map(|h| h.keys).collect();
+        let keys: Vec<_> = crate::keys::footer_hints()
+            .into_iter()
+            .map(|h| h.keys)
+            .collect();
         assert_eq!(keys.first(), Some(&"q"), "the way out is ranked first");
         assert!(keys.contains(&"space"), "play/pause is a headline hint");
         assert!(keys.contains(&"enter"), "layer toggle moved to enter");
