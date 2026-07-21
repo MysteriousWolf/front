@@ -97,8 +97,7 @@ pub async fn run(tx: UnboundedSender<LocationFix>, log_path: &Path) -> Result<()
         .name("front-corelocation".to_string())
         .spawn(move || {
             let delegate = Delegate::new(thread_tx, log);
-            let manager: Retained<CLLocationManager> =
-                unsafe { CLLocationManager::new() };
+            let manager: Retained<CLLocationManager> = unsafe { CLLocationManager::new() };
             let proto = ProtocolObject::from_ref(&*delegate);
             unsafe {
                 manager.setDelegate(Some(proto));

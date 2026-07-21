@@ -1953,8 +1953,10 @@ mod tests {
         let mut reg = LayerRegistry::new();
         // Location defaults to the text overlay; start from a clean slate.
         reg.mode_state_mut().remove_all(LayerId::Location);
-        reg.mode_state_mut().assign(RenderMode::Text, LayerId::SurfTemp);
-        reg.mode_state_mut().toggle(RenderMode::Text, LayerId::Location);
+        reg.mode_state_mut()
+            .assign(RenderMode::Text, LayerId::SurfTemp);
+        reg.mode_state_mut()
+            .toggle(RenderMode::Text, LayerId::Location);
         assert!(reg.mode_state().has(RenderMode::Text, LayerId::Location));
         assert!(
             reg.mode_state().has(RenderMode::Text, LayerId::SurfTemp),
@@ -1968,7 +1970,9 @@ mod tests {
     fn location_is_a_text_overlay_by_default_and_temps_keep_primary_text() {
         let reg = LayerRegistry::new();
         assert!(reg.enabled(LayerId::Location), "marker on by default");
-        assert!(reg.mode_state().has_overlay(RenderMode::Text, LayerId::Location));
+        assert!(reg
+            .mode_state()
+            .has_overlay(RenderMode::Text, LayerId::Location));
         assert_eq!(reg.mode_state().text, Some(LayerId::SurfTemp));
     }
 
@@ -2025,8 +2029,10 @@ mod tests {
     #[test]
     fn location_background_does_not_evict_the_color_owner() {
         let mut reg = LayerRegistry::new();
-        reg.mode_state_mut().assign(RenderMode::Color, LayerId::Radar);
-        reg.mode_state_mut().toggle(RenderMode::Color, LayerId::Location);
+        reg.mode_state_mut()
+            .assign(RenderMode::Color, LayerId::Radar);
+        reg.mode_state_mut()
+            .toggle(RenderMode::Color, LayerId::Location);
         assert!(reg.mode_state().has(RenderMode::Color, LayerId::Location));
         assert!(
             reg.mode_state().has(RenderMode::Color, LayerId::Radar),
@@ -2037,9 +2043,11 @@ mod tests {
     #[test]
     fn location_modes_toggle_off_again() {
         let mut reg = LayerRegistry::new();
-        reg.mode_state_mut().toggle(RenderMode::Color, LayerId::Location);
+        reg.mode_state_mut()
+            .toggle(RenderMode::Color, LayerId::Location);
         assert!(reg.mode_state().has(RenderMode::Color, LayerId::Location));
-        reg.mode_state_mut().toggle(RenderMode::Color, LayerId::Location);
+        reg.mode_state_mut()
+            .toggle(RenderMode::Color, LayerId::Location);
         assert!(!reg.mode_state().has(RenderMode::Color, LayerId::Location));
     }
 

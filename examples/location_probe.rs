@@ -13,7 +13,10 @@ use front::providers::location::{spawn, LocationArbiter};
 async fn main() {
     let log = std::env::temp_dir().join("front-location-probe.log");
     let config = LocationConfig::default();
-    println!("ip_fallback={} endpoint={}", config.ip_fallback, config.ip_endpoint);
+    println!(
+        "ip_fallback={} endpoint={}",
+        config.ip_fallback, config.ip_endpoint
+    );
     println!("waiting 15s for fixes...\n");
 
     let mut stream = spawn(&config, &log);

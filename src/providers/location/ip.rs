@@ -44,7 +44,11 @@ struct IpApiResponse {
     lon: Option<f64>,
 }
 
-pub async fn run(tx: UnboundedSender<LocationFix>, endpoint: String, log_path: &Path) -> Result<()> {
+pub async fn run(
+    tx: UnboundedSender<LocationFix>,
+    endpoint: String,
+    log_path: &Path,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()

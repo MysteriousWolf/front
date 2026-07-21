@@ -36,7 +36,6 @@ pub const CITY_MATCH_KM: f64 = 100.0;
 /// this cutoff.
 pub const OBS_TIER_ZOOM_CUTOFF: f64 = 5.5;
 
-
 /// City names matching `EUROPEAN_CAPITALS` (same order).
 pub const EUROPEAN_CAPITAL_NAMES: &[&str] = &[
     "Vienna",

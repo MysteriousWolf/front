@@ -46,17 +46,19 @@ pub async fn run(tx: UnboundedSender<LocationFix>, log_path: &Path) -> Result<()
 
     let handler_tx = tx.clone();
     let token = locator
-        .PositionChanged(&TypedEventHandler::<Geolocator, PositionChangedEventArgs>::new(
-            move |_sender, args| {
-                let args = args.ok()?;
-                if let Some(fix) = fix_from_args(args) {
-                    // Ignore send failure: the app is shutting down and the
-                    // handler must not surface that as a WinRT error.
-                    let _ = handler_tx.send(fix);
-                }
-                Ok(())
-            },
-        ))
+        .PositionChanged(
+            &TypedEventHandler::<Geolocator, PositionChangedEventArgs>::new(
+                move |_sender, args| {
+                    let args = args.ok()?;
+                    if let Some(fix) = fix_from_args(args) {
+                        // Ignore send failure: the app is shutting down and the
+                        // handler must not surface that as a WinRT error.
+                        let _ = handler_tx.send(fix);
+                    }
+                    Ok(())
+                },
+            ),
+        )
         .map_err(|e| eyre!("subscribe to PositionChanged: {e}"))?;
 
     // Hold the Geolocator alive; dropping it unsubscribes and events stop.
