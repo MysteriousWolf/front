@@ -145,3 +145,24 @@ carries pre-existing `cargo fmt` drift in unrelated files, left untouched.)
   verify endpoint, if/when that API is used.
 - `ip_fallback` edits persist + update live config but do not hot-restart location
   backends (out of v1 scope; applies on next launch).
+
+### Follow-up batch (uncommitted, awaiting manual review) — 2026-07-22
+
+One /subagent-implementation iteration (reviewer-PASS, 0 findings) resolving the two
+config-editor follow-ups above:
+
+- `tui-config-editor-f1-inline-table` — **fixed.** `apply_config_edits` now walks
+  intermediate segments via `Item::as_table_like_mut()` (`&mut dyn TableLike`), so an
+  intermediate written as an inline table (`location = { ip_fallback = true }`) is
+  navigated into rather than clobbered with a fresh `Table::new()`; sibling keys
+  survive. Final-segment scalar write switched to `entry(seg).or_insert(Item::None)`
+  (byte-equivalent to `Table`'s own `IndexMut`, so the normal `[section]` path is
+  unchanged). Regression test `test_apply_config_edits_preserves_inline_table_siblings`
+  added — confirmed failing on pre-fix code. `src/config.rs`. Closed 2026-07-22.
+- `tui-config-editor-f4-unreachable-invariant` — **moot, closed no-change.** The
+  shipped `settings.rs` has no `unreachable!()` and no `pending_changes` fn; the final
+  refactor matches exhaustively on `FieldValue` (2 variants). The reviewer finding was
+  against an intermediate iteration that never shipped. Closed 2026-07-22.
+
+Per the repo standing rule, nothing was committed — the working-tree diff
+(`src/config.rs`, +52/-8) awaits the owner's manual commit.

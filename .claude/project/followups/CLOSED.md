@@ -6,3 +6,6 @@
 - 2026-07-20 nearest-free-cell-ring-search — "nearest_free_cell ring search is O(radius^2) per pin per frame" — *(closed 2026-07-20)*
 - 2026-07-20 obs-station-identity-is-the-name — "ObservationPoint identity is the station name, not the WIGOS id" — *(closed 2026-07-20)*
 - 2026-07-21 obs-partial-lazy-reset — "obs_partial reset lazily on first Point, not on PartialCommit/Ready" — *(closed 2026-07-21)*
+- 2026-07-22 tui-config-editor-f1-inline-table — "apply_config_edits drops sibling keys in an inline-table section" — *(closed 2026-07-22)*
+- 2026-07-22 tui-config-editor-f4-unreachable-invariant — "pending_changes unreachable arm relies on construction-enforced invariant" — *(closed 2026-07-22)*
+- 2026-07-22 obs-location-cache-memory-only — "location_cache is memory-only, so the 6h backdrop TTL dies at exit" — *(closed 2026-07-22)*

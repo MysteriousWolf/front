@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::cache::write_atomic;
 use crate::geo::{EUROPE_LAT, EUROPE_LON, EUROPE_ZOOM};
@@ -454,23 +454,28 @@ pub fn apply_config_edits(path: &Path, edits: &[ConfigEdit]) -> color_eyre::eyre
 
     for edit in edits {
         let mut segments = edit.key.split('.').peekable();
-        let mut table: &mut Table = doc.as_table_mut();
+        let mut table: &mut dyn TableLike = doc.as_table_mut();
         while let Some(segment) = segments.next() {
             if segments.peek().is_some() {
                 let entry = table
                     .entry(segment)
                     .or_insert_with(|| Item::Table(Table::new()));
-                if entry.as_table().is_none() {
+                // Only genuinely non-table items (a scalar sitting where a
+                // table segment is needed) get replaced; existing tables and
+                // inline tables are navigated into as-is so their sibling
+                // keys survive.
+                if entry.as_table_like_mut().is_none() {
                     *entry = Item::Table(Table::new());
                 }
                 table = entry
-                    .as_table_mut()
+                    .as_table_like_mut()
                     .expect("entry was just forced to Item::Table above");
             } else {
-                match &edit.value {
-                    ConfigEditValue::Str(s) => table[segment] = toml_edit::value(s.as_str()),
-                    ConfigEditValue::Bool(b) => table[segment] = toml_edit::value(*b),
-                }
+                let item = match &edit.value {
+                    ConfigEditValue::Str(s) => toml_edit::value(s.as_str()),
+                    ConfigEditValue::Bool(b) => toml_edit::value(*b),
+                };
+                *table.entry(segment).or_insert(Item::None) = item;
             }
         }
     }
@@ -701,6 +706,45 @@ s3_endpoint = "https://s3.example.invalid"
         assert!(!reloaded.location.ip_fallback);
         assert_eq!(reloaded.eumetnet.api_key, "euk");
         assert_eq!(reloaded.viewport.lat, 46.05);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Editing a key under an intermediate segment written as a TOML inline
+    /// table must not drop that inline table's sibling keys.
+    #[test]
+    fn test_apply_config_edits_preserves_inline_table_siblings() {
+        let dir = std::env::temp_dir().join(format!(
+            "front-config-edit-test-{}-{}",
+            std::process::id(),
+            "inline-table"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "location = { ip_fallback = true, ip_endpoint = \"x\" }\n",
+        )
+        .unwrap();
+
+        apply_config_edits(
+            &path,
+            &[ConfigEdit {
+                key: "location.ip_fallback".to_string(),
+                value: ConfigEditValue::Bool(false),
+            }],
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("ip_endpoint = \"x\""),
+            "inline table sibling key must survive: {written}"
+        );
+
+        let reloaded = Config::load(&path).unwrap();
+        assert!(!reloaded.location.ip_fallback);
+        assert_eq!(reloaded.location.ip_endpoint, "x");
 
         std::fs::remove_dir_all(&dir).ok();
     }
