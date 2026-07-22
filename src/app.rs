@@ -351,6 +351,9 @@ pub struct App {
     pub playback_mode: PlaybackMode,
     pub playback_speed: PlaybackSpeed,
     pub show_help: bool,
+    /// Whether the bottom-right colour-scale key is drawn.  Toggled by `g`;
+    /// on by default.
+    pub show_legend: bool,
     pub is_dragging: bool,
     /// False when the layer panel is defocused (dimmed, no selection indicators,
     /// submenu hidden).  Toggled by Alt+← from the root list; set to true by
@@ -581,6 +584,7 @@ impl App {
             playback_mode: PlaybackMode::Live,
             playback_speed: PlaybackSpeed::Normal,
             show_help: false,
+            show_legend: true,
             is_dragging: false,
             layer_panel_focused: false,
             location,

@@ -1258,44 +1258,75 @@ fn build_row(
     runs
 }
 
+/// One band of the dBZ colour scale: `max` is the band's exclusive upper
+/// bound (the last band is open-ended and never matched by the `<` scan —
+/// the lookup falls through to it). Shared with the legend (CP-2/CP-3), which
+/// enumerates this table instead of restating the thresholds.
+pub(crate) struct DbzBand {
+    pub max: f32,
+    pub color: Rgb8,
+}
+
+/// The unit label for the dBZ scale, exported alongside the bands so the
+/// legend never needs its own hardcoded copy.
+pub(crate) const DBZ_UNIT: &str = "dBZ";
+
+/// OPERA dBZ → colour mapping (standard weather radar palette). Ordered by
+/// ascending `max`; the last entry's `max` is never reached by the scan in
+/// `dbz_to_color` and represents the open-ended 60+ band.
+pub(crate) const DBZ_BANDS: &[DbzBand] = &[
+    DbzBand {
+        max: 5.0,
+        color: Rgb8::new(140, 180, 255),
+    }, // very light
+    DbzBand {
+        max: 15.0,
+        color: Rgb8::new(80, 140, 255),
+    }, // light
+    DbzBand {
+        max: 25.0,
+        color: Rgb8::new(100, 220, 100),
+    }, // medium (lighter green)
+    DbzBand {
+        max: 35.0,
+        color: Rgb8::new(40, 180, 40),
+    }, // medium (green)
+    DbzBand {
+        max: 40.0,
+        color: Rgb8::new(180, 220, 40),
+    }, // medium (yellow-green)
+    DbzBand {
+        max: 45.0,
+        color: Rgb8::new(220, 220, 40),
+    }, // medium (yellow)
+    DbzBand {
+        max: 50.0,
+        color: Rgb8::new(240, 160, 40),
+    }, // medium-high (orange)
+    DbzBand {
+        max: 55.0,
+        color: Rgb8::new(220, 60, 40),
+    }, // high (red)
+    DbzBand {
+        max: 60.0,
+        color: Rgb8::new(200, 40, 180),
+    }, // very high (magenta)
+    DbzBand {
+        max: f32::INFINITY,
+        color: Rgb8::new(200, 200, 200),
+    }, // extreme, 60+ (white)
+];
+
 /// Map a dBZ value to a display colour and Braille intensity (1–14).
 fn dbz_to_color(dbz: f32) -> (Rgb8, u8) {
-    // OPERA dBZ → colour mapping (standard weather radar palette):
-    //   < 0  → transparent (handled by caller)
-    //   0–5  → light blue (very light)
-    //   5–15 → medium blue (light)
-    //  15–25 → lighter green (medium)
-    //  25–35 → green (medium)
-    //  35–40 → yellow-green (medium)
-    //  40–45 → yellow (medium)
-    //  45–50 → orange (medium-high)
-    //  50–55 → red (high)
-    //  55–60 → magenta (very high)
-    //  60+   → white (extreme)
-    let (r, g, b) = if dbz < 5.0 {
-        (140, 180, 255)
-    } else if dbz < 15.0 {
-        (80, 140, 255)
-    } else if dbz < 25.0 {
-        (100, 220, 100)
-    } else if dbz < 35.0 {
-        (40, 180, 40)
-    } else if dbz < 40.0 {
-        (180, 220, 40)
-    } else if dbz < 45.0 {
-        (220, 220, 40)
-    } else if dbz < 50.0 {
-        (240, 160, 40)
-    } else if dbz < 55.0 {
-        (220, 60, 40)
-    } else if dbz < 60.0 {
-        (200, 40, 180)
-    } else {
-        (200, 200, 200)
-    };
+    let color = DBZ_BANDS
+        .iter()
+        .find(|band| dbz < band.max)
+        .map(|band| band.color)
+        .unwrap_or_else(|| DBZ_BANDS[DBZ_BANDS.len() - 1].color);
     // Intensity proportional to dBZ (higher = brighter dot)
     let intensity = (dbz.clamp(0.0, 70.0) / 5.0) as u8 + 1;
-    (Rgb8::new(r, g, b), intensity.min(14))
+    (color, intensity.min(14))
 }
 
 fn radar_zoom(zoom: f64) -> u8 {
@@ -1736,6 +1767,18 @@ mod tests {
         let (_, i_low) = dbz_to_color(5.0);
         let (_, i_high) = dbz_to_color(45.0);
         assert!(i_high > i_low, "higher dBZ must give higher intensity");
+    }
+
+    /// The dBZ band table must be enumerable (for the future legend) and
+    /// carry its unit label as data rather than a hardcoded string elsewhere.
+    #[test]
+    fn dbz_bands_are_enumerable_with_unit_label() {
+        assert_eq!(DBZ_UNIT, "dBZ");
+        assert_eq!(DBZ_BANDS.len(), 10, "one band per documented threshold");
+        assert!(
+            DBZ_BANDS.last().unwrap().max.is_infinite(),
+            "top band must be open-ended"
+        );
     }
 
     #[test]

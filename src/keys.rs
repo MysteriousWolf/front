@@ -18,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Action {
     Quit,
     ToggleHelp,
+    ToggleLegend,
     PanLeft,
     PanRight,
     PanUp,
@@ -349,6 +350,15 @@ pub static BINDINGS: &[Binding] = &[
         description: "assign the text renderer to this layer",
         chords: &[Chord::plain(KeyCode::Char('l'))],
         help_keys: Some("l"),
+        footer: None,
+    },
+    Binding {
+        action: Some(Action::ToggleLegend),
+        name: "Toggle legend",
+        category: Category::Layers,
+        description: "show or hide the colour-scale key",
+        chords: &[Chord::plain(KeyCode::Char('g'))],
+        help_keys: Some("g"),
         footer: None,
     },
     // ── General ─────────────────────────────────────────────────────────

@@ -602,6 +602,10 @@ async fn run_loop(
                                 app.show_help = !app.show_help;
                                 dirty = true;
                             }
+                            Action::ToggleLegend => {
+                                app.show_legend = !app.show_legend;
+                                dirty = true;
+                            }
                             Action::ToggleLayer => {
                                 app.layer_panel_focused = true;
                                 if let Some(id) = app.layers.activate_selected() {
@@ -1605,7 +1609,12 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, reuse_r
         );
         if !app.is_dragging {
             render_layer_list(frame, area, app);
-            render_task_queue(frame, area, app);
+            let now = Instant::now();
+            let reserved = task_queue_reserved_rows(&app.active_tasks, now);
+            if app.show_legend {
+                render_legend(frame, area, app.layers.mode_state(), reserved);
+            }
+            render_task_queue(frame, area, app, now);
         }
         return;
     }
@@ -1715,7 +1724,12 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, reuse_r
     app.braille_frame = braille_frame;
     if !app.is_dragging {
         render_layer_list(frame, area, app);
-        render_task_queue(frame, area, app);
+        let now = Instant::now();
+        let reserved = task_queue_reserved_rows(&app.active_tasks, now);
+        if app.show_legend {
+            render_legend(frame, area, app.layers.mode_state(), reserved);
+        }
+        render_task_queue(frame, area, app, now);
     }
 }
 
@@ -3191,73 +3205,164 @@ fn raster_observations(
     }
 }
 
-fn obs_color(property: ObservationProperty, value: Option<f64>) -> Rgb8 {
-    match (property, value) {
-        // Temperature: cold blue → teal → yellow-green → amber → hot orange
-        // Follows standard synoptic weather-map convention.
-        (ObservationProperty::Temperature, Some(t)) => {
-            if t < -20.0 {
-                Rgb8::new(80, 110, 210)
-            } else if t < -10.0 {
-                Rgb8::new(110, 155, 235)
-            } else if t < 0.0 {
-                Rgb8::new(140, 195, 240)
-            } else if t < 10.0 {
-                Rgb8::new(100, 205, 185)
-            } else if t < 20.0 {
-                Rgb8::new(165, 215, 120)
-            } else if t < 30.0 {
-                Rgb8::new(235, 185, 65)
-            } else {
-                Rgb8::new(230, 100, 60)
-            }
-        }
-        // Wind: Beaufort-inspired calm-gray → light-blue → green → yellow → orange → red
-        (ObservationProperty::WindSpeed, Some(w)) => {
-            if w < 1.0 {
-                Rgb8::new(165, 185, 195)
-            } else if w < 3.0 {
-                Rgb8::new(130, 190, 235)
-            } else if w < 8.0 {
-                Rgb8::new(110, 210, 150)
-            } else if w < 14.0 {
-                Rgb8::new(220, 205, 80)
-            } else if w < 20.0 {
-                Rgb8::new(230, 140, 60)
-            } else {
-                Rgb8::new(215, 80, 80)
-            }
-        }
-        // Humidity: dry amber → comfortable green → moist blue
-        (ObservationProperty::Humidity, Some(h)) => {
-            if h < 30.0 {
-                Rgb8::new(205, 170, 75)
-            } else if h < 50.0 {
-                Rgb8::new(195, 210, 120)
-            } else if h < 70.0 {
-                Rgb8::new(130, 200, 155)
-            } else if h < 85.0 {
-                Rgb8::new(100, 175, 220)
-            } else {
-                Rgb8::new(70, 130, 215)
-            }
-        }
-        // Pressure: low = stormy red, normal = neutral, high = fair-weather blue
-        (ObservationProperty::Pressure, Some(p)) => {
-            if p < 980.0 {
-                Rgb8::new(215, 85, 85)
-            } else if p < 1000.0 {
-                Rgb8::new(200, 145, 130)
-            } else if p < 1015.0 {
-                Rgb8::new(165, 185, 205)
-            } else if p < 1030.0 {
-                Rgb8::new(110, 170, 220)
-            } else {
-                Rgb8::new(70, 135, 215)
-            }
-        }
-        _ => Rgb8::GRAY,
+/// One band of an observation colour ramp: `max` is the band's exclusive
+/// upper bound (the last band is open-ended). Shared with the legend
+/// (CP-2/CP-3), which enumerates this table instead of restating thresholds.
+struct ObsBand {
+    max: f64,
+    color: Rgb8,
+}
+
+/// A full colour ramp for one `ObservationProperty`, plus the unit label the
+/// legend displays alongside it so CP-3 need not hardcode a unit list.
+struct ObsScale {
+    unit: &'static str,
+    bands: &'static [ObsBand],
+}
+
+// Temperature: cold blue → teal → yellow-green → amber → hot orange. Follows
+// standard synoptic weather-map convention.
+const TEMPERATURE_BANDS: &[ObsBand] = &[
+    ObsBand {
+        max: -20.0,
+        color: Rgb8::new(80, 110, 210),
+    },
+    ObsBand {
+        max: -10.0,
+        color: Rgb8::new(110, 155, 235),
+    },
+    ObsBand {
+        max: 0.0,
+        color: Rgb8::new(140, 195, 240),
+    },
+    ObsBand {
+        max: 10.0,
+        color: Rgb8::new(100, 205, 185),
+    },
+    ObsBand {
+        max: 20.0,
+        color: Rgb8::new(165, 215, 120),
+    },
+    ObsBand {
+        max: 30.0,
+        color: Rgb8::new(235, 185, 65),
+    },
+    ObsBand {
+        max: f64::INFINITY,
+        color: Rgb8::new(230, 100, 60),
+    },
+];
+
+// Wind: Beaufort-inspired calm-gray → light-blue → green → yellow → orange → red.
+const WIND_SPEED_BANDS: &[ObsBand] = &[
+    ObsBand {
+        max: 1.0,
+        color: Rgb8::new(165, 185, 195),
+    },
+    ObsBand {
+        max: 3.0,
+        color: Rgb8::new(130, 190, 235),
+    },
+    ObsBand {
+        max: 8.0,
+        color: Rgb8::new(110, 210, 150),
+    },
+    ObsBand {
+        max: 14.0,
+        color: Rgb8::new(220, 205, 80),
+    },
+    ObsBand {
+        max: 20.0,
+        color: Rgb8::new(230, 140, 60),
+    },
+    ObsBand {
+        max: f64::INFINITY,
+        color: Rgb8::new(215, 80, 80),
+    },
+];
+
+// Humidity: dry amber → comfortable green → moist blue.
+const HUMIDITY_BANDS: &[ObsBand] = &[
+    ObsBand {
+        max: 30.0,
+        color: Rgb8::new(205, 170, 75),
+    },
+    ObsBand {
+        max: 50.0,
+        color: Rgb8::new(195, 210, 120),
+    },
+    ObsBand {
+        max: 70.0,
+        color: Rgb8::new(130, 200, 155),
+    },
+    ObsBand {
+        max: 85.0,
+        color: Rgb8::new(100, 175, 220),
+    },
+    ObsBand {
+        max: f64::INFINITY,
+        color: Rgb8::new(70, 130, 215),
+    },
+];
+
+// Pressure: low = stormy red, normal = neutral, high = fair-weather blue.
+const PRESSURE_BANDS: &[ObsBand] = &[
+    ObsBand {
+        max: 980.0,
+        color: Rgb8::new(215, 85, 85),
+    },
+    ObsBand {
+        max: 1000.0,
+        color: Rgb8::new(200, 145, 130),
+    },
+    ObsBand {
+        max: 1015.0,
+        color: Rgb8::new(165, 185, 205),
+    },
+    ObsBand {
+        max: 1030.0,
+        color: Rgb8::new(110, 170, 220),
+    },
+    ObsBand {
+        max: f64::INFINITY,
+        color: Rgb8::new(70, 135, 215),
+    },
+];
+
+/// Look up the colour ramp and unit label for an `ObservationProperty`.
+/// Enumerable by the future legend so it never needs a second hardcoded copy.
+fn obs_scale(property: ObservationProperty) -> ObsScale {
+    match property {
+        ObservationProperty::Temperature => ObsScale {
+            unit: "°C",
+            bands: TEMPERATURE_BANDS,
+        },
+        ObservationProperty::WindSpeed => ObsScale {
+            unit: "m/s",
+            bands: WIND_SPEED_BANDS,
+        },
+        ObservationProperty::Humidity => ObsScale {
+            unit: "%",
+            bands: HUMIDITY_BANDS,
+        },
+        ObservationProperty::Pressure => ObsScale {
+            unit: "hPa",
+            bands: PRESSURE_BANDS,
+        },
     }
+}
+
+fn obs_color(property: ObservationProperty, value: Option<f64>) -> Rgb8 {
+    let Some(v) = value else {
+        return Rgb8::GRAY;
+    };
+    let scale = obs_scale(property);
+    scale
+        .bands
+        .iter()
+        .find(|band| v < band.max)
+        .map(|band| band.color)
+        .unwrap_or_else(|| scale.bands[scale.bands.len() - 1].color)
 }
 
 fn set_subcell(cells: &mut [RasterCell], width: u16, sx: u32, sy: u32, color: Rgb8, intensity: u8) {
@@ -3621,6 +3726,297 @@ fn layer_area(area: Rect) -> Rect {
     }
 }
 
+/// Area for the bottom-right legend panel, mirroring `layer_area` reflected
+/// horizontally: same baseline (one row of bottom padding), two-column inset
+/// from the right edge instead of the left. Unlike `layer_area`, height is
+/// driven by the caller (CP-3 knows how many scale blocks fit) rather than a
+/// fixed item count, so both dimensions are parameters here.
+fn legend_area(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(3));
+    let height = height.min(area.height.saturating_sub(1));
+    let x = area.x + area.width.saturating_sub(width + 2);
+    let y = area.y + area.height.saturating_sub(1 + height);
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// One colour-carrying scale that can appear on the legend. Maps 1:1 to
+/// either the dBZ ramp or an `ObservationProperty` ramp, so CP-3 can pull the
+/// band table + unit via `DBZ_BANDS`/`DBZ_UNIT` or `obs_scale()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegendScale {
+    Dbz,
+    Temperature,
+    WindSpeed,
+    Humidity,
+    Pressure,
+}
+
+impl LegendScale {
+    /// The `ObservationProperty` this scale reads bands from, if it isn't dBZ.
+    fn observation_property(self) -> Option<ObservationProperty> {
+        match self {
+            Self::Dbz => None,
+            Self::Temperature => Some(ObservationProperty::Temperature),
+            Self::WindSpeed => Some(ObservationProperty::WindSpeed),
+            Self::Humidity => Some(ObservationProperty::Humidity),
+            Self::Pressure => Some(ObservationProperty::Pressure),
+        }
+    }
+}
+
+/// Which scales are currently active, in a fixed declaration order (dBZ,
+/// Temperature, Wind, Humidity, Pressure). A scale is active exactly when its
+/// layer owns a colour-painting render mode — dBZ requires `Radar` to own
+/// `Braille` or `Color` specifically (its palette only appears there); the
+/// observation scales just require their layer to own any mode at all.
+/// Ordering here is declaration order only — `fitting_scales` drops from the
+/// tail for degradation, keeping dBZ (declared first) and dropping
+/// observation scales first.
+fn active_scales(rms: &RenderModeState) -> Vec<LegendScale> {
+    let mut scales = Vec::new();
+    if rms.has(RenderMode::Braille, LayerId::Radar) || rms.has(RenderMode::Color, LayerId::Radar) {
+        scales.push(LegendScale::Dbz);
+    }
+    if rms.has_any(LayerId::SurfTemp) {
+        scales.push(LegendScale::Temperature);
+    }
+    if rms.has_any(LayerId::SurfWind) {
+        scales.push(LegendScale::WindSpeed);
+    }
+    if rms.has_any(LayerId::SurfHumidity) {
+        scales.push(LegendScale::Humidity);
+    }
+    if rms.has_any(LayerId::SurfPressure) {
+        scales.push(LegendScale::Pressure);
+    }
+    scales
+}
+
+/// Abbreviated quantity name for a legend scale's header row — the unit is
+/// composed alongside it (`legend_scale_data`) from the same band table CP-1
+/// already reads (`DBZ_UNIT` / `ObsScale::unit`), so it is never duplicated
+/// here. Header reads `"<name> / <unit>"` (a slash, not parentheses), the
+/// scientific "quantity / unit" axis convention.
+fn legend_scale_name(scale: LegendScale) -> &'static str {
+    match scale {
+        LegendScale::Dbz => "Reflect",
+        LegendScale::Temperature => "Temp",
+        LegendScale::WindSpeed => "Wind",
+        LegendScale::Humidity => "Humid",
+        LegendScale::Pressure => "Press",
+    }
+}
+
+/// One band's colour and exclusive upper bound, unified to `f64` so layout
+/// code doesn't care whether it came from the dBZ (`f32`) or observation
+/// (`f64`) band tables.
+struct LegendBand {
+    max: f64,
+    color: Rgb8,
+}
+
+/// Everything the legend needs to draw one scale's two-row block: its
+/// composed `"<name> / <unit>"` header (row 1) and band table (row 2's bar),
+/// pulled from the CP-1 tables rather than restated here.
+struct LegendScaleData {
+    header: String,
+    bands: Vec<LegendBand>,
+}
+
+fn legend_scale_data(scale: LegendScale) -> LegendScaleData {
+    match scale.observation_property() {
+        None => LegendScaleData {
+            header: format!(
+                "{} / {}",
+                legend_scale_name(scale),
+                crate::providers::meteogate::DBZ_UNIT
+            ),
+            bands: crate::providers::meteogate::DBZ_BANDS
+                .iter()
+                .map(|b| LegendBand {
+                    max: f64::from(b.max),
+                    color: b.color,
+                })
+                .collect(),
+        },
+        Some(property) => {
+            let scale_data = obs_scale(property);
+            LegendScaleData {
+                header: format!("{} / {}", legend_scale_name(scale), scale_data.unit),
+                bands: scale_data
+                    .bands
+                    .iter()
+                    .map(|b| LegendBand {
+                        max: b.max,
+                        color: b.color,
+                    })
+                    .collect(),
+            }
+        }
+    }
+}
+
+/// Every band's colour repeated `LEGEND_HALF_CELLS_PER_BAND` times, giving a
+/// flat sequence of half-cell colour samples for the whole bar — the input
+/// `legend_bar_cells` packs two-at-a-time into terminal cells.
+fn legend_bar_half_colors(bands: &[LegendBand]) -> Vec<Color> {
+    bands
+        .iter()
+        .flat_map(|b| {
+            std::iter::repeat_n(
+                to_terminal_color(b.color),
+                LEGEND_HALF_CELLS_PER_BAND as usize,
+            )
+        })
+        .collect()
+}
+
+/// Pack half-cell colour samples two at a time into terminal cells using the
+/// same half-block idiom as the radar timeline (`timeline_bar_spans`): a
+/// cell whose two halves agree is drawn as a solid background colour; a cell
+/// whose halves disagree — a band boundary — is drawn as `▌` with `fg` = the
+/// left half's colour and `bg` = the right half's, instead of blending them.
+/// A trailing odd half-cell (odd bands × an odd `LEGEND_HALF_CELLS_PER_BAND`)
+/// pairs with itself, so it still renders as one solid cell, never a gap.
+fn legend_bar_cells(half_colors: &[Color]) -> Vec<(char, Style)> {
+    let mut cells = Vec::with_capacity(half_colors.len().div_ceil(2));
+    let mut i = 0;
+    while i < half_colors.len() {
+        let left = half_colors[i];
+        let right = half_colors.get(i + 1).copied().unwrap_or(left);
+        if left == right {
+            cells.push((' ', Style::default().bg(left)));
+        } else {
+            cells.push(('▌', Style::default().fg(left).bg(right)));
+        }
+        i += 2;
+    }
+    cells
+}
+
+/// Terminal-cell width of a bar with `n_bands` bands at the fixed half-cells-
+/// per-band resolution — used to size the shared bar-width budget before any
+/// scale's actual colours are resolved.
+fn legend_bar_width_cells(n_bands: usize) -> u16 {
+    (n_bands as u16 * LEGEND_HALF_CELLS_PER_BAND).div_ceil(2)
+}
+
+/// Which whole bars fit in `height` given `rows_per_bar`, dropping from the
+/// TAIL of `scales` until the remainder fits. Since `active_scales` returns
+/// dBZ first, dropping from the tail keeps dBZ and drops observation scales
+/// first, per the fixed-priority degradation rule. If not even one bar fits,
+/// the slice is empty.
+fn fitting_scales(scales: &[LegendScale], rows_per_bar: u16, height: u16) -> &[LegendScale] {
+    if rows_per_bar == 0 {
+        return &[];
+    }
+    let max_bars = (height / rows_per_bar) as usize;
+    let n = scales.len().min(max_bars);
+    &scales[..n]
+}
+
+/// Low-end and high-end marker text for a scale's boundary-number row.
+/// Derived from the band table's boundaries plus two physical-domain facts
+/// no band table encodes: wind speed and humidity never go below 0, and
+/// humidity is a percentage so it never exceeds 100 even though its top
+/// colour band (`>= 85`) is open-ended like every other scale's. The low
+/// marker anchors the left edge of the bar region (fraction 0) and the high
+/// marker the right edge (fraction 1); `legend_labels` fills in the interior
+/// boundary numbers between them.
+fn legend_endpoints(scale: LegendScale, bands: &[LegendBand]) -> (String, String) {
+    let start = match scale {
+        LegendScale::Dbz => format!("<{:.0}", bands[0].max),
+        LegendScale::WindSpeed | LegendScale::Humidity => "0".to_string(),
+        LegendScale::Temperature | LegendScale::Pressure => format!("{:.0}", bands[0].max),
+    };
+    let end = if scale == LegendScale::Humidity {
+        "100".to_string()
+    } else {
+        match bands.last() {
+            Some(last) if last.max.is_finite() => format!("{:.0}", last.max),
+            Some(_) if bands.len() >= 2 => {
+                format!("{:.0}+", bands[bands.len() - 2].max)
+            }
+            _ => String::new(),
+        }
+    };
+    (start, end)
+}
+
+/// Minimum cell gap between two boundary numbers on the top row — used to
+/// derive the uniform stride in `legend_labels` so no two numbers (and no
+/// number and an endpoint) ever touch or merge.
+const LEGEND_LABEL_MIN_GAP: u16 = 4;
+
+/// Evenly-spaced (uniform-stride) boundary numbers for a scale's top row.
+/// Boundaries are indices `0..=n` (`n = bands.len()`), boundary `i` sitting at
+/// cell `round(i / n * bar_width)` — uniform because bands are equal width.
+/// The smallest stride `s >= 1` with `round(s / n * bar_width) >=
+/// LEGEND_LABEL_MIN_GAP` is chosen (`s = ceil(MIN_GAP * n / bar_width)`), and
+/// boundaries `0, s, 2s, …` are shown. The high end (`n`) is always shown; if
+/// the last stride-multiple already lands within `LEGEND_LABEL_MIN_GAP` cells
+/// of it, that multiple is dropped so the final pair isn't cramped. Index 0
+/// is labelled with `legend_endpoints`' low marker, index `n` with its high
+/// marker, and interior index `i` with `bands[i - 1].max` (the value at that
+/// boundary).
+fn legend_labels(
+    scale: LegendScale,
+    bands: &[LegendBand],
+    bar_width: u16,
+) -> Vec<(u16, String, Rgb8)> {
+    let (low, high) = legend_endpoints(scale, bands);
+    let n = bands.len();
+    let label_at = |i: usize| -> String {
+        if i == 0 {
+            low.clone()
+        } else if i == n {
+            high.clone()
+        } else {
+            format!("{:.0}", bands[i - 1].max)
+        }
+    };
+    // Tick colour: index 0 -> first band, interior/high index i -> bands[i - 1]
+    // (the band whose upper bound the number marks) — same mapping as `label_at`.
+    let color_at = |i: usize| -> Rgb8 {
+        if i == 0 {
+            bands[0].color
+        } else {
+            bands[i - 1].color
+        }
+    };
+    let pos_at = |i: usize| -> u16 { (i as f64 / n as f64 * f64::from(bar_width)).round() as u16 };
+
+    if n == 0 || bar_width == 0 {
+        let fallback = Rgb8 { r: 0, g: 0, b: 0 };
+        return vec![(0, low, fallback), (bar_width, high, fallback)];
+    }
+
+    let stride = (u32::from(LEGEND_LABEL_MIN_GAP) * n as u32)
+        .div_ceil(u32::from(bar_width).max(1))
+        .max(1) as usize;
+
+    let mut indices: Vec<usize> = (0..=n).step_by(stride).collect();
+    if let Some(&last) = indices.last() {
+        if last != n {
+            let last_pos = pos_at(last);
+            if bar_width.saturating_sub(last_pos) < LEGEND_LABEL_MIN_GAP {
+                indices.pop();
+            }
+            indices.push(n);
+        }
+    }
+
+    indices
+        .into_iter()
+        .map(|i| (pos_at(i), label_at(i), color_at(i)))
+        .collect()
+}
+
 /// Area for the right (options) panel, placed to the right of the main
 /// panel and bottom-aligned with it.  Height is computed from the number
 /// of lines the caller needs to render.
@@ -3662,27 +4058,30 @@ fn sort_visible_tasks(mut tasks: Vec<&ActiveTask>) -> Vec<&ActiveTask> {
     tasks
 }
 
+/// Cap on simultaneously visible rows in the task-progress overlay, shared
+/// with `task_queue_reserved_rows` so the legend's reserved-space budget can
+/// never drift from what `render_task_queue` actually draws.
+const MAX_VISIBLE_TASKS: usize = 8;
+
 /// Render task progress overlay in the top-right corner.
-fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn render_task_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, now: Instant) {
     if app.active_tasks.is_empty() {
         return;
     }
 
     let bar_chars = 12usize;
-    let max_visible = 8;
 
     // CP-4's visibility threshold filters first, then CP-5's deterministic
     // sort, then truncate — a young task must not win a slot over an older
     // visible one purely by vec position, and an all-invisible panel must
     // render nothing (early return below covers that case).
-    let now = std::time::Instant::now();
     let visible: Vec<&ActiveTask> = app
         .active_tasks
         .iter()
         .filter(|t| t.is_visible(now))
         .collect();
     let ordered = sort_visible_tasks(visible);
-    let rows: Vec<&ActiveTask> = ordered.into_iter().take(max_visible).collect();
+    let rows: Vec<&ActiveTask> = ordered.into_iter().take(MAX_VISIBLE_TASKS).collect();
     if rows.is_empty() {
         return;
     }
@@ -3849,6 +4248,142 @@ fn apply_dim(lines: Vec<TextLine<'static>>) -> Vec<TextLine<'static>> {
             )
         })
         .collect()
+}
+
+/// Half-cells every colour band occupies in the bar. Fixed and ODD so a
+/// band's boundary lands mid-cell rather than on a cell edge — that mid-cell
+/// landing is what produces a two-colour `▌` split instead of a hard,
+/// full-cell colour change, and reads as a finer gradient at 2× the cell
+/// resolution. Narrowed back from 7 to 3 — the wider bar dominated the map;
+/// evenly-spaced `legend_labels` no longer need the extra width to avoid
+/// merging.
+const LEGEND_HALF_CELLS_PER_BAND: u16 = 3;
+/// Two rows per scale: row 1 is the `name / unit` header plus the
+/// fraction-positioned boundary numbers, row 2 is the gradient bar alone.
+const LEGEND_ROWS_PER_BAR: u16 = 2;
+
+/// Rows the task-progress overlay (`render_task_queue`) currently occupies
+/// at the top of the map area: visible tasks, capped at the same
+/// `max_visible` the overlay itself enforces. Kept as a standalone pure
+/// function (not inside `render_task_queue`) so `render_legend` can shrink
+/// its own vertical budget by this amount — the two panels share the
+/// right-hand column on a short terminal and must never overlap — without
+/// changing `render_task_queue` itself.
+fn task_queue_reserved_rows(active_tasks: &[ActiveTask], now: Instant) -> u16 {
+    active_tasks
+        .iter()
+        .filter(|t| t.is_visible(now))
+        .count()
+        .min(MAX_VISIBLE_TASKS) as u16
+}
+
+/// Render the bottom-right legend panel: a two-row block per active scale
+/// (`active_scales`) — row 1 a `name / unit` header followed inline by a
+/// sub-character half-block gradient bar, row 2 fraction-positioned boundary
+/// numbers (`legend_labels`) under the bar, each drawn in its band's tick
+/// colour, read from the shared CP-1 band tables. Mirrors
+/// `render_layer_list`'s placement on the opposite corner. Draws nothing,
+/// and reserves no area, when no colour-carrying scale is active or none
+/// fits the available height.
+///
+/// `reserved_top_rows` is how many rows the task-progress overlay currently
+/// occupies at the top of `area` (see `task_queue_reserved_rows`); the
+/// legend's own available area is shrunk from the top by that amount so a
+/// full task queue on a short terminal makes the legend degrade or draw
+/// nothing rather than draw over the overlay. The task queue takes
+/// precedence and is never moved.
+fn render_legend(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    rms: &RenderModeState,
+    reserved_top_rows: u16,
+) {
+    let scales = active_scales(rms);
+    if scales.is_empty() {
+        return;
+    }
+
+    // Shrink from the top by the task queue's occupied rows, keeping the
+    // bottom edge (and thus the baseline `legend_area` anchors to) fixed.
+    let top_shrink = reserved_top_rows.min(area.height);
+    let area = Rect {
+        x: area.x,
+        y: area.y + top_shrink,
+        width: area.width,
+        height: area.height - top_shrink,
+    };
+
+    // legend_area reserves one row of bottom padding, matching layer_area.
+    let available_height = area.height.saturating_sub(1);
+    let fitted = fitting_scales(&scales, LEGEND_ROWS_PER_BAR, available_height);
+    if fitted.is_empty() {
+        return;
+    }
+
+    let data: Vec<LegendScaleData> = fitted.iter().map(|&s| legend_scale_data(s)).collect();
+
+    // The widest bar among the fitted scales (dBZ has the most bands) sets
+    // the shared width budget; rows still left-align at the same x — a
+    // scale with fewer bands just has a shorter bar. The title column is
+    // fixed to the widest header so every bar (and its numbers) starts at
+    // the same x.
+    let max_band_count = data.iter().map(|d| d.bands.len()).max().unwrap_or(0);
+    let desired_bar_width = legend_bar_width_cells(max_band_count);
+    let title_col_width = data
+        .iter()
+        .map(|d| d.header.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    let bar_width = desired_bar_width.min(area.width.saturating_sub(title_col_width + 1));
+    if bar_width == 0 {
+        return;
+    }
+
+    let panel_width = title_col_width + 1 + bar_width;
+    let legend = legend_area(area, panel_width, fitted.len() as u16 * LEGEND_ROWS_PER_BAR);
+    if legend.width == 0 || legend.height == 0 {
+        return;
+    }
+
+    frame.render_widget(Clear, legend);
+    let bar_x = (legend.x + title_col_width + 1).min(legend.x + legend.width);
+    let buf = frame.buffer_mut();
+
+    for (i, (&scale, d)) in fitted.iter().zip(data.iter()).enumerate() {
+        let y0 = legend.y + i as u16 * LEGEND_ROWS_PER_BAR;
+        let y1 = y0 + 1;
+        if y1 >= legend.y + legend.height {
+            break;
+        }
+        buf.set_string(legend.x, y0, &d.header, Style::default());
+
+        let half_colors = legend_bar_half_colors(&d.bands);
+        let cells = legend_bar_cells(&half_colors);
+        let available_bar_cells =
+            (cells.len() as u16).min(legend.width.saturating_sub(bar_x.saturating_sub(legend.x)));
+
+        // Row 0: the gradient bar, inline with the title.
+        for (cx, &(glyph, style)) in (bar_x..).zip(cells.iter().take(available_bar_cells as usize))
+        {
+            if let Some(cell) = buf.cell_mut((cx, y0)) {
+                cell.set_style(style);
+                cell.set_char(glyph);
+            }
+        }
+
+        // Row 1: boundary numbers, each centred on its fraction position
+        // under the bar above, drawn in its band's tick colour.
+        for (pos, label, color) in legend_labels(scale, &d.bands, available_bar_cells) {
+            let label_width = label.chars().count() as u16;
+            let offset = pos
+                .saturating_sub(label_width / 2)
+                .min(available_bar_cells.saturating_sub(label_width));
+            let x = bar_x + offset;
+            if x + label_width <= legend.x + legend.width {
+                buf.set_string(x, y1, &label, Style::default().fg(to_terminal_color(color)));
+            }
+        }
+    }
 }
 
 fn render_layer_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -4372,6 +4907,733 @@ mod tests {
             completed_at: None,
             last_anim: started_at,
         }
+    }
+
+    // ── map-legend CP-2: legend_area placement + active_scales mapping ──
+
+    /// `legend_area` must sit on the same baseline as `layer_area` (same y,
+    /// same height for a given input) and mirror its inset: two columns from
+    /// the right edge instead of the left.
+    #[test]
+    fn legend_area_mirrors_layer_area_placement() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let main = layer_area(area);
+        let legend = legend_area(area, 20, main.height);
+
+        assert_eq!(legend.y, main.y, "same baseline as the layer panel");
+        assert_eq!(legend.height, main.height);
+        assert_eq!(
+            legend.x + legend.width,
+            area.x + area.width - 2,
+            "right edge sits two columns inset from the right edge, mirroring \
+             the layer panel's left inset of 2"
+        );
+    }
+
+    /// Width and height are clamped the same way `layer_area` clamps its own
+    /// dimensions, so an oversized request never draws outside the map or
+    /// over the footer row.
+    #[test]
+    fn legend_area_clamps_to_available_space() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
+        let legend = legend_area(area, 200, 200);
+
+        assert_eq!(legend.width, area.width.saturating_sub(3));
+        assert_eq!(legend.height, area.height.saturating_sub(1));
+        assert!(legend.x >= area.x);
+        assert!(legend.x + legend.width <= area.x + area.width);
+        assert!(legend.y + legend.height <= area.y + area.height);
+    }
+
+    /// No colour-carrying layer active → nothing to show.
+    #[test]
+    fn active_scales_empty_when_nothing_active() {
+        let rms = RenderModeState::new();
+        assert_eq!(active_scales(&rms), vec![]);
+    }
+
+    /// Radar owning `Braille` is enough to activate the dBZ scale.
+    #[test]
+    fn active_scales_radar_braille_yields_dbz_only() {
+        let mut rms = RenderModeState::new();
+        rms.braille = Some(LayerId::Radar);
+        assert_eq!(active_scales(&rms), vec![LegendScale::Dbz]);
+    }
+
+    /// Both radar (via `Color`) and an observation property active: both
+    /// appear, in fixed declaration order (dBZ before Temperature), not
+    /// activation order.
+    #[test]
+    fn active_scales_radar_and_obs_layer_both_appear_in_declaration_order() {
+        let mut rms = RenderModeState::new();
+        rms.text = Some(LayerId::SurfTemp);
+        rms.color = Some(LayerId::Radar);
+        assert_eq!(
+            active_scales(&rms),
+            vec![LegendScale::Dbz, LegendScale::Temperature]
+        );
+    }
+
+    /// A geographic layer (no colour ramp) owning a mode contributes nothing.
+    #[test]
+    fn active_scales_geographic_layer_contributes_nothing() {
+        let mut rms = RenderModeState::new();
+        rms.text = Some(LayerId::MapBorders);
+        assert_eq!(active_scales(&rms), vec![]);
+    }
+
+    // ── Observation colour scales: map-legend CP-1 band-table extraction ──
+
+    /// Each scale's band table must be retrievable with its correct unit
+    /// label, so the future legend never needs a second hardcoded unit list.
+    #[test]
+    fn obs_scale_reports_correct_unit_per_property() {
+        assert_eq!(obs_scale(ObservationProperty::Temperature).unit, "°C");
+        assert_eq!(obs_scale(ObservationProperty::WindSpeed).unit, "m/s");
+        assert_eq!(obs_scale(ObservationProperty::Humidity).unit, "%");
+        assert_eq!(obs_scale(ObservationProperty::Pressure).unit, "hPa");
+    }
+
+    #[test]
+    fn obs_scale_bands_are_open_ended_at_the_top() {
+        for property in [
+            ObservationProperty::Temperature,
+            ObservationProperty::WindSpeed,
+            ObservationProperty::Humidity,
+            ObservationProperty::Pressure,
+        ] {
+            let scale = obs_scale(property);
+            assert!(
+                scale.bands.last().unwrap().max.is_infinite(),
+                "{property:?} top band must be open-ended"
+            );
+        }
+    }
+
+    // ── map-legend CP-3 rework: sub-character gradient bar ──────────────
+
+    /// Every band contributes exactly `LEGEND_HALF_CELLS_PER_BAND` half-cell
+    /// colour samples — no remainder distribution, so segments stay uniform
+    /// regardless of how many bands a scale has.
+    #[test]
+    fn legend_bar_half_colors_are_uniform_per_band() {
+        for bands in [
+            crate::providers::meteogate::DBZ_BANDS
+                .iter()
+                .map(|b| LegendBand {
+                    max: f64::from(b.max),
+                    color: b.color,
+                })
+                .collect::<Vec<_>>(),
+            TEMPERATURE_BANDS
+                .iter()
+                .map(|b| LegendBand {
+                    max: b.max,
+                    color: b.color,
+                })
+                .collect::<Vec<_>>(),
+        ] {
+            let half_colors = legend_bar_half_colors(&bands);
+            assert_eq!(
+                half_colors.len(),
+                bands.len() * LEGEND_HALF_CELLS_PER_BAND as usize,
+                "every band must contribute the same fixed half-cell count"
+            );
+            for (i, band) in bands.iter().enumerate() {
+                let start = i * LEGEND_HALF_CELLS_PER_BAND as usize;
+                let run = &half_colors[start..start + LEGEND_HALF_CELLS_PER_BAND as usize];
+                assert!(
+                    run.iter().all(|&c| c == to_terminal_color(band.color)),
+                    "band {i}'s half-cells must all carry its own colour"
+                );
+            }
+        }
+    }
+
+    /// `LEGEND_HALF_CELLS_PER_BAND` must be odd — that's what makes a band
+    /// boundary land mid-cell (producing the two-colour `▌` split) rather
+    /// than exactly on a cell edge.
+    #[test]
+    fn legend_half_cells_per_band_is_odd() {
+        assert_eq!(LEGEND_HALF_CELLS_PER_BAND % 2, 1);
+    }
+
+    /// A cell straddling a band boundary is drawn as `▌` carrying the two
+    /// distinct band colours (fg != bg) instead of a blended colour — the
+    /// same half-block idiom `timeline_bar_spans` uses (mirrors the test at
+    /// `a_download_boundary_splits_a_cell_instead_of_blending_it`).
+    #[test]
+    fn legend_bar_boundary_cell_splits_instead_of_blending() {
+        let bands = vec![
+            LegendBand {
+                max: 10.0,
+                color: Rgb8 { r: 255, g: 0, b: 0 },
+            },
+            LegendBand {
+                max: 20.0,
+                color: Rgb8 { r: 0, g: 0, b: 255 },
+            },
+        ];
+        let half_colors = legend_bar_half_colors(&bands);
+        let cells = legend_bar_cells(&half_colors);
+        let split: Vec<_> = cells.iter().filter(|(g, _)| *g == '▌').collect();
+        assert!(
+            !split.is_empty(),
+            "a band boundary must be drawn with ▌, not a blended colour"
+        );
+        for (_, style) in split {
+            assert_ne!(
+                style.fg.unwrap(),
+                style.bg.unwrap(),
+                "a split cell must paint two distinct band colours"
+            );
+        }
+    }
+
+    /// A cell fully inside one band (both half-cells the same colour) is a
+    /// solid colour, not a spurious `▌` split.
+    #[test]
+    fn legend_bar_within_band_cell_is_solid() {
+        let bands = vec![LegendBand {
+            max: 10.0,
+            color: Rgb8 {
+                r: 10,
+                g: 20,
+                b: 30,
+            },
+        }];
+        let half_colors = legend_bar_half_colors(&bands);
+        let cells = legend_bar_cells(&half_colors);
+        assert!(!cells.is_empty());
+        for (glyph, style) in cells {
+            assert_eq!(glyph, ' ', "a solid cell needs no split glyph");
+            assert_eq!(style.bg.unwrap(), to_terminal_color(bands[0].color));
+        }
+    }
+
+    /// A trailing odd half-cell (odd bands × the odd per-band count) must
+    /// still render solid — no half-empty or gap cell.
+    #[test]
+    fn legend_bar_trailing_odd_half_cell_has_no_gap() {
+        let bands = vec![
+            LegendBand {
+                max: 10.0,
+                color: Rgb8 { r: 1, g: 2, b: 3 },
+            },
+            LegendBand {
+                max: 20.0,
+                color: Rgb8 { r: 4, g: 5, b: 6 },
+            },
+            LegendBand {
+                max: 30.0,
+                color: Rgb8 { r: 7, g: 8, b: 9 },
+            },
+        ];
+        let half_colors = legend_bar_half_colors(&bands);
+        assert_eq!(half_colors.len() % 2, 1, "test assumes an odd total");
+        let cells = legend_bar_cells(&half_colors);
+        assert_eq!(cells.len(), half_colors.len().div_ceil(2));
+        let (glyph, style) = cells.last().unwrap();
+        assert_eq!(*glyph, ' ', "trailing odd half-cell must render solid");
+        assert_eq!(style.bg.unwrap(), to_terminal_color(bands[2].color));
+    }
+
+    /// No max_bars room at all (rows_per_bar 0, or height 0) drops everything.
+    #[test]
+    fn fitting_scales_empty_when_nothing_fits() {
+        let scales = vec![LegendScale::Dbz, LegendScale::Temperature];
+        assert_eq!(fitting_scales(&scales, 2, 0), &[] as &[LegendScale]);
+        assert_eq!(fitting_scales(&scales, 0, 100), &[] as &[LegendScale]);
+    }
+
+    /// Enough height for every bar keeps them all.
+    #[test]
+    fn fitting_scales_keeps_everything_when_it_fits() {
+        let scales = vec![LegendScale::Dbz, LegendScale::Temperature];
+        assert_eq!(fitting_scales(&scales, 2, 4), scales.as_slice());
+    }
+
+    /// Short terminal: enough height for one bar only. Since `active_scales`
+    /// is dBZ-first, dropping from the tail keeps dBZ and drops the
+    /// observation scale — the fixed-priority degradation rule.
+    #[test]
+    fn fitting_scales_drops_observation_bars_first_keeping_dbz() {
+        let scales = vec![
+            LegendScale::Dbz,
+            LegendScale::Temperature,
+            LegendScale::WindSpeed,
+        ];
+        assert_eq!(fitting_scales(&scales, 2, 2), &[LegendScale::Dbz]);
+    }
+
+    /// dBZ's start is marked open-low (`<5`) since reflectivity has no
+    /// natural floor, and its end carries a `+` since the top band is
+    /// open-ended.
+    #[test]
+    fn legend_endpoints_dbz_open_low_and_open_high() {
+        let bands: Vec<LegendBand> = crate::providers::meteogate::DBZ_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: f64::from(b.max),
+                color: b.color,
+            })
+            .collect();
+        let (start, end) = legend_endpoints(LegendScale::Dbz, &bands);
+        assert_eq!(start, "<5");
+        assert_eq!(end, "60+");
+    }
+
+    /// Temperature and pressure have no natural domain floor either, but are
+    /// shown as the plain first boundary rather than an open-low marker.
+    #[test]
+    fn legend_endpoints_temperature_and_pressure_use_first_boundary() {
+        let temp_bands: Vec<LegendBand> = TEMPERATURE_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: b.max,
+                color: b.color,
+            })
+            .collect();
+        let (start, end) = legend_endpoints(LegendScale::Temperature, &temp_bands);
+        assert_eq!(start, "-20");
+        assert_eq!(end, "30+");
+
+        let pressure_bands: Vec<LegendBand> = PRESSURE_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: b.max,
+                color: b.color,
+            })
+            .collect();
+        let (start, end) = legend_endpoints(LegendScale::Pressure, &pressure_bands);
+        assert_eq!(start, "980");
+        assert_eq!(end, "1030+");
+    }
+
+    /// Wind speed and humidity are physically non-negative, so their start
+    /// value is the real domain floor (0), not the first colour boundary.
+    #[test]
+    fn legend_endpoints_wind_and_humidity_floor_at_zero() {
+        let wind_bands: Vec<LegendBand> = WIND_SPEED_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: b.max,
+                color: b.color,
+            })
+            .collect();
+        let (start, end) = legend_endpoints(LegendScale::WindSpeed, &wind_bands);
+        assert_eq!(start, "0");
+        assert_eq!(end, "20+");
+
+        let humidity_bands: Vec<LegendBand> = HUMIDITY_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: b.max,
+                color: b.color,
+            })
+            .collect();
+        let (start, _) = legend_endpoints(LegendScale::Humidity, &humidity_bands);
+        assert_eq!(start, "0");
+    }
+
+    /// Humidity's top colour band is open-ended (`>= 85`) like every other
+    /// scale's, but it is a percentage and can never exceed 100 — so its end
+    /// value is the finite `100`, not `85+`.
+    #[test]
+    fn legend_endpoints_humidity_ends_at_finite_100() {
+        assert!(
+            HUMIDITY_BANDS.last().unwrap().max.is_infinite(),
+            "test assumes the band table itself is open-ended"
+        );
+        let bands: Vec<LegendBand> = HUMIDITY_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: b.max,
+                color: b.color,
+            })
+            .collect();
+        let (_, end) = legend_endpoints(LegendScale::Humidity, &bands);
+        assert_eq!(end, "100", "humidity must never show an open-ended +");
+    }
+
+    /// `legend_labels` positions are strictly monotonic increasing, the low
+    /// and high markers are always present at the bar's edges, and the kept
+    /// positions are an EVENLY-SPACED (uniform-stride) subset — every gap
+    /// between consecutive labels is equal within +/-1 cell, except possibly
+    /// the final interval into the high-end marker. A merely min-gap-
+    /// satisfying but irregular subset (the old greedy behaviour) would fail
+    /// this: it could keep positions with gaps like 5, 15, 40 (uneven) as
+    /// long as each pair cleared the minimum.
+    #[test]
+    fn legend_labels_evenly_spaced_low_high_always_present() {
+        let bands: Vec<LegendBand> = crate::providers::meteogate::DBZ_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: f64::from(b.max),
+                color: b.color,
+            })
+            .collect();
+        let bar_width = legend_bar_width_cells(bands.len());
+        let labels = legend_labels(LegendScale::Dbz, &bands, bar_width);
+
+        assert_eq!(labels.first().unwrap().1, "<5", "low-end marker missing");
+        assert!(
+            labels.last().unwrap().1.ends_with('+'),
+            "high-end marker missing its open-ended +: {:?}",
+            labels.last()
+        );
+        assert_eq!(labels.last().unwrap().0, bar_width);
+        assert_eq!(labels.first().unwrap().0, 0);
+
+        // Tick colours: low marker -> first band, high marker -> last band, an
+        // interior label -> the band whose upper bound it names.
+        assert_eq!(
+            labels.first().unwrap().2,
+            bands[0].color,
+            "low marker must carry the first band's colour"
+        );
+        assert_eq!(
+            labels.last().unwrap().2,
+            bands.last().unwrap().color,
+            "high marker must carry the last band's colour"
+        );
+        let interior = labels
+            .iter()
+            .find(|(_, label, _)| label.parse::<f64>().is_ok())
+            .expect("must have at least one interior boundary number");
+        let value: f64 = interior.1.parse().unwrap();
+        let expected = bands
+            .iter()
+            .find(|b| (b.max - value).abs() < f64::EPSILON)
+            .unwrap()
+            .color;
+        assert_eq!(
+            interior.2, expected,
+            "interior label {:?} must carry its own band's colour",
+            interior.1
+        );
+
+        let positions: Vec<u16> = labels.iter().map(|(pos, _, _)| *pos).collect();
+        for pair in positions.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "positions must be strictly increasing: {labels:?}"
+            );
+        }
+
+        let gaps: Vec<u16> = positions.windows(2).map(|w| w[1] - w[0]).collect();
+        // Every gap except the final one (into the high-end marker, which may
+        // be a shorter or longer leftover interval) must be equal within one
+        // cell of every other non-final gap.
+        if gaps.len() > 2 {
+            let regular_gaps = &gaps[..gaps.len() - 1];
+            let min_gap = *regular_gaps.iter().min().unwrap();
+            let max_gap = *regular_gaps.iter().max().unwrap();
+            assert!(
+                max_gap - min_gap <= 1,
+                "non-final gaps must be evenly spaced within 1 cell: {gaps:?}"
+            );
+        }
+    }
+
+    /// A narrow bar drops every interior candidate (there's no room for any
+    /// of them without violating the min-gap rule) but low and high survive
+    /// regardless — degradation never removes the two mandatory markers.
+    #[test]
+    fn legend_labels_narrow_bar_drops_interior_keeps_low_and_high() {
+        let bands: Vec<LegendBand> = crate::providers::meteogate::DBZ_BANDS
+            .iter()
+            .map(|b| LegendBand {
+                max: f64::from(b.max),
+                color: b.color,
+            })
+            .collect();
+        let labels = legend_labels(LegendScale::Dbz, &bands, LEGEND_LABEL_MIN_GAP);
+        assert_eq!(
+            labels.len(),
+            2,
+            "a bar too narrow for any interior gap should keep only low+high: {labels:?}"
+        );
+        assert_eq!(labels[0].1, "<5");
+        assert!(labels[1].1.ends_with('+'));
+    }
+
+    /// No active scale → nothing renders and no legend area is reserved
+    /// (checked indirectly: the buffer is untouched where the legend would
+    /// have drawn).
+    #[test]
+    fn render_legend_draws_nothing_when_no_scale_active() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let rms = RenderModeState::new();
+        let mut t = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        t.draw(|f| render_legend(f, f.area(), &rms, 0)).unwrap();
+        let b = t.backend().buffer();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                assert_eq!(b[(x, y)].symbol(), " ", "cell ({x},{y}) was drawn on");
+            }
+        }
+    }
+
+    /// Radar active renders a dBZ bar: colours from `DBZ_BANDS` appear
+    /// low→high left→right on the gradient row (row 1 of the scale's
+    /// two-row block, inline with the title), a `▌` two-colour boundary
+    /// split appears on that same UPPER row, the boundary numbers appear on
+    /// the LOWER row under it (row 2) each in its band's tick colour, and
+    /// the footer row (last row) is never touched.
+    #[test]
+    fn render_legend_radar_active_draws_low_to_high_dbz_bar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut rms = RenderModeState::new();
+        rms.braille = Some(LayerId::Radar);
+        let mut t = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let footer_y = t.backend().buffer().area.height - 1;
+        t.draw(|f| render_legend(f, f.area(), &rms, 0)).unwrap();
+        let b = t.backend().buffer();
+
+        let bands = crate::providers::meteogate::DBZ_BANDS;
+        let first_bg = to_terminal_color(bands.first().unwrap().color);
+        let last_bg = to_terminal_color(bands.last().unwrap().color);
+        // Not testing an exact y (legend is bottom-aligned): find whichever
+        // row carries the lowest band's colour, then assert the highest
+        // band's colour is on that SAME row — proving the gradient is one
+        // row, not spread across a bar row plus a separate label row.
+        let row_with =
+            |c: Color| (0..b.area.height).find(|&y| (0..b.area.width).any(|x| b[(x, y)].bg == c));
+        let first_row = row_with(first_bg).expect("lowest dBZ band colour missing from the bar");
+        let last_row = row_with(last_bg).expect("highest dBZ band colour missing from the bar");
+        assert_eq!(
+            first_row, last_row,
+            "low and high band colours must be on the same single (upper) row"
+        );
+
+        // The upper row (y0, inline with the title) must carry a `▌`
+        // two-colour split at a boundary.
+        let split_x = (0..b.area.width).find(|&x| b[(x, first_row)].symbol() == "▌");
+        let split_x = split_x.expect("gradient row must contain a ▌ boundary split cell");
+        let cell = &b[(split_x, first_row)];
+        assert_ne!(
+            cell.fg, cell.bg,
+            "a ▌ split cell must carry two distinct band colours"
+        );
+
+        // The row below the gradient (y1) must carry a boundary number.
+        let numbers_row = first_row + 1;
+        let mut numbers_row_text = String::new();
+        for x in 0..b.area.width {
+            numbers_row_text.push_str(b[(x, numbers_row)].symbol());
+        }
+        assert!(
+            numbers_row_text.chars().any(|c| c.is_ascii_digit()),
+            "row below the bar must show boundary numbers: {numbers_row_text:?}"
+        );
+
+        // The high marker (`60+`) must be drawn in the last dBZ band's colour.
+        let high_marker_x = (0..b.area.width).find(|&x| {
+            let text: String = (x..b.area.width)
+                .take(3)
+                .map(|cx| b[(cx, numbers_row)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            text.starts_with("60+")
+        });
+        let high_marker_x = high_marker_x.expect("high marker `60+` missing from the numbers row");
+        assert_eq!(
+            b[(high_marker_x, numbers_row)].fg,
+            last_bg,
+            "the high marker must be drawn in the last band's tick colour"
+        );
+
+        for x in 0..b.area.width {
+            assert_eq!(
+                b[(x, footer_y)].bg,
+                Color::Reset,
+                "legend must never draw over the footer row"
+            );
+        }
+    }
+
+    /// An observation property active renders its bar with the correct unit
+    /// in the name column.
+    #[test]
+    fn render_legend_obs_property_shows_correct_unit() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut rms = RenderModeState::new();
+        rms.text = Some(LayerId::SurfWind);
+        let mut t = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        t.draw(|f| render_legend(f, f.area(), &rms, 0)).unwrap();
+        let b = t.backend().buffer();
+
+        let mut text = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                text.push_str(b[(x, y)].symbol());
+            }
+        }
+        assert!(
+            text.contains("m/s"),
+            "wind legend must show its unit: {text:?}"
+        );
+    }
+
+    /// Both radar and an observation property active: two two-row blocks
+    /// stack (header text for both scales is present).
+    #[test]
+    fn render_legend_both_active_stack_as_horizontal_strips() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut rms = RenderModeState::new();
+        rms.braille = Some(LayerId::Radar);
+        rms.color = Some(LayerId::SurfTemp);
+        let mut t = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        t.draw(|f| render_legend(f, f.area(), &rms, 0)).unwrap();
+        let b = t.backend().buffer();
+
+        let mut text = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                text.push_str(b[(x, y)].symbol());
+            }
+        }
+        assert!(
+            text.contains("dBZ"),
+            "dBZ bar's name column missing: {text:?}"
+        );
+        assert!(
+            text.contains("Temp"),
+            "Temp bar's name column missing: {text:?}"
+        );
+    }
+
+    /// A short terminal drops whole bars, keeping dBZ and dropping the
+    /// observation bar first.
+    #[test]
+    fn render_legend_short_terminal_keeps_dbz_drops_obs_first() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut rms = RenderModeState::new();
+        rms.braille = Some(LayerId::Radar);
+        rms.color = Some(LayerId::SurfTemp);
+        // Just enough height for one two-row block (LEGEND_ROWS_PER_BAR = 2)
+        // plus the one row of bottom padding `legend_area`/`layer_area`
+        // reserve — not enough for a second block.
+        let mut t = Terminal::new(TestBackend::new(60, 3)).unwrap();
+        t.draw(|f| render_legend(f, f.area(), &rms, 0)).unwrap();
+        let b = t.backend().buffer();
+
+        let mut text = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                text.push_str(b[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains("dBZ"), "dBZ bar should survive: {text:?}");
+        assert!(
+            !text.contains("Temp"),
+            "obs bar should be dropped first: {text:?}"
+        );
+    }
+
+    /// A full task queue (8 visible tasks, `render_task_queue`'s cap) reserves
+    /// its rows across the whole width; on a terminal short enough that naive
+    /// top-height + bottom-height would collide, `render_legend` must never
+    /// write into those reserved rows. Sentinel-fills the reserved region
+    /// before drawing (rather than invoking `render_task_queue`, which needs
+    /// a full `App`) so the assertion is a direct buffer check against the
+    /// real `render_legend` under the exact budget `render_task_queue`
+    /// exposes via `task_queue_reserved_rows`.
+    #[test]
+    fn render_legend_never_overlaps_a_full_task_queue_on_a_short_terminal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut rms = RenderModeState::new();
+        rms.braille = Some(LayerId::Radar);
+        rms.color = Some(LayerId::SurfTemp);
+
+        // Height 10: naive top(8) + bottom(2 scales * 2 rows + 1 padding = 5)
+        // = 13 > 10, so without the guard the two regions would collide.
+        let mut t = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let reserved = 8u16;
+
+        // Both writes must happen in the same `draw` call: `Terminal` double-
+        // buffers, so a sentinel written in one `draw` is gone (reset to
+        // blank) by the time the next `draw` call hands out its buffer.
+        t.draw(|f| {
+            let area = f.area();
+            {
+                let buf = f.buffer_mut();
+                for y in 0..reserved {
+                    for x in 0..area.width {
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_char('Q');
+                        }
+                    }
+                }
+            }
+            render_legend(f, area, &rms, reserved);
+        })
+        .unwrap();
+        let b = t.backend().buffer();
+
+        for y in 0..reserved {
+            for x in 0..b.area.width {
+                assert_eq!(
+                    b[(x, y)].symbol(),
+                    "Q",
+                    "legend wrote into the task queue's reserved row ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// A long-running, already-visible task — `started_at` set well past
+    /// `TASK_VISIBLE_AFTER` so `is_visible` returns true at `now`.
+    fn visible_task(id: u64) -> ActiveTask {
+        ActiveTask {
+            id,
+            label: "test".into(),
+            action: String::new(),
+            fraction: Some(0.5),
+            display_fraction: 0.5,
+            anim_from: 0.5,
+            anim_t: 1.0,
+            kind: TaskKind::RadarFrame,
+            state: TaskState::Running,
+            started_at: Instant::now() - Duration::from_secs(1),
+            completed_at: None,
+            last_anim: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn task_queue_reserved_rows_caps_at_eight_visible_tasks() {
+        let now = Instant::now();
+        let tasks: Vec<ActiveTask> = (0..12).map(visible_task).collect();
+        assert_eq!(task_queue_reserved_rows(&tasks, now), 8);
+    }
+
+    #[test]
+    fn task_queue_reserved_rows_counts_only_visible_tasks() {
+        let now = Instant::now();
+        assert_eq!(task_queue_reserved_rows(&[], now), 0);
     }
 
     // ── Task overlay: CP-5 deterministic overflow sort ─────────────────

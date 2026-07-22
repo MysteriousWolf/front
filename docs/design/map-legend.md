@@ -112,12 +112,59 @@ functions they describe, exported as data that both the renderer and the legend
 read. `dbz_to_color` and `obs_color` become consumers of that table rather than
 owners of a threshold chain.
 
-## Open questions
+## Resolved — horizontal colour bars (2026-07-22)
+
+The CP-2 → CP-3 gate resolved the layout and both open questions with the user.
+The legend is **not** a vertical stack of banded rows. Each active scale is a
+**compact horizontal colour bar**:
+
+- **Orientation:** horizontal. Low → high runs left → right.
+- **Colour source:** the discrete band colours from the CP-1 tables, laid
+  edge-to-edge as cell **background** colours. No interpolation — the bar shows
+  the exact colours the map paints; it reads as a near-continuous gradient only
+  because each band spans several cells. This keeps the earlier "no continuous
+  gradients" non-goal honest while giving the smooth look the user wanted.
+- **Width:** every bar shares one fixed width so the bars align into a neat
+  column regardless of how many bands each scale has (dBZ 10, obs 5–6). Labels
+  are positioned by fraction along that fixed width.
+- **Layout (two rows per scale):** row 1 (top) is the `name / unit` title on the
+  left (`Reflect / dBZ`, `Temp / °C`, `Wind / m/s`, `Humid / %`, `Press / hPa` — a
+  slash not parentheses, the scientific quantity/unit axis convention) followed
+  INLINE by the gradient bar (the colour scale on the title's row). Row 2 (bottom)
+  is the numbers, aligned under the bar, each drawn in the colour of the band it
+  marks (its tick colour) so it reads as belonging to that point on the gradient
+  above it. Blocks left-align in a fixed title column so the bars begin at the same
+  x. Numbers are an evenly-spaced (uniform-stride) subset of the band boundaries
+  (low/high always kept); the bar is kept compact. Several rendered-legend reviews
+  (2026-07-22) drove this shape: numbers on their own row above a separate bar made
+  it hard to tell which tick a number belonged to, so the bar moved inline with the
+  title and each number took its band's colour.
+- **Bar (sub-character gradient):** rendered with half-block glyphs at 2× horizontal
+  resolution — each terminal cell carries two band colours (foreground + background
+  halves), so band edges fall at half-cell granularity and the bar reads as a finer,
+  smoother gradient than chunky full-cell segments. Still only the discrete band
+  colours (no interpolation) — every band occupies the same fixed number of
+  half-cells, so segments stay uniform.
+- **Labels:** only the start and end values, placed beside the bar (not over it) on
+  row 2. An earlier rendered-legend review showed interior labels collide/merge on a
+  narrow bar (`560+`, `2030+`), so interior labels stay dropped; the gradient carries
+  the middle.
+
+**Degradation** is now fixed-priority, not recency-based: keep the radar (dBZ)
+bar, drop observation bars first, always whole bars, never partial. Rationale:
+each bar is only a few rows tall so the height budget is rarely tight, and no
+activation-recency state exists in `RenderModeState` (primary mode slots are bare
+`Option<LayerId>` with no activation order). `active_scales` already returns
+dBZ-first declaration order, so "drop from the tail" implements this directly.
+
+Placement (`legend_area`, bottom-right mirror of `layer_area`) and the
+band-derivation principle below are unchanged by this reshape.
+
+## Original open questions (resolved above)
 
 - Should the dBZ block show every one of the eleven bands, or condense to the
-  labelled decades (5/15/25/35/45/55/60+)? Eleven rows is tall next to a
-  five-row temperature block. Leaning condensed, but this is a visual judgement
-  better made against a rendered mock than argued in prose.
-- Does the legend need a unit suffix per block (`dBZ`, `°C`, `m/s`, `%`, `hPa`)
-  as a header row, or is the layer name enough? A header row costs one row per
-  block against the height budget.
+  labelled decades (5/15/25/35/45/55/60+)? — Resolved: the full scale renders as
+  one horizontal bar, so row-count is no longer the constraint.
+- Does the legend need a unit suffix per block as a header row, or is the layer
+  name enough? — Resolved: name column + sparse labels carry the unit; no
+  separate header row.
