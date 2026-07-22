@@ -926,6 +926,53 @@ fn desc_span(desc: &str) -> Span<'static> {
     )
 }
 
+/// Current resident-set size of this process in bytes, or `None` when it
+/// can't be read.  Backs the help modal's memory readout so cache growth
+/// (radar frames especially) can be watched at a glance.
+///
+/// Reads `/proc/self/status`'s `VmRSS`, which is already reported in kB —
+/// no page-size arithmetic — so this is Linux-only; every other platform
+/// gets `None` and the readout is simply omitted.
+fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        parse_vmrss_kib(&status).map(|kib| kib * 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Pull the `VmRSS` value (in kB) out of `/proc/self/status` contents.
+/// The line looks like `VmRSS:\t  123456 kB`; the number is the first
+/// whitespace-separated token after the label.
+fn parse_vmrss_kib(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Format a byte count as a short human-readable string (e.g. `312.4 MB`).
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else {
+        format!("{:.0} KB", b / KIB)
+    }
+}
+
 /// Build the help modal's lines from the keybinding registry.
 ///
 /// Every row comes from [`keys::BINDINGS`], so a binding added there appears
@@ -971,6 +1018,14 @@ fn help_lines() -> Vec<TextLine<'static>> {
                 Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
             ]));
         }
+    }
+
+    if let Some(bytes) = process_rss_bytes() {
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(Span::styled(
+            format!("  Memory: {}", format_bytes(bytes)),
+            Style::default().fg(Color::Gray),
+        )));
     }
 
     lines.push(TextLine::from(""));
@@ -4904,6 +4959,31 @@ mod tests {
             completed_at: None,
             last_anim: started_at,
         }
+    }
+
+    // ── help modal: process RAM readout ────────────────────────────────
+
+    /// The real `/proc/self/status` layout: tab-indented label, value, unit.
+    #[test]
+    fn parse_vmrss_pulls_the_kib_value() {
+        let status = "Name:\tfront\nVmPeak:\t  999999 kB\nVmRSS:\t  312460 kB\nThreads:\t8\n";
+        assert_eq!(parse_vmrss_kib(status), Some(312_460));
+    }
+
+    /// A status blob without a VmRSS line yields nothing rather than a wrong
+    /// number scraped from an adjacent field.
+    #[test]
+    fn parse_vmrss_absent_is_none() {
+        assert_eq!(parse_vmrss_kib("Name:\tfront\nThreads:\t8\n"), None);
+    }
+
+    /// Human-readable formatting steps through KB / MB / GB at the 1024
+    /// boundaries with the decimal precision the readout shows.
+    #[test]
+    fn format_bytes_scales_by_unit() {
+        assert_eq!(format_bytes(512 * 1024), "512 KB");
+        assert_eq!(format_bytes(312_460 * 1024), "305.1 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
     }
 
     // ── map-legend CP-2: legend_area placement + active_scales mapping ──
