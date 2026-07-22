@@ -1607,15 +1607,7 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, reuse_r
             height,
             frame.buffer_mut(),
         );
-        if !app.is_dragging {
-            render_layer_list(frame, area, app);
-            let now = Instant::now();
-            let reserved = task_queue_reserved_rows(&app.active_tasks, now);
-            if app.show_legend {
-                render_legend(frame, area, app.layers.mode_state(), reserved);
-            }
-            render_task_queue(frame, area, app, now);
-        }
+        render_map_chrome(frame, area, app);
         return;
     }
 
@@ -1722,15 +1714,20 @@ fn render_map(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, reuse_r
         frame.buffer_mut(),
     );
     app.braille_frame = braille_frame;
-    if !app.is_dragging {
-        render_layer_list(frame, area, app);
-        let now = Instant::now();
-        let reserved = task_queue_reserved_rows(&app.active_tasks, now);
-        if app.show_legend {
-            render_legend(frame, area, app.layers.mode_state(), reserved);
-        }
-        render_task_queue(frame, area, app, now);
+    render_map_chrome(frame, area, app);
+}
+
+/// Draw the map's overlaid chrome: the bottom-left layer panel, the
+/// bottom-right colour legend, and the background-task overlay.  Rendered on
+/// every frame — including mid-drag — so panning the map never blanks them out.
+fn render_map_chrome(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    render_layer_list(frame, area, app);
+    let now = Instant::now();
+    let reserved = task_queue_reserved_rows(&app.active_tasks, now);
+    if app.show_legend {
+        render_legend(frame, area, app.layers.mode_state(), reserved);
     }
+    render_task_queue(frame, area, app, now);
 }
 
 fn get_or_compute_border_mask(
