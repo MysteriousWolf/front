@@ -202,6 +202,9 @@ fn show_station_names(zoom: f64) -> bool {
 /// a newly opened 5-minute slot.
 const RADAR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often RSS is sampled for the help HUD's memory sparkline.
+const MEM_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Minimum time between observation / warning refresh attempts.
 /// Matches the providers' cache TTLs so polling faster would only burn
 /// requests on data that hasn't changed.
@@ -215,6 +218,45 @@ const STATE_SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// a busy feed would drive a full re-raster per arrival.  Coalescing to
 /// 30 fps bounds that cost while staying well above what reads as smooth.
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Redraw ceiling while smooth playback is animating: 60 fps. The per-frame
+/// cost is a parallel warp+blend sample per sub-cell (cheap since the linear-Z
+/// LUT replaced `powf`), so the tighter cap is affordable here and is what lets
+/// the interpolation actually look smooth rather than being pinned to 30 fps by
+/// [`MIN_FRAME_INTERVAL`]. Only in effect during `Playing` + `smoothing`.
+const SMOOTH_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Fold one frame's inter-draw interval into the smoothed FPS shown in the help
+/// modal. Idle gaps (no redraw for a while — nothing to draw) are ignored so
+/// the number reflects the active render cadence during playback/interaction,
+/// not the wall-clock time since the app last had work.
+fn update_render_fps(app: &mut App, dt: Duration) {
+    let secs = dt.as_secs_f32();
+    if secs <= 0.0 || dt > Duration::from_millis(200) {
+        return;
+    }
+    let inst = 1.0 / secs;
+    app.render_fps = if app.render_fps <= 0.0 {
+        inst
+    } else {
+        app.render_fps * 0.85 + inst * 0.15
+    };
+    app.push_fps_sample(inst);
+}
+
+/// The active redraw-rate ceiling: the tighter 60 fps cap while smooth playback
+/// animates a morph pair, or while dragging the map (panning wants to feel as
+/// fluid as playback), otherwise the default 30 fps.
+fn frame_cap(app: &App) -> Duration {
+    let smoothing = app.playback_mode == PlaybackMode::Playing
+        && app.config.playback.smoothing
+        && app.frame_index >= 1;
+    if smoothing || app.is_dragging {
+        SMOOTH_FRAME_INTERVAL
+    } else {
+        MIN_FRAME_INTERVAL
+    }
+}
 
 /// Redraw cadence for fast animations (spinners, lightning impact flash).
 const ANIM_FAST: Duration = Duration::from_millis(50);
@@ -314,6 +356,16 @@ fn animation_interval(app: &App) -> Option<Anim> {
     None
 }
 
+/// Linear sub-frame morph phase: `elapsed / interval`, clamped to `[0, 1]`.
+/// Pure so the playback tick's phase math is unit-testable without a
+/// running event loop.
+fn morph_phase(elapsed: Duration, interval: Duration) -> f32 {
+    if interval.is_zero() {
+        return 1.0;
+    }
+    (elapsed.as_secs_f32() / interval.as_secs_f32()).clamp(0.0, 1.0)
+}
+
 /// How long to block waiting for input.
 ///
 /// This is the loop's idle cost: `event::poll` returns the instant input
@@ -332,7 +384,7 @@ fn poll_timeout(
     // A pending redraw was held back by the frame cap — wait out the
     // remainder and nothing longer.
     if dirty {
-        return MIN_FRAME_INTERVAL.saturating_sub(last_render.elapsed());
+        return frame_cap(app).saturating_sub(last_render.elapsed());
     }
 
     let mut timeout = IDLE_POLL;
@@ -344,6 +396,11 @@ fn poll_timeout(
         let base = Duration::from_millis(app.playback_speed.interval_ms());
         let interval = if app.frame_index == 0 { base * 3 } else { base };
         timeout = timeout.min(interval.saturating_sub(last_playback_step.elapsed()));
+        // Smoothing needs to redraw at 60 fps to animate the phase, not
+        // just at the (much longer) step interval.
+        if app.config.playback.smoothing && app.frame_index >= 1 {
+            timeout = timeout.min(SMOOTH_FRAME_INTERVAL);
+        }
     }
     let now = Instant::now();
     for deadline in [next_interaction_refresh, next_zoom_refresh]
@@ -370,12 +427,14 @@ async fn run_loop(
     let mut state_dirty = false;
     let mut last_state_save = Instant::now();
     let mut last_playback_step = Instant::now();
+    let mut last_mem_sample: Option<Instant> = None;
     loop {
         // Any of these can change what the map shows, so a redraw they cause
         // must re-rasterise rather than reuse the cached frame.
         let drained = app.drain_border_results()
             | app.drain_field_results()
             | app.drain_field_preload_results()
+            | app.drain_flow_results()
             | app.drain_frame_list()
             | app.drain_task_messages()
             | app.drain_obs_results()
@@ -417,6 +476,12 @@ async fn run_loop(
                 app.playback_step();
                 app.request_meteogate_refresh(app.map_width, app.map_height);
                 dirty = true;
+            } else if app.config.playback.smoothing && app.frame_index >= 1 {
+                // Between steps: advance the morph phase off wall-clock so
+                // motion is constant-velocity. Never at the seam
+                // (`frame_index == 0`) — that dwell is a plain hard-cut wait.
+                app.playback_phase = morph_phase(last_playback_step.elapsed(), interval);
+                dirty = true;
             }
         }
         // Staleness: re-fetch observations and warnings while their
@@ -446,6 +511,14 @@ async fn run_loop(
             app.save_state();
             state_dirty = false;
             last_state_save = Instant::now();
+        }
+        // Sample RSS on a timer for the help HUD's memory sparkline. Reading
+        // /proc every frame would be wasteful; twice a second is plenty.
+        if last_mem_sample.is_none_or(|t| t.elapsed() >= MEM_SAMPLE_INTERVAL) {
+            if let Some(bytes) = process_rss_bytes() {
+                app.push_mem_sample(bytes);
+            }
+            last_mem_sample = Some(Instant::now());
         }
         if pending_interaction_refresh
             && next_interaction_refresh.is_some_and(|deadline| Instant::now() >= deadline)
@@ -482,9 +555,14 @@ async fn run_loop(
             next_zoom_refresh = None;
             dirty = true;
         }
-        if dirty && last_render.elapsed() >= MIN_FRAME_INTERVAL {
+        // Keep the pre-decoded interpolation pair in sync with the playhead and
+        // flow cache before rendering (cheap; decodes only on a pair change).
+        app.refresh_active_interp();
+        if dirty && last_render.elapsed() >= frame_cap(app) {
             // State changed — always re-rasterise.
+            let dt = last_render.elapsed();
             terminal.draw(|frame| render(frame, app, false))?;
+            update_render_fps(app, dt);
             dirty = false;
             last_render = Instant::now();
         } else if !dirty {
@@ -493,7 +571,9 @@ async fn run_loop(
             // which is what keeps the live pulse essentially free.
             if let Some(anim) = animation_interval(app) {
                 if last_render.elapsed() >= anim.interval {
+                    let dt = last_render.elapsed();
                     terminal.draw(|frame| render(frame, app, !anim.needs_raster))?;
+                    update_render_fps(app, dt);
                     last_render = Instant::now();
                 }
             }
@@ -897,7 +977,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App, reuse_raster: bool) {
     }
 
     if app.show_help {
-        render_help(frame, frame.area());
+        let perf = perf_hud(app);
+        render_help(frame, frame.area(), &perf);
     }
     if app.settings.is_some() {
         render_settings(frame, frame.area(), app);
@@ -974,12 +1055,111 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Colour tier for a frame rate: red < 24, orange < 30, yellow < 50, else
+/// green. The thresholds are the ones a viewer cares about — below 24 reads as
+/// choppy, 30 as passable, 50 as near-smooth, 60+ as smooth.
+fn fps_color(fps: f32) -> Color {
+    if fps < 24.0 {
+        Color::Red
+    } else if fps < 30.0 {
+        Color::Rgb(255, 140, 0) // orange
+    } else if fps < 50.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// One braille cell (2 columns × 4 dots) rendering two vertical bars of height
+/// 0–4, filled from the bottom up. Used to pack two data points per character
+/// into a compact sparkline.
+fn braille_bar_char(left: u8, right: u8) -> char {
+    // Dot bit values, bottom → top, per column (Unicode braille layout).
+    const LEFT: [u8; 4] = [0x40, 0x04, 0x02, 0x01];
+    const RIGHT: [u8; 4] = [0x80, 0x20, 0x10, 0x08];
+    let mut bits = 0u8;
+    for &b in LEFT.iter().take(left.min(4) as usize) {
+        bits |= b;
+    }
+    for &b in RIGHT.iter().take(right.min(4) as usize) {
+        bits |= b;
+    }
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
+
+/// A compact braille sparkline of the most recent `values`, auto-scaled to the
+/// series max, two samples per character. Empty when there is no data.
+fn braille_sparkline(values: &[f32], max_chars: usize) -> String {
+    if values.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+    let start = values.len().saturating_sub(max_chars * 2);
+    let slice = &values[start..];
+    let maxv = slice.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+    let height = |v: f32| -> u8 { ((v / maxv).clamp(0.0, 1.0) * 4.0).round() as u8 };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < slice.len() {
+        let l = height(slice[i]);
+        let r = if i + 1 < slice.len() {
+            height(slice[i + 1])
+        } else {
+            0
+        };
+        out.push(braille_bar_char(l, r));
+        i += 2;
+    }
+    out
+}
+
+/// The value at the `pct` low percentile of `values` (e.g. `pct = 1.0` is the
+/// "1% low"): sort ascending, index at that percentile. `None` when empty.
+fn percentile_low(values: &[f32], pct: f32) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v: Vec<f32> = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((pct / 100.0) * (v.len() as f32 - 1.0)).round() as usize;
+    v.get(idx.min(v.len() - 1)).copied()
+}
+
+/// Display-ready performance figures for the help modal's FPS/memory HUD.
+struct PerfHud {
+    fps: f32,
+    fps_low_1: Option<f32>,
+    fps_low_5: Option<f32>,
+    fps_spark: String,
+    mem_bytes: Option<u64>,
+    mem_spark: String,
+}
+
+/// Minimum FPS samples before the percentile-lows are meaningful.
+const PERF_MIN_SAMPLES: usize = 20;
+
+/// Width (in braille characters) of the HUD sparklines.
+const PERF_SPARK_CHARS: usize = 24;
+
+fn perf_hud(app: &App) -> PerfHud {
+    let fps: Vec<f32> = app.fps_history.iter().copied().collect();
+    let enough = fps.len() >= PERF_MIN_SAMPLES;
+    let mem: Vec<f32> = app.mem_history.iter().map(|&b| b as f32).collect();
+    PerfHud {
+        fps: app.render_fps,
+        fps_low_1: enough.then(|| percentile_low(&fps, 1.0)).flatten(),
+        fps_low_5: enough.then(|| percentile_low(&fps, 5.0)).flatten(),
+        fps_spark: braille_sparkline(&fps, PERF_SPARK_CHARS),
+        mem_bytes: app.mem_history.back().copied().or_else(process_rss_bytes),
+        mem_spark: braille_sparkline(&mem, PERF_SPARK_CHARS),
+    }
+}
+
 /// Build the help modal's lines from the keybinding registry.
 ///
 /// Every row comes from [`keys::BINDINGS`], so a binding added there appears
 /// here automatically.  The key and name columns are each padded to their
 /// widest entry, so all three columns line up across all four sections.
-fn help_lines() -> Vec<TextLine<'static>> {
+fn help_lines(perf: &PerfHud) -> Vec<TextLine<'static>> {
     let rows = || keys::BINDINGS.iter().filter(|b| b.help_keys.is_some());
     let key_w = rows()
         .filter_map(|b| b.help_keys)
@@ -1021,13 +1201,52 @@ fn help_lines() -> Vec<TextLine<'static>> {
         }
     }
 
-    if let Some(bytes) = process_rss_bytes() {
-        lines.push(TextLine::from(""));
-        lines.push(TextLine::from(Span::styled(
-            format!("  Memory: {}", format_bytes(bytes)),
-            Style::default().fg(Color::Gray),
-        )));
+    lines.push(TextLine::from(""));
+
+    // FPS: current value coloured by tier, then 1%/5% lows, then a sparkline.
+    let mut fps_spans: Vec<Span<'static>> = vec![Span::raw("  FPS: ")];
+    if perf.fps >= 1.0 {
+        fps_spans.push(Span::styled(
+            format!("{:>3}", perf.fps.round() as i64),
+            Style::default()
+                .fg(fps_color(perf.fps))
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        fps_spans.push(Span::styled("  —", Style::default().fg(Color::DarkGray)));
     }
+    if let (Some(l1), Some(l5)) = (perf.fps_low_1, perf.fps_low_5) {
+        fps_spans.push(Span::styled(
+            format!("   1% {l1:.0}   5% {l5:.0}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if !perf.fps_spark.is_empty() {
+        fps_spans.push(Span::raw("   "));
+        fps_spans.push(Span::styled(
+            perf.fps_spark.clone(),
+            Style::default().fg(fps_color(perf.fps)),
+        ));
+    }
+    lines.push(TextLine::from(fps_spans));
+
+    // Memory: current RSS, then a sparkline of recent samples.
+    let mem_str = perf
+        .mem_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "—".to_string());
+    let mut mem_spans: Vec<Span<'static>> = vec![Span::styled(
+        format!("  Memory: {mem_str}"),
+        Style::default().fg(Color::Gray),
+    )];
+    if !perf.mem_spark.is_empty() {
+        mem_spans.push(Span::raw("   "));
+        mem_spans.push(Span::styled(
+            perf.mem_spark.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    lines.push(TextLine::from(mem_spans));
 
     lines.push(TextLine::from(""));
     lines.push(TextLine::from(Span::styled(
@@ -1039,8 +1258,8 @@ fn help_lines() -> Vec<TextLine<'static>> {
     lines
 }
 
-fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let content = help_lines();
+fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect, perf: &PerfHud) {
+    let content = help_lines(perf);
 
     // `Clear` resets the cells the modal covers, so the block needs no fill of
     // its own — it inherits the terminal's own background, whatever that is.
@@ -1209,6 +1428,7 @@ fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let legend = if state.editing {
         match state.model.focused().kind {
             crate::settings::FieldKind::Bool => "←→ toggle   enter save   esc cancel",
+            crate::settings::FieldKind::Choice => "←→ cycle   enter save   esc cancel",
             crate::settings::FieldKind::Secret => "type to edit   enter save   esc cancel",
         }
     } else {
@@ -1453,11 +1673,13 @@ fn timeline_line(app: &App, avail: u16) -> TextLine<'static> {
             .iter()
             .map(|ts| app.slot_state(*ts))
             .collect();
+        let flow: Vec<bool> = (0..frame_count).map(|i| app.slot_has_flow(i)).collect();
         spans.push(Span::raw(" "));
         spans.extend(timeline_bar_spans(
             frame_count,
             app.frame_index,
             &states,
+            &flow,
             bar_width,
         ));
         spans.push(Span::raw(" "));
@@ -1501,6 +1723,11 @@ const BAR_RAM_DOTS: Color = Color::Rgb(78, 78, 78);
 /// The playhead.  Amber rather than a grey so it stays findable against a bar
 /// that is otherwise monochrome.
 const BAR_PLAYHEAD: Color = Color::Rgb(255, 200, 60);
+/// Dot colour for a slot whose morph pair has optical flow generated — smooth
+/// interpolation is cached for it. Cyan so the flow-covered region stands out
+/// as its own thing against the white/grey download bar and the amber playhead,
+/// without reading as the green live-pulse indicator.
+const BAR_INTERPOLATED: Color = Color::Rgb(60, 200, 220);
 
 /// Braille dot bits per column, top row first.  Standard U+28xx layout: the
 /// left column is dots 1,2,3,7 and the right column dots 4,5,6,8.
@@ -1540,6 +1767,7 @@ struct SubCol {
     total: u16,
     downloaded: u16,
     in_ram: u16,
+    has_flow: u16,
     playhead: bool,
 }
 
@@ -1561,14 +1789,23 @@ impl SubCol {
         }
     }
 
-    /// Dots to raise for this column: the share of its slots held in RAM.
+    /// Whether this column's slots are mostly flow-ready — its braille dots are
+    /// coloured [`BAR_INTERPOLATED`] instead of the plain RAM stipple to show
+    /// how far the smoothing precompute has covered the timeline.
+    fn flow_ready(self) -> bool {
+        self.total > 0 && self.has_flow * 2 >= self.total
+    }
+
+    /// Dots to raise for this column: the share of its slots held in RAM, but
+    /// at least one when the column is flow-ready so the green coverage shows
+    /// even before the (larger) decoded grid happens to be resident.
     fn ram_height(self) -> u16 {
-        if self.total == 0 || self.in_ram == 0 {
+        if self.total == 0 || (self.in_ram == 0 && !self.flow_ready()) {
             return 0;
         }
-        let filled = f64::from(self.in_ram) / f64::from(self.total) * f64::from(BRAILLE_ROWS);
-        // Never round a non-empty column down to nothing — one cached frame in
-        // a busy column should still show.
+        let share = if self.in_ram == 0 { 0.0 } else { f64::from(self.in_ram) };
+        let filled = share / f64::from(self.total) * f64::from(BRAILLE_ROWS);
+        // Never round a non-empty/flow-ready column down to nothing.
         (filled.round() as u16).clamp(1, BRAILLE_ROWS)
     }
 }
@@ -1594,6 +1831,7 @@ fn timeline_bar_spans(
     frame_count: usize,
     frame_index: usize,
     states: &[SlotState],
+    flow: &[bool],
     bar_width: usize,
 ) -> Vec<Span<'static>> {
     if bar_width == 0 {
@@ -1614,6 +1852,9 @@ fn timeline_bar_spans(
         if state == SlotState::InRam {
             s.in_ram += 1;
         }
+        if flow.get(i).copied().unwrap_or(false) {
+            s.has_flow += 1;
+        }
     }
     if frame_count > 0 {
         subs[frame_to_bar_pos(frame_index, frame_count, sub_count)].playhead = true;
@@ -1625,9 +1866,16 @@ fn timeline_bar_spans(
         let (l, r) = (subs[i * 2], subs[i * 2 + 1]);
         let (lp, rp) = (l.paint(), r.paint());
         if lp == rp {
-            // Uniform: the whole cell is one colour, free to carry dots.
+            // Uniform: the whole cell is one colour, free to carry dots. The
+            // dots go green when the column is flow-ready (smoothing cached),
+            // otherwise the plain dark RAM stipple.
             let glyph = braille_columns([l.ram_height(), r.ram_height()]);
-            (glyph, Style::default().fg(BAR_RAM_DOTS).bg(lp))
+            let dots = if l.flow_ready() || r.flow_ready() {
+                BAR_INTERPOLATED
+            } else {
+                BAR_RAM_DOTS
+            };
+            (glyph, Style::default().fg(dots).bg(lp))
         } else {
             // Split: `▌` paints the left half in fg and the right half in bg.
             ('▌', Style::default().fg(lp).bg(rp))
@@ -2087,7 +2335,19 @@ fn raster_map_rows(
     let modes = app.layers.mode_state();
 
     if modes.has_any(LayerId::Radar) {
-        if let Some(field) = &app.current_field {
+        if let Some(interp) = app.interpolated_field_for_render() {
+            // Interpolated sub-frames render in true dBZ colour, same as plain
+            // frames — which frames are flow-processed is shown on the timeline
+            // bar (green), not by tinting the map data.
+            raster_radar(
+                cells,
+                |lat, lon| interp.sample(lat, lon),
+                bounds,
+                width,
+                height,
+                modes,
+            );
+        } else if let Some(field) = &app.current_field {
             raster_radar(
                 cells,
                 |lat, lon| field.sample(lat, lon),
@@ -4854,6 +5114,33 @@ mod tests {
         }
     }
 
+    // ── CP5: playback morph phase ───────────────────────────────────────
+
+    #[test]
+    fn morph_phase_is_zero_at_the_start() {
+        assert_eq!(
+            morph_phase(Duration::ZERO, Duration::from_millis(500)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn morph_phase_is_one_at_and_past_the_interval() {
+        let interval = Duration::from_millis(500);
+        assert_eq!(morph_phase(interval, interval), 1.0);
+        assert_eq!(
+            morph_phase(interval * 3, interval),
+            1.0,
+            "past the interval clamps rather than overshoots"
+        );
+    }
+
+    #[test]
+    fn morph_phase_is_linear_at_the_midpoint() {
+        let interval = Duration::from_millis(500);
+        assert_eq!(morph_phase(interval / 2, interval), 0.5);
+    }
+
     // ── help modal: process RAM readout ────────────────────────────────
 
     /// The real `/proc/self/status` layout: tab-indented label, value, unit.
@@ -6445,7 +6732,7 @@ mod tests {
             let slots = crate::providers::meteogate::frames_for_hours(hours);
             let width = timeline_bar_width(hours, 200).expect("bar fits");
             let states = vec![SlotState::InRam; slots];
-            let spans = timeline_bar_spans(slots, 0, &states, width);
+            let spans = timeline_bar_spans(slots, 0, &states, &[], width);
             let empty: Vec<Color> = bar_cells(&spans)
                 .iter()
                 .map(|(_, s)| s.bg.unwrap())
@@ -6471,7 +6758,7 @@ mod tests {
         for s in states.iter_mut().take(25) {
             *s = SlotState::InRam;
         }
-        let spans = timeline_bar_spans(288, 12, &states, TIMELINE_BAR_MAX);
+        let spans = timeline_bar_spans(288, 12, &states, &[], TIMELINE_BAR_MAX);
         let allowed = [BAR_MISSING, BAR_DOWNLOADED, BAR_RAM_DOTS, BAR_PLAYHEAD];
         for (glyph, style) in bar_cells(&spans) {
             for c in [style.fg.unwrap(), style.bg.unwrap()] {
@@ -6496,7 +6783,7 @@ mod tests {
         // Playhead parked off this cell's halves is impossible at width 1, so
         // check the split shape at width 2 where the boundary is interior.
         let states4 = [states.as_slice(), states.as_slice()].concat();
-        let cells = bar_cells(&timeline_bar_spans(8, 0, &states4, 2));
+        let cells = bar_cells(&timeline_bar_spans(8, 0, &states4, &[], 2));
         let split: Vec<_> = cells.iter().filter(|(g, _)| *g == '▌').collect();
         assert!(
             !split.is_empty(),
@@ -6523,7 +6810,7 @@ mod tests {
     #[test]
     fn bar_renders_two_half_cells_per_column() {
         let states = vec![SlotState::InRam; 4];
-        let spans = timeline_bar_spans(4, 0, &states, 8);
+        let spans = timeline_bar_spans(4, 0, &states, &[], 8);
         let cells = bar_cells(&spans);
         assert_eq!(cells.len(), 8, "one glyph per cell");
         assert!(
@@ -6538,7 +6825,7 @@ mod tests {
     fn playhead_is_visible_when_slots_share_a_cell() {
         // 24 h over the widest bar: 288 slots, 96 columns, 3 slots each.
         let states = vec![SlotState::InRam; 288];
-        let spans = timeline_bar_spans(288, 150, &states, TIMELINE_BAR_MAX);
+        let spans = timeline_bar_spans(288, 150, &states, &[], TIMELINE_BAR_MAX);
         let painted: Vec<Color> = bar_cells(&spans)
             .iter()
             .map(|(_, s)| s.bg.unwrap())
@@ -6551,7 +6838,7 @@ mod tests {
 
     #[test]
     fn empty_timeline_paints_bare_track() {
-        let spans = timeline_bar_spans(0, 0, &[], 6);
+        let spans = timeline_bar_spans(0, 0, &[], &[], 6);
         let cells = bar_cells(&spans);
         assert_eq!(cells.len(), 6, "track is drawn even before frames arrive");
         for (glyph, style) in cells {
@@ -6574,9 +6861,9 @@ mod tests {
     fn background_carries_download_state_only() {
         // Downloaded but not resident reads as solid white; in-RAM shares that
         // background, because RAM is a texture over it rather than a colour.
-        let disk = timeline_bar_spans(8, 0, &[SlotState::OnDisk; 8], 4);
-        let ram = timeline_bar_spans(8, 0, &[SlotState::InRam; 8], 4);
-        let missing = timeline_bar_spans(8, 0, &[SlotState::Missing; 8], 4);
+        let disk = timeline_bar_spans(8, 0, &[SlotState::OnDisk; 8], &[], 4);
+        let ram = timeline_bar_spans(8, 0, &[SlotState::InRam; 8], &[], 4);
+        let missing = timeline_bar_spans(8, 0, &[SlotState::Missing; 8], &[], 4);
         assert!(backgrounds(&disk).iter().all(|c| *c == BAR_DOWNLOADED));
         assert!(
             backgrounds(&ram).iter().all(|c| *c == BAR_DOWNLOADED),
@@ -6586,13 +6873,47 @@ mod tests {
     }
 
     #[test]
+    fn flow_ready_slots_colour_the_dots_not_the_background() {
+        // No flow → dots are the plain RAM stipple colour, bg stays download.
+        let plain = uniform_cells(&timeline_bar_spans(8, 0, &[SlotState::InRam; 8], &[false; 8], 4));
+        assert!(
+            plain.iter().all(|(_, s)| s.fg == Some(BAR_RAM_DOTS)),
+            "no flow → dark RAM dots"
+        );
+        assert!(
+            backgrounds(&timeline_bar_spans(8, 0, &[SlotState::InRam; 8], &[false; 8], 4))
+                .iter()
+                .all(|c| *c == BAR_DOWNLOADED),
+            "download bg unchanged by flow state"
+        );
+        // Flow-ready → dots go cyan; background is still the download colour.
+        let flowed = uniform_cells(&timeline_bar_spans(8, 0, &[SlotState::InRam; 8], &[true; 8], 4));
+        assert!(
+            flowed.iter().all(|(_, s)| s.fg == Some(BAR_INTERPOLATED)),
+            "flow-ready → cyan dots"
+        );
+        assert!(
+            backgrounds(&timeline_bar_spans(8, 0, &[SlotState::InRam; 8], &[true; 8], 4))
+                .iter()
+                .all(|c| *c == BAR_DOWNLOADED),
+            "flow colours the dots, never the background"
+        );
+        // Flow-ready even without a resident grid still shows a dot (≥1 height).
+        let evicted = uniform_cells(&timeline_bar_spans(8, 0, &[SlotState::OnDisk; 8], &[true; 8], 4));
+        assert!(
+            evicted.iter().all(|(g, _)| *g != '\u{2800}'),
+            "flow-ready columns raise at least one dot even if the grid was evicted"
+        );
+    }
+
+    #[test]
     fn ram_shows_as_dots_and_absent_ram_shows_none() {
-        let ram = uniform_cells(&timeline_bar_spans(4, 0, &[SlotState::InRam; 4], 2));
+        let ram = uniform_cells(&timeline_bar_spans(4, 0, &[SlotState::InRam; 4], &[], 2));
         assert!(
             !ram.is_empty() && ram.iter().all(|(c, _)| *c != '\u{2800}'),
             "resident frames must raise dots"
         );
-        let disk = uniform_cells(&timeline_bar_spans(4, 0, &[SlotState::OnDisk; 4], 2));
+        let disk = uniform_cells(&timeline_bar_spans(4, 0, &[SlotState::OnDisk; 4], &[], 2));
         assert!(
             !disk.is_empty() && disk.iter().all(|(c, _)| *c == '\u{2800}'),
             "downloaded-but-not-resident must be bare white, no stipple"
@@ -6617,7 +6938,7 @@ mod tests {
         states[6] = SlotState::InRam; // cell 0, left column
         states[7] = SlotState::InRam; // cell 0, left column
         states[4] = SlotState::InRam; // cell 0, right column: 1 of its 2
-        let cells = bar_cells(&timeline_bar_spans(8, 0, &states, 2));
+        let cells = bar_cells(&timeline_bar_spans(8, 0, &states, &[], 2));
         let glyph = cells[0].0;
         assert_ne!(
             glyph, '\u{258C}',
@@ -6635,7 +6956,7 @@ mod tests {
         // not round away to zero dots.
         let mut states = vec![SlotState::OnDisk; 24];
         states[23] = SlotState::InRam; // oldest, lands in cell 0
-        let cells = bar_cells(&timeline_bar_spans(24, 0, &states, 2));
+        let cells = bar_cells(&timeline_bar_spans(24, 0, &states, &[], 2));
         assert_ne!(cells[0].0, '\u{2800}', "1-of-6 resident must still stipple");
     }
 
@@ -6649,8 +6970,58 @@ mod tests {
     }
 
     #[test]
+    fn fps_color_tiers() {
+        assert_eq!(fps_color(20.0), Color::Red);
+        assert_eq!(fps_color(23.9), Color::Red);
+        assert_eq!(fps_color(24.0), Color::Rgb(255, 140, 0));
+        assert_eq!(fps_color(29.9), Color::Rgb(255, 140, 0));
+        assert_eq!(fps_color(30.0), Color::Yellow);
+        assert_eq!(fps_color(49.9), Color::Yellow);
+        assert_eq!(fps_color(50.0), Color::Green);
+        assert_eq!(fps_color(60.0), Color::Green);
+    }
+
+    #[test]
+    fn percentile_low_picks_the_low_tail() {
+        let v: Vec<f32> = (1..=100).map(|n| n as f32).collect();
+        // 1% low ~ near the bottom of the sorted series, 5% low a bit higher.
+        let p1 = percentile_low(&v, 1.0).unwrap();
+        let p5 = percentile_low(&v, 5.0).unwrap();
+        assert!(p1 < p5, "1% low ({p1}) must be below 5% low ({p5})");
+        assert!(p1 <= 5.0, "1% low should sit in the low tail, got {p1}");
+        assert_eq!(percentile_low(&[], 1.0), None);
+    }
+
+    #[test]
+    fn braille_sparkline_packs_two_samples_per_char_and_scales() {
+        // Empty input → empty string.
+        assert_eq!(braille_sparkline(&[], 8), "");
+        // Flat series at the series max → every cell fully filled (8 dots).
+        let flat = [5.0f32; 8];
+        let s = braille_sparkline(&flat, 8);
+        assert_eq!(s.chars().count(), 4, "8 samples → 4 braille chars");
+        assert!(
+            s.chars().all(|c| c == '\u{28ff}'),
+            "a flat max-valued series fills every braille cell, got {s:?}"
+        );
+        // A zero-height column produces blank braille, a max column a full one.
+        assert_eq!(braille_sparkline(&[0.0, 5.0], 8), "\u{28b8}");
+    }
+
+    fn sample_perf() -> PerfHud {
+        PerfHud {
+            fps: 60.0,
+            fps_low_1: Some(41.0),
+            fps_low_5: Some(48.0),
+            fps_spark: String::new(),
+            mem_bytes: Some(320 * 1024 * 1024),
+            mem_spark: String::new(),
+        }
+    }
+
+    #[test]
     fn help_lists_every_binding_in_the_registry() {
-        let text: String = help_lines()
+        let text: String = help_lines(&sample_perf())
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
             .collect();
@@ -6667,7 +7038,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut t = Terminal::new(TestBackend::new(100, 45)).unwrap();
-        t.draw(|f| render_help(f, f.area())).unwrap();
+        t.draw(|f| render_help(f, f.area(), &sample_perf())).unwrap();
         let b = t.backend().buffer();
         // Clear resets the covered cells; nothing may set a fill colour, so the
         // modal inherits whatever background the terminal itself uses.

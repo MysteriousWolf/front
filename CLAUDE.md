@@ -88,6 +88,46 @@ row-bands. The displayed frame is `App.current_field`; playback stepping swaps i
 from a warm cache (`.frd` bytes RAM-cached window-wide, decoded grids behind a
 bounded LRU) with no refetch.
 
+**Smooth playback (optical-flow interpolation).** When `[playback] smoothing`
+is on (config default), the `Playing` animation interpolates between consecutive
+composites instead of hard-swapping them. A coarse per-pair motion field
+(pyramidal Horn–Schunck, `src/flow.rs`) is estimated for every adjacent pair.
+
+*Generation is fully off the event-loop thread and precomputed window-wide.*
+`ensure_flow_precompute` (triggered from `trigger_field_preload`) spawns one
+background task that estimates all uncached pairs in the timeline, nearest the
+playhead first, several at a time (`flow_precompute_concurrency`, ~half the
+cores, bounded by the memory-bandwidth wall). Each pair decodes its two grids
+off-thread (`provider.field`, async) then estimates on a `spawn_blocking`
+worker. Results stream back through `flow_tx` and are dropped into `FlowCache`
+by `drain_flow_results`. The cache is sized to the whole timeline
+(`FlowCache::set_capacity`) so the *entire* cached window is interpolated, not a
+near-playhead slice; memory scales with history depth × flow resolution.
+
+*Warm start.* Each computed field is persisted to `~/.cache/front/…/flow/`
+(`.flw`: zstd-compressed `u`/`v`, `store_flow_disk`) and reloaded on a later run
+(`load_flow_disk`) instead of re-estimating — a decompress vs ~150 ms of
+Horn–Schunck. Files live under `radar_dir`, so the 24 h boot prune and
+`--clear-cache` handle them for free.
+
+*Render path never decodes.* The active pair's two decoded grids + flow live on
+`App` as `active_interp` (refreshed once per pair by `refresh_active_interp`),
+so the 60 fps render is a pure `Arc` clone — immune to the background precompute
+churning the decoded-grid LRU. Each sub-frame builds an `InterpolatedField`
+(`providers/meteogate.rs`) that backward-warps **both** real full-resolution
+grids by the wall-clock phase `t` and blends in linear Z (via a 256-entry
+`code → Z` LUT, not `powf`), so echoes move (advection) and grow/decay without
+ghosting. Only the motion field is coarse; displayed grids are always full-res.
+
+Flow resolution is a setting (Coarse/Medium/Fine → 1/8, 1/4, 1/2). Interpolation
+is strictly between two existing frames (no extrapolation); the `0 → len-1` ring
+seam and any manual `[`/`]` step are hard cuts. Phase advances off wall-clock
+(`morph_phase`) at a 60 fps cap (`SMOOTH_FRAME_INTERVAL`, also used while
+dragging) so motion is constant. The timeline bar tints a slot's braille cache
+dots cyan (`BAR_INTERPOLATED`) once its pair's flow is ready, showing precompute
+coverage; the help modal's FPS/memory HUD (sparklines + 1%/5% lows) surfaces the
+cost.
+
 Border lines are rasterised into a `BorderMask` (a flat cell grid) which is cached and invalidated only when the viewport or border data changes. The mask supports a `fallback_mask_cache` to avoid a blank flash during resolution transitions.
 
 The **legend** (`render_legend`) is a bottom-right colour-scale panel mirroring the bottom-left layer panel (`legend_area` reflects `layer_area`). It draws one two-row block per colour-carrying layer currently active (`active_scales` reads `RenderModeState` ownership: reflectivity when `Radar` owns `Braille`/`Color`; a temperature/wind/humidity/pressure block when the matching `SurfX` layer owns a mode). Each block is a `name / unit` title plus fraction-positioned boundary numbers on the top row (`Reflect / dBZ`, `Temp / °C`, …), and a sub-character gradient bar on the bottom row: half-block `▌` cells carry two band colours each (fg/bg), the same `▌`-split idiom the radar timeline uses, at 2× horizontal resolution. Colours come from the shared band tables — `DBZ_BANDS` (`providers/meteogate.rs`) and `Obs*_BANDS`/`obs_scale` (`ui.rs`), the same data `dbz_to_color`/`obs_color` consume, so the key can never drift from the map, and are the discrete band colours only (no interpolation). Numbers that would collide are dropped by a minimum-gap rule (low/high kept). When the terminal is too short, whole blocks are dropped keeping the reflectivity block and dropping observation blocks first (`fitting_scales`); `render_legend` also reserves the task overlay's top rows (`task_queue_reserved_rows`) so the two never collide.

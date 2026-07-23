@@ -31,6 +31,9 @@ pub struct Config {
     /// Place-name search (the `/` prompt).
     #[serde(default)]
     pub geocode: GeocodeConfig,
+    /// Playback / frame-interpolation preferences.
+    #[serde(default)]
+    pub playback: PlaybackConfig,
 }
 
 /// Place-name search via OpenStreetMap Nominatim.
@@ -128,6 +131,78 @@ pub struct MeteoAlarmConfig {
     /// MQTT broker URL for live updates.
     #[serde(default = "default_meteoalarm_broker")]
     pub mqtt_broker: String,
+}
+
+/// Playback / frame-interpolation preferences.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlaybackConfig {
+    /// Smooth playback with optical-flow interpolation between frames.
+    #[serde(default = "default_playback_smoothing")]
+    pub smoothing: bool,
+    /// Cost/quality tradeoff for the flow estimation grid.
+    #[serde(default)]
+    pub flow_resolution: FlowResolution,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            smoothing: default_playback_smoothing(),
+            flow_resolution: FlowResolution::default(),
+        }
+    }
+}
+
+fn default_playback_smoothing() -> bool {
+    true
+}
+
+/// Cost/quality tradeoff for the coarse grid optical flow is estimated on.
+/// Higher resolution (smaller downsample factor) costs more per frame pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowResolution {
+    Coarse,
+    #[default]
+    Medium,
+    Fine,
+}
+
+impl FlowResolution {
+    /// Box-downsample factor applied to the full-resolution grid before flow
+    /// estimation.
+    pub fn downsample_factor(&self) -> u32 {
+        match self {
+            FlowResolution::Coarse => 8,
+            FlowResolution::Medium => 4,
+            FlowResolution::Fine => 2,
+        }
+    }
+
+    /// Human-readable label, matching the settings modal's Choice options.
+    pub fn label(&self) -> &'static str {
+        match self {
+            FlowResolution::Coarse => "Coarse",
+            FlowResolution::Medium => "Medium",
+            FlowResolution::Fine => "Fine",
+        }
+    }
+
+    /// Parse a lowercase config value (as `apply_config_edits` writes it)
+    /// back into a `FlowResolution`. Case-insensitive to also accept the
+    /// settings modal's label casing.
+    ///
+    /// Named `parse_label` (not `from_str`) to avoid clippy's
+    /// `should_implement_trait` lint for an inherent method that shadows
+    /// `std::str::FromStr::from_str`'s signature shape.
+    pub fn parse_label(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "coarse" => Some(FlowResolution::Coarse),
+            "medium" => Some(FlowResolution::Medium),
+            "fine" => Some(FlowResolution::Fine),
+            _ => None,
+        }
+    }
 }
 
 /// EUMETNET surface observations via MeteoGate.
@@ -772,6 +847,80 @@ s3_endpoint = "https://s3.example.invalid"
         assert!(result.is_err(), "malformed file must be refused");
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(before, after, "malformed file must be left untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_config_playback_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.playback.smoothing);
+        assert_eq!(cfg.playback.flow_resolution, FlowResolution::Medium);
+    }
+
+    #[test]
+    fn test_config_without_playback_section_still_loads() {
+        let cfg: Config = toml::from_str("[viewport]\nlat = 46.05\n").unwrap();
+        assert!(cfg.playback.smoothing);
+        assert_eq!(cfg.playback.flow_resolution, FlowResolution::Medium);
+    }
+
+    #[test]
+    fn test_config_playback_section_roundtrips() {
+        let mut original = Config::default();
+        original.playback.smoothing = false;
+        original.playback.flow_resolution = FlowResolution::Fine;
+        let text = toml::to_string_pretty(&original).unwrap();
+        assert!(text.contains("fine"), "flow_resolution must serialize lowercase: {text}");
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert!(!loaded.playback.smoothing);
+        assert_eq!(loaded.playback.flow_resolution, FlowResolution::Fine);
+    }
+
+    #[test]
+    fn test_flow_resolution_downsample_factor_mapping() {
+        assert_eq!(FlowResolution::Coarse.downsample_factor(), 8);
+        assert_eq!(FlowResolution::Medium.downsample_factor(), 4);
+        assert_eq!(FlowResolution::Fine.downsample_factor(), 2);
+    }
+
+    #[test]
+    fn test_flow_resolution_parse_label_roundtrips_and_rejects_garbage() {
+        assert_eq!(FlowResolution::parse_label("coarse"), Some(FlowResolution::Coarse));
+        assert_eq!(FlowResolution::parse_label("Medium"), Some(FlowResolution::Medium));
+        assert_eq!(FlowResolution::parse_label("FINE"), Some(FlowResolution::Fine));
+        assert_eq!(FlowResolution::parse_label("bogus"), None);
+    }
+
+    #[test]
+    fn test_apply_config_edits_playback_keys_write_to_playback_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "front-config-edit-test-{}-{}",
+            std::process::id(),
+            "playback"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[viewport]\nlat = 46.05\n").unwrap();
+
+        apply_config_edits(
+            &path,
+            &[
+                ConfigEdit {
+                    key: "playback.smoothing".to_string(),
+                    value: ConfigEditValue::Bool(false),
+                },
+                ConfigEdit {
+                    key: "playback.flow_resolution".to_string(),
+                    value: ConfigEditValue::Str("coarse".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert!(!reloaded.playback.smoothing);
+        assert_eq!(reloaded.playback.flow_resolution, FlowResolution::Coarse);
 
         std::fs::remove_dir_all(&dir).ok();
     }

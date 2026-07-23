@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use crate::providers::geocode::{GeocodeProvider, Place};
 use crate::providers::location::{LocationArbiter, LocationFix, LocationSource};
 use crate::providers::maps::NaturalEarthProvider;
 use crate::providers::meteoalarm::MeteoAlarmProvider;
-use crate::providers::meteogate::{MeteoGateProvider, RadarField};
+use crate::providers::meteogate::{InterpolatedField, MeteoGateProvider, RadarField};
 use crate::providers::verify::VerifyOutcome;
 use crate::retry::RetryPolicy;
 use crate::settings::SettingsModel;
@@ -79,6 +79,31 @@ pub(crate) const LIGHTNING_IMPACT_MS: u32 = 900;
 struct FieldPreloadResult {
     timestamp: i64,
     ok: bool,
+}
+
+/// Result of one off-thread optical-flow estimation for a frame pair. The
+/// flow is computed on a `spawn_blocking` worker — Horn–Schunck over a coarse
+/// full-grid pass is tens-to-hundreds of ms and must never run on the
+/// event-loop thread — and delivered back here to be dropped into
+/// [`FlowCache`] by [`App::drain_flow_results`]. `flow` is `None` when the
+/// pair's grids had mismatched geometry (`compute_flow` returned `None`).
+struct FlowResult {
+    key: (i64, i64),
+    flow: Option<Arc<crate::flow::FlowField>>,
+}
+
+/// The decoded frame pair plus flow the renderer currently morphs between,
+/// held directly on `App` rather than looked up per frame. This decouples the
+/// 60 fps render path from the decoded-grid LRU entirely: the two grids live
+/// here as `Arc`s for as long as the pair is active, so the background flow
+/// precompute is free to churn the LRU without ever evicting what the renderer
+/// is sampling, and the render is a cheap clone with no decode.
+#[derive(Debug)]
+struct ActiveInterp {
+    key: (i64, i64),
+    older: RadarField,
+    newer: RadarField,
+    flow: Arc<crate::flow::FlowField>,
 }
 
 /// Retry bookkeeping for a radar slot whose fetch failed.
@@ -171,6 +196,152 @@ fn stepped_index(current: usize, len: usize, dir: Step) -> Option<usize> {
         Step::Newer if current == 0 => oldest,
         Step::Newer => (current - 1).min(oldest),
     })
+}
+
+/// How many frame pairs the background precompute estimates concurrently.
+/// Roughly half the cores (min 2, max 8): enough to fill the window fast while
+/// leaving headroom for the render, and past which the memory-bandwidth-bound
+/// Horn–Schunck stops scaling anyway.
+fn flow_precompute_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(2, 8))
+        .unwrap_or(2)
+}
+
+/// Initial flow-cache capacity before the first precompute pass sizes it to the
+/// live timeline (see [`FlowCache::set_capacity`]). The cache grows to hold one
+/// field per adjacent pair so the entire cached window is interpolated, not a
+/// fixed slice; steady-state capacity is the timeline length, not this value.
+const FLOW_CACHE_CAPACITY: usize = 48;
+
+/// Cap on retained per-frame FPS samples (~4 s at 60 fps) — long enough for a
+/// meaningful 1%/5%-low, short enough that the sparkline tracks recent state.
+const FPS_HISTORY_CAP: usize = 240;
+
+/// Cap on retained RSS samples for the memory sparkline.
+const MEM_HISTORY_CAP: usize = 120;
+
+/// The `(older_ts, newer_ts)` pair morphed between when the playhead sits at
+/// frame `i`, or `None` when there is no pair to morph.
+///
+/// `i == 0` is the newest frame; its only neighbour is the `0 → len - 1`
+/// wrap, which is the ring seam and must never be treated as a morph pair
+/// (see the module's non-goals). Every other index morphs against its older
+/// neighbour `i - 1`.
+fn active_flow_pair(i: usize, timestamps: &[i64]) -> Option<(i64, i64)> {
+    if i == 0 {
+        return None;
+    }
+    // No separate out-of-bounds guard needed: `.get(i)` below already
+    // returns `None` (short-circuiting via `?`) for any `i >= timestamps.len()`.
+    let newer = *timestamps.get(i - 1)?;
+    let older = *timestamps.get(i)?;
+    Some((older, newer))
+}
+
+/// The predicate gate for [`App::interpolated_field_for_render`]: which pair
+/// (if any) should be morphed this tick, before any cache/warm-grid lookup.
+/// Pure and independent of `App`/network state so the early-`None` branches
+/// (smoothing off, not `Playing`, at the seam) are unit-testable without a
+/// live `App` fixture — see `docs/spec/radar-flow-interpolation.md`.
+fn playback_pair_to_interpolate(
+    mode: PlaybackMode,
+    smoothing: bool,
+    frame_index: usize,
+    timestamps: &[i64],
+) -> Option<(i64, i64)> {
+    if mode != PlaybackMode::Playing || !smoothing {
+        return None;
+    }
+    active_flow_pair(frame_index, timestamps)
+}
+
+/// Bounded cache of per-pair optical-flow fields, keyed by
+/// `(older_ts, newer_ts)`. Flow is expensive to estimate but cheap to reuse
+/// (an `Arc` clone) across every sub-frame of the same pair, so the cache
+/// exists to compute each pair once and serve it back identically on a hit.
+///
+/// Bounded rather than unbounded: a long session's timeline holds far more
+/// pairs than are ever worth keeping warm, so eviction drops whichever
+/// cached pair currently sits furthest from the playhead (by its newer
+/// frame's [`ring_distance`]) — the one least likely to be revisited soon.
+#[derive(Debug, Default)]
+struct FlowCache {
+    capacity: usize,
+    entries: Vec<((i64, i64), Arc<crate::flow::FlowField>)>,
+}
+
+impl FlowCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Resize the cache so it can hold the whole current playback window (one
+    /// flow field per adjacent frame pair) — keeps the *entire* cached area
+    /// interpolated rather than a fixed near-playhead slice. Growing never
+    /// drops anything; shrinking is left to the next `insert` to enforce.
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+    }
+
+    fn get(&self, key: (i64, i64)) -> Option<Arc<crate::flow::FlowField>> {
+        self.entries
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| Arc::clone(v))
+    }
+
+    /// Inserts `flow` under `key`, evicting the entry furthest from
+    /// `playhead` (by `ring_distance` of its newer-frame index within
+    /// `timestamps`) first if the cache is already at capacity. A pair
+    /// already at the newest/furthest end of `timestamps` sorts by whatever
+    /// `ring_distance` returns for an index it can't find (see below).
+    fn insert(
+        &mut self,
+        key: (i64, i64),
+        flow: Arc<crate::flow::FlowField>,
+        timestamps: &[i64],
+        playhead: usize,
+    ) {
+        // Existing-key scan and eviction-candidate search below are both
+        // O(capacity), not O(1) (no HashMap/heap). `FLOW_CACHE_CAPACITY` is
+        // tiny, so a linear scan costs nothing in practice and avoids the
+        // extra structure a hash index or heap would add for no measurable
+        // gain at this size.
+        if let Some(entry) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+            entry.1 = flow;
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            let len = timestamps.len();
+            let distance_of = |ts: i64| -> usize {
+                match timestamps.iter().position(|&t| t == ts) {
+                    Some(idx) => ring_distance(idx, playhead, len),
+                    // A pair whose newer frame has scrolled off the known
+                    // timeline entirely is the least useful entry to keep —
+                    // treat it as maximally far.
+                    None => usize::MAX,
+                }
+            };
+            if let Some((evict_idx, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (k, _))| distance_of(k.1))
+            {
+                self.entries.remove(evict_idx);
+            }
+        }
+        self.entries.push((key, flow));
+    }
 }
 
 /// True when `ts` may be (re-)requested: no failure recorded yet, or the
@@ -331,6 +502,21 @@ pub struct App {
     pub frame_index: usize,
     pub playback_mode: PlaybackMode,
     pub playback_speed: PlaybackSpeed,
+    /// Sub-frame morph position (0.0..=1.0) for the active flow pair while
+    /// `Playing` with smoothing on — 0 shows the older frame, 1 the newer.
+    /// Reset to 0.0 on every frame step (auto or manual) and on leaving
+    /// `Playing`, so a stale phase never bleeds into a paused or hard-cut
+    /// frame. See `docs/spec/radar-flow-interpolation.md`.
+    pub playback_phase: f32,
+    /// Smoothed render-loop frame rate (EMA), updated per drawn frame by the
+    /// event loop and shown in the help modal. 0.0 until the first frame.
+    pub render_fps: f32,
+    /// Recent instantaneous FPS samples (one per drawn frame), for the help
+    /// modal's sparkline and 1%/5%-low figures. Capped at [`FPS_HISTORY_CAP`].
+    pub fps_history: VecDeque<f32>,
+    /// Recent RSS samples (sampled on a timer), for the help modal's memory
+    /// sparkline. Capped at [`MEM_HISTORY_CAP`].
+    pub mem_history: VecDeque<u64>,
     pub show_help: bool,
     /// Whether the bottom-right colour-scale key is drawn.  Toggled by `g`;
     /// on by default.
@@ -409,6 +595,25 @@ pub struct App {
     field_preload_task: Option<JoinHandle<()>>,
     field_preload_tx: UnboundedSender<FieldPreloadResult>,
     field_preload_rx: UnboundedReceiver<FieldPreloadResult>,
+    /// Per-pair optical-flow cache, filled window-wide by the background
+    /// [`Self::ensure_flow_precompute`] task. Only populated when
+    /// `config.playback.smoothing` is on.
+    flow_cache: FlowCache,
+    /// Off-thread flow-estimation results land here (`spawn_blocking` sender)
+    /// and are drained into `flow_cache` each tick by
+    /// [`Self::drain_flow_results`].
+    flow_tx: UnboundedSender<FlowResult>,
+    flow_rx: UnboundedReceiver<FlowResult>,
+    /// The single background task precomputing flow for the playback window.
+    /// One at a time: while it runs, [`Self::ensure_flow_precompute`] leaves it
+    /// alone; when it finishes, the next trigger spawns a fresh pass for any
+    /// pairs still missing. Keeps all grid decoding and flow estimation off the
+    /// event-loop thread.
+    flow_precompute_task: Option<JoinHandle<()>>,
+    /// The decoded pair + flow the renderer morphs between, refreshed once per
+    /// pair by [`Self::refresh_active_interp`]. Holds its grids so the render
+    /// never decodes and is immune to precompute LRU churn.
+    active_interp: Option<ActiveInterp>,
     border_tx: UnboundedSender<BorderRefreshResult>,
     border_rx: UnboundedReceiver<BorderRefreshResult>,
     border_task: Option<JoinHandle<()>>,
@@ -519,6 +724,7 @@ impl App {
         let (location_label_tx, location_label_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
+        let (flow_tx, flow_rx) = unbounded_channel::<FlowResult>();
         let (field_preload_tx, field_preload_rx) = unbounded_channel::<FieldPreloadResult>();
         let (lightning_tx, lightning_rx) = unbounded_channel::<(WorldPoint, i8)>();
         write_log(&log, "boot: creating providers");
@@ -555,6 +761,10 @@ impl App {
             braille_frame: BrailleFrame::default(),
             frame_index: 0,
             playback_mode: PlaybackMode::Live,
+            playback_phase: 0.0,
+            render_fps: 0.0,
+            fps_history: VecDeque::new(),
+            mem_history: VecDeque::new(),
             playback_speed: PlaybackSpeed::Normal,
             show_help: false,
             show_legend: true,
@@ -608,6 +818,11 @@ impl App {
             field_preload_task: None,
             field_preload_tx,
             field_preload_rx,
+            flow_cache: FlowCache::new(FLOW_CACHE_CAPACITY),
+            flow_tx,
+            flow_rx,
+            flow_precompute_task: None,
+            active_interp: None,
             border_tx,
             border_rx,
             border_task: None,
@@ -834,6 +1049,7 @@ impl App {
         if self.is_dragging || self.timestamps.is_empty() || !self.layers.enabled(LayerId::Radar) {
             return;
         }
+        self.ensure_flow_precompute();
         if let Some(task) = self.field_preload_task.take() {
             task.abort();
         }
@@ -889,6 +1105,228 @@ impl App {
             }
             while futs.next().await.is_some() {}
         }));
+    }
+
+    /// JIT-computes and caches optical flow for the active morph pair (the
+    /// pair the playhead currently sits on) plus one pair ahead, gated on
+    /// `config.playback.smoothing`. Only computes a pair once both its
+    /// frames are warm (`meteogate.field_warm`) — a grid that isn't warm yet
+    /// is skipped silently, the existing preload will warm it and a later
+    /// tick retries. The `i == 0` seam is never a pair (see
+    /// [`active_flow_pair`]) and so is never computed.
+    ///
+    /// CP4 only makes flow *available* in the cache; nothing here changes
+    /// what is rendered (that's CP5's playback timing + sampler wiring).
+    /// Precompute optical flow for the whole playback window in the background,
+    /// so playback reads cached flow instead of generating it live (live
+    /// generation couldn't keep up and stuttered playback).
+    ///
+    /// All work — grid decode AND Horn–Schunck estimation — runs off the
+    /// event-loop thread in one sequential task: decoding on the UI thread was
+    /// the source of the periodic sub-10-fps chugging. Only one task runs at a
+    /// time; while it runs this is a no-op, and once it finishes the next
+    /// trigger spawns a fresh pass for whatever pairs are still missing. Pairs
+    /// are computed nearest the playhead first so the frames about to play are
+    /// ready soonest. Results arrive via `flow_tx` and are cached by
+    /// [`Self::drain_flow_results`].
+    pub fn ensure_flow_precompute(&mut self) {
+        if !self.config.playback.smoothing {
+            return;
+        }
+        // Keep flow for the entire cached window, not a fixed near-playhead
+        // slice: size the cache to hold one field per adjacent pair. Memory
+        // scales with history depth × flow resolution (a coarse field is a few
+        // MB; deep 24 h histories at Medium are the costly end).
+        let len = self.timestamps.len();
+        self.flow_cache.set_capacity(len);
+        // One pass at a time — don't pile up or thrash the decode cache.
+        if self
+            .flow_precompute_task
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+        {
+            return;
+        }
+        // Adjacent morph pairs still missing flow, nearest the playhead first.
+        let mut pairs: Vec<(usize, (i64, i64))> = (1..len)
+            .filter_map(|i| active_flow_pair(i, &self.timestamps).map(|key| (i, key)))
+            .filter(|(_, key)| self.flow_cache.get(*key).is_none())
+            .map(|(i, key)| (ring_distance(i, self.frame_index, len), key))
+            .collect();
+        pairs.sort_by_key(|&(d, _)| d);
+        let queue: Vec<(i64, i64)> = pairs.into_iter().map(|(_, key)| key).collect();
+        if queue.is_empty() {
+            return;
+        }
+        let n = self.config.playback.flow_resolution.downsample_factor();
+        let provider = self.meteogate.clone();
+        let tx = self.flow_tx.clone();
+        self.flow_precompute_task = Some(tokio::spawn(async move {
+            // Estimate several pairs at once — they're independent, so the
+            // whole window fills in a fraction of the sequential time. Bounded
+            // so the estimation burst leaves cores for the render (and doesn't
+            // hit the memory-bandwidth wall that extra parallelism can't beat).
+            // The semaphore is fair, so the nearest-first `queue` order is
+            // preserved: the pairs about to play acquire permits first.
+            let sem = Arc::new(Semaphore::new(flow_precompute_concurrency()));
+            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+            for key in queue {
+                let provider = provider.clone();
+                let tx = tx.clone();
+                let sem = Arc::clone(&sem);
+                futs.push(async move {
+                    let _permit = sem.acquire().await;
+                    let (older_ts, newer_ts) = key;
+                    // Warm start: reuse a disk-cached field if one exists,
+                    // skipping the decode + estimation entirely (a decompress
+                    // vs ~150 ms of Horn–Schunck). Read off-thread.
+                    let disk = {
+                        let provider = provider.clone();
+                        tokio::task::spawn_blocking(move || {
+                            provider.load_flow_disk(older_ts, newer_ts, n)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    };
+                    let flow = if let Some(field) = disk {
+                        Some(Arc::new(field))
+                    } else {
+                        // Decode both grids off-thread (async), skipping the
+                        // pair when either isn't fetchable yet — the frame
+                        // preload warms it and a later pass picks it up.
+                        let (Ok(older), Ok(newer)) =
+                            (provider.field(older_ts).await, provider.field(newer_ts).await)
+                        else {
+                            return;
+                        };
+                        let provider = provider.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let field = crate::providers::meteogate::InterpolatedField::compute_flow(
+                                &older, &newer, n,
+                            );
+                            // Persist for a warm start next time.
+                            if let Some(ref f) = field {
+                                provider.store_flow_disk(older_ts, newer_ts, n, f);
+                            }
+                            field
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    };
+                    if flow.is_some() {
+                        let _ = tx.send(FlowResult { key, flow });
+                    }
+                });
+            }
+            while futs.next().await.is_some() {}
+        }));
+    }
+
+    /// Whether the morph pair active at frame index `i` already has its optical
+    /// flow cached — i.e. smooth interpolation is ready for that frame. Drives
+    /// the timeline bar's flow-ready dot colouring.
+    pub fn slot_has_flow(&self, i: usize) -> bool {
+        active_flow_pair(i, &self.timestamps)
+            .is_some_and(|key| self.flow_cache.get(key).is_some())
+    }
+
+    /// Record one drawn frame's instantaneous FPS for the help HUD's sparkline
+    /// and percentile-low figures.
+    pub fn push_fps_sample(&mut self, fps: f32) {
+        if self.fps_history.len() >= FPS_HISTORY_CAP {
+            self.fps_history.pop_front();
+        }
+        self.fps_history.push_back(fps);
+    }
+
+    /// Record one RSS sample (bytes) for the help HUD's memory sparkline.
+    pub fn push_mem_sample(&mut self, bytes: u64) {
+        if self.mem_history.len() >= MEM_HISTORY_CAP {
+            self.mem_history.pop_front();
+        }
+        self.mem_history.push_back(bytes);
+    }
+
+    /// Drain completed background flow estimations into `flow_cache`. Returns
+    /// `true` when a new flow landed, so the caller redraws and the newly
+    /// interpolatable frames appear (and the timeline's flow dots update).
+    pub fn drain_flow_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.flow_rx.try_recv() {
+            if let Some(flow) = result.flow {
+                self.flow_cache
+                    .insert(result.key, flow, &self.timestamps, self.frame_index);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Builds the flow-interpolated sub-frame to render this tick, or `None`
+    /// to fall back to the plain `current_field` swap.
+    ///
+    /// Refresh [`Self::active_interp`] to match the current playhead and flow
+    /// cache. Decodes the pair's two grids only when transitioning onto a new
+    /// flow-ready pair — once per pair, never per rendered frame — and holds
+    /// them so the render is a cheap clone. Sets `None` (renderer falls back to
+    /// the plain frame) when smoothing is off, not `Playing`, at the seam, or
+    /// the active pair's flow hasn't been precomputed yet. Call once per tick.
+    pub fn refresh_active_interp(&mut self) {
+        let key = playback_pair_to_interpolate(
+            self.playback_mode,
+            self.config.playback.smoothing,
+            self.frame_index,
+            &self.timestamps,
+        );
+        let Some(key) = key else {
+            self.active_interp = None;
+            return;
+        };
+        if self.active_interp.as_ref().is_some_and(|a| a.key == key) {
+            return; // already decoded for this exact pair
+        }
+        let Some(flow) = self.flow_cache.get(key) else {
+            self.active_interp = None; // flow not ready → plain frame
+            return;
+        };
+        let (older_ts, newer_ts) = key;
+        self.active_interp = match (
+            self.meteogate.field_warm(older_ts),
+            self.meteogate.field_warm(newer_ts),
+        ) {
+            (Some(older), Some(newer)) => Some(ActiveInterp {
+                key,
+                older,
+                newer,
+                flow,
+            }),
+            _ => None,
+        };
+    }
+
+    /// Builds this tick's flow-interpolated sub-frame from the pre-decoded
+    /// [`Self::active_interp`] set, or `None` to fall back to the plain frame.
+    /// Pure Arc clones — no decode, no cache lookup, safe at 60 fps. The pair
+    /// re-check guards against the playhead moving between refresh and render.
+    pub fn interpolated_field_for_render(&self) -> Option<InterpolatedField> {
+        let a = self.active_interp.as_ref()?;
+        let current = playback_pair_to_interpolate(
+            self.playback_mode,
+            self.config.playback.smoothing,
+            self.frame_index,
+            &self.timestamps,
+        )?;
+        if current != a.key {
+            return None;
+        }
+        InterpolatedField::with_flow(
+            a.older.clone(),
+            a.newer.clone(),
+            Arc::clone(&a.flow),
+            self.playback_phase,
+        )
     }
 
     /// Drain completed field preload results, clearing or recording backoff
@@ -2000,6 +2438,14 @@ impl App {
             ("location.ip_fallback", ConfigEditValue::Bool(b)) => {
                 self.config.location.ip_fallback = *b;
             }
+            ("playback.smoothing", ConfigEditValue::Bool(b)) => {
+                self.config.playback.smoothing = *b;
+            }
+            ("playback.flow_resolution", ConfigEditValue::Str(s)) => {
+                if let Some(res) = crate::config::FlowResolution::parse_label(s) {
+                    self.config.playback.flow_resolution = res;
+                }
+            }
             _ => {}
         }
     }
@@ -2361,6 +2807,7 @@ impl App {
         if let Some(i) = stepped_index(self.frame_index, self.timestamps.len(), Step::Older) {
             self.frame_index = i;
             self.playback_mode = self.mode_for_index();
+            self.playback_phase = 0.0;
         }
     }
 
@@ -2369,6 +2816,7 @@ impl App {
         if let Some(i) = stepped_index(self.frame_index, self.timestamps.len(), Step::Newer) {
             self.frame_index = i;
             self.playback_mode = self.mode_for_index();
+            self.playback_phase = 0.0;
         }
     }
 
@@ -2386,6 +2834,7 @@ impl App {
     pub fn jump_to_live(&mut self) {
         self.playback_mode = PlaybackMode::Live;
         self.frame_index = 0;
+        self.playback_phase = 0.0;
     }
 
     /// Toggle between Playing and Paused; Live transitions to Playing.
@@ -2401,6 +2850,9 @@ impl App {
                 }
             }
         };
+        if self.playback_mode != PlaybackMode::Playing {
+            self.playback_phase = 0.0;
+        }
     }
 
     /// Advance one frame toward newer (decrement index toward 0), wrapping
@@ -2415,6 +2867,7 @@ impl App {
         } else {
             self.frame_index -= 1;
         }
+        self.playback_phase = 0.0;
     }
 
     pub fn speed_faster(&mut self) {
@@ -3274,6 +3727,124 @@ mod tests {
         );
     }
 
+    fn flow_field_stub() -> Arc<crate::flow::FlowField> {
+        Arc::new(crate::flow::FlowField {
+            width: 1,
+            height: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            scale: 1.0,
+        })
+    }
+
+    #[test]
+    fn active_flow_pair_is_none_at_the_newest_frame_the_seam() {
+        let timestamps = vec![500, 400, 300, 200, 100];
+        assert_eq!(
+            active_flow_pair(0, &timestamps),
+            None,
+            "index 0's only neighbour is the 0 -> len-1 wrap, never a morph pair"
+        );
+    }
+
+    #[test]
+    fn active_flow_pair_keys_by_adjacent_timestamps() {
+        let timestamps = vec![500, 400, 300, 200, 100];
+        assert_eq!(
+            active_flow_pair(1, &timestamps),
+            Some((400, 500)),
+            "older=i, newer=i-1"
+        );
+        assert_eq!(active_flow_pair(4, &timestamps), Some((100, 200)));
+        assert_eq!(
+            active_flow_pair(5, &timestamps),
+            None,
+            "out of range yields no pair"
+        );
+    }
+
+    #[test]
+    fn flow_cache_hit_returns_the_same_arc_no_recompute() {
+        let mut cache = FlowCache::new(FLOW_CACHE_CAPACITY);
+        let flow = flow_field_stub();
+        let timestamps = vec![300, 200, 100];
+        cache.insert((200, 300), Arc::clone(&flow), &timestamps, 0);
+
+        let hit = cache.get((200, 300)).expect("cache hit");
+        assert!(
+            Arc::ptr_eq(&hit, &flow),
+            "a repeated pair must return the identical Arc, not a recomputed one"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn flow_cache_miss_returns_none() {
+        let cache = FlowCache::new(FLOW_CACHE_CAPACITY);
+        assert!(cache.get((1, 2)).is_none());
+    }
+
+    #[test]
+    fn flow_cache_evicts_the_pair_furthest_from_the_playhead() {
+        // A 10-slot ring; playhead sits at index 0 (newest).
+        let timestamps: Vec<i64> = (0..10).map(|i| (9 - i) * 100).collect();
+        let mut cache = FlowCache::new(2);
+
+        // Pair keyed by newer-frame index 1 (close to playhead 0).
+        let near_key = (timestamps[2], timestamps[1]);
+        // Pair keyed by newer-frame index 5 (far from playhead 0).
+        let far_key = (timestamps[6], timestamps[5]);
+        cache.insert(near_key, flow_field_stub(), &timestamps, 0);
+        cache.insert(far_key, flow_field_stub(), &timestamps, 0);
+        assert_eq!(cache.len(), 2);
+
+        // Insert a third pair past capacity: the furthest-from-playhead
+        // entry (far_key) must be the one evicted, not near_key.
+        let newest_key = (timestamps[1], timestamps[0]);
+        cache.insert(newest_key, flow_field_stub(), &timestamps, 0);
+
+        assert_eq!(cache.len(), 2, "bounded to capacity");
+        assert!(cache.get(near_key).is_some(), "near pair survives eviction");
+        assert!(
+            cache.get(far_key).is_none(),
+            "furthest-from-playhead pair is evicted"
+        );
+        assert!(cache.get(newest_key).is_some(), "newly inserted pair present");
+    }
+
+    #[test]
+    fn set_capacity_grows_the_cache_to_cover_the_whole_window() {
+        let timestamps: Vec<i64> = (0..6).map(|i| (5 - i) * 100).collect();
+        let mut cache = FlowCache::new(2);
+        // Grow to the window size so nothing is evicted while filling it.
+        cache.set_capacity(timestamps.len());
+        for i in 1..timestamps.len() {
+            let key = (timestamps[i], timestamps[i - 1]);
+            cache.insert(key, flow_field_stub(), &timestamps, 0);
+        }
+        assert_eq!(cache.len(), 5, "all 5 pairs of the window stay cached");
+        for i in 1..timestamps.len() {
+            assert!(cache.get((timestamps[i], timestamps[i - 1])).is_some());
+        }
+    }
+
+    #[test]
+    fn flow_cache_insert_of_existing_key_updates_in_place_without_growing() {
+        let timestamps = vec![300, 200, 100];
+        let mut cache = FlowCache::new(1);
+        let first = flow_field_stub();
+        cache.insert((200, 300), Arc::clone(&first), &timestamps, 0);
+        let second = flow_field_stub();
+        cache.insert((200, 300), Arc::clone(&second), &timestamps, 0);
+
+        assert_eq!(cache.len(), 1, "re-inserting the same key must not evict");
+        let got = cache.get((200, 300)).unwrap();
+        assert!(
+            Arc::ptr_eq(&got, &second),
+            "re-insert replaces the cached value for that key"
+        );
+    }
+
     fn dummy_obs_point() -> ObservationPoint {
         ObservationPoint {
             point: GeoPoint { lon: 0.0, lat: 0.0 },
@@ -3416,4 +3987,54 @@ mod tests {
         let new = eumetnet_config("  abc123  ");
         assert!(!App::eumetnet_rebuild_needed(&old, &new));
     }
+
+    // CP5: `interpolated_field_for_render`'s early-`None` predicate gate.
+    // `App` has no lightweight test constructor (see the `test_task` comment
+    // above), so the gate is exercised via the extracted pure
+    // `playback_pair_to_interpolate` rather than a live `App`; the
+    // active-interp decode tail of `interpolated_field_for_render` and the
+    // background `ensure_flow_precompute` task are inspection-verified only.
+
+    #[test]
+    fn playback_pair_to_interpolate_is_none_when_smoothing_is_off() {
+        let timestamps = vec![300, 200, 100];
+        assert_eq!(
+            playback_pair_to_interpolate(PlaybackMode::Playing, false, 1, &timestamps),
+            None
+        );
+    }
+
+    #[test]
+    fn playback_pair_to_interpolate_is_none_when_not_playing() {
+        let timestamps = vec![300, 200, 100];
+        assert_eq!(
+            playback_pair_to_interpolate(PlaybackMode::Paused, true, 1, &timestamps),
+            None,
+            "Paused must never morph"
+        );
+        assert_eq!(
+            playback_pair_to_interpolate(PlaybackMode::Live, true, 1, &timestamps),
+            None
+        );
+    }
+
+    #[test]
+    fn playback_pair_to_interpolate_is_none_at_the_seam() {
+        let timestamps = vec![300, 200, 100];
+        assert_eq!(
+            playback_pair_to_interpolate(PlaybackMode::Playing, true, 0, &timestamps),
+            None,
+            "frame_index 0 is the ring seam — never a morph pair"
+        );
+    }
+
+    #[test]
+    fn playback_pair_to_interpolate_returns_the_active_pair_when_playing_and_smoothing() {
+        let timestamps = vec![300, 200, 100];
+        assert_eq!(
+            playback_pair_to_interpolate(PlaybackMode::Playing, true, 1, &timestamps),
+            Some((200, 300))
+        );
+    }
+
 }

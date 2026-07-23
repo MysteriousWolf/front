@@ -16,6 +16,8 @@ pub enum FieldKind {
     Secret,
     /// A boolean preference.
     Bool,
+    /// A cycling choice among a fixed set of options.
+    Choice,
 }
 
 /// The staged/current value of a field.
@@ -23,6 +25,11 @@ pub enum FieldKind {
 pub enum FieldValue {
     Secret(String),
     Bool(bool),
+    /// `options` is the fixed label set; `index` the currently selected one.
+    Choice {
+        options: Vec<&'static str>,
+        index: usize,
+    },
 }
 
 /// Manual `Debug` impl (F-3): the derived one would print a `Secret`'s raw
@@ -34,6 +41,9 @@ impl std::fmt::Debug for FieldValue {
         match self {
             FieldValue::Secret(s) => write!(f, "Secret({})", mask_secret(s)),
             FieldValue::Bool(b) => write!(f, "Bool({b})"),
+            FieldValue::Choice { options, index } => {
+                write!(f, "Choice({})", options.get(*index).unwrap_or(&"?"))
+            }
         }
     }
 }
@@ -68,6 +78,7 @@ impl Field {
             kind: match value {
                 FieldValue::Secret(_) => FieldKind::Secret,
                 FieldValue::Bool(_) => FieldKind::Bool,
+                FieldValue::Choice { .. } => FieldKind::Choice,
             },
             help_url,
             current: value.clone(),
@@ -98,6 +109,10 @@ impl Field {
                     mask_secret(s)
                 }
             }
+            // A Choice never masks, regardless of `revealed`.
+            FieldValue::Choice { options, index } => {
+                options.get(*index).copied().unwrap_or("?").to_string()
+            }
         }
     }
 }
@@ -120,9 +135,15 @@ fn mask_secret(s: &str) -> String {
 /// Editable field keys, in focus-navigation order.
 const EUMETNET_API_KEY: &str = "eumetnet.api_key";
 const LOCATION_IP_FALLBACK: &str = "location.ip_fallback";
+const PLAYBACK_SMOOTHING: &str = "playback.smoothing";
+const PLAYBACK_FLOW_RESOLUTION: &str = "playback.flow_resolution";
 
 /// Where to obtain the EUMETNET / MeteoGate API key.
 const EUMETNET_KEY_URL: &str = "https://devportal.meteogate.eu/";
+
+/// Flow-resolution choice options, in cycling order. Labels match
+/// `FlowResolution::label()`.
+const FLOW_RESOLUTION_OPTIONS: [&str; 3] = ["Coarse", "Medium", "Fine"];
 
 /// The settings editor's in-progress editing session.
 #[derive(Debug, Clone)]
@@ -149,6 +170,24 @@ impl SettingsModel {
                     "IP location fallback",
                     None,
                     FieldValue::Bool(config.location.ip_fallback),
+                ),
+                Field::new(
+                    PLAYBACK_SMOOTHING,
+                    "Smooth playback",
+                    None,
+                    FieldValue::Bool(config.playback.smoothing),
+                ),
+                Field::new(
+                    PLAYBACK_FLOW_RESOLUTION,
+                    "Flow resolution",
+                    None,
+                    FieldValue::Choice {
+                        options: FLOW_RESOLUTION_OPTIONS.to_vec(),
+                        index: FLOW_RESOLUTION_OPTIONS
+                            .iter()
+                            .position(|&label| label == config.playback.flow_resolution.label())
+                            .unwrap_or(0),
+                    },
                 ),
             ],
             focus: 0,
@@ -190,10 +229,15 @@ impl SettingsModel {
         }
     }
 
-    /// Flip the focused field's staged bool. No-op on a `Secret` field.
+    /// Flip the focused field's staged bool, or advance a focused `Choice`
+    /// to its next option (wrapping). No-op on a `Secret` field.
     pub fn toggle_bool(&mut self) {
-        if let FieldValue::Bool(b) = &mut self.focused_mut().staged {
-            *b = !*b;
+        match &mut self.focused_mut().staged {
+            FieldValue::Bool(b) => *b = !*b,
+            FieldValue::Choice { options, index } => {
+                *index = (*index + 1) % options.len();
+            }
+            FieldValue::Secret(_) => {}
         }
     }
 
@@ -207,6 +251,10 @@ impl SettingsModel {
         let value = match &field.staged {
             FieldValue::Secret(s) => ConfigEditValue::Str(s.clone()),
             FieldValue::Bool(b) => ConfigEditValue::Bool(*b),
+            FieldValue::Choice { options, index } => {
+                let label = options.get(*index).copied().unwrap_or("");
+                ConfigEditValue::Str(label.to_ascii_lowercase())
+            }
         };
         Some(ConfigEdit {
             key: field.key.to_string(),
@@ -295,14 +343,17 @@ mod tests {
     #[test]
     fn focus_next_and_prev_wrap_around() {
         let mut model = model_with("key", true);
+        let last = model.fields.len() - 1;
         assert_eq!(model.focus, 0);
         model.focus_next();
         assert_eq!(model.focus, 1);
-        model.focus_next();
+        for _ in 0..last {
+            model.focus_next();
+        }
         assert_eq!(model.focus, 0, "focus_next must wrap past the last field");
         model.focus_prev();
         assert_eq!(
-            model.focus, 1,
+            model.focus, last,
             "focus_prev must wrap before the first field"
         );
     }
@@ -419,5 +470,80 @@ mod tests {
         let model = model_with("supersecretkey", true);
         let out = format!("{model:?}");
         assert!(!out.contains("supersecretkey"), "raw secret leaked: {out}");
+    }
+
+    // -- Playback fields (CP3) -------------------------------------------
+
+    #[test]
+    fn from_config_playback_fields_reflect_smoothing_and_flow_resolution() {
+        let mut config = Config::default();
+        config.playback.smoothing = false;
+        config.playback.flow_resolution = crate::config::FlowResolution::Fine;
+        let model = SettingsModel::from_config(&config);
+
+        assert_eq!(model.fields[2].key, "playback.smoothing");
+        assert_eq!(model.fields[2].staged, FieldValue::Bool(false));
+
+        assert_eq!(model.fields[3].key, "playback.flow_resolution");
+        match &model.fields[3].staged {
+            FieldValue::Choice { options, index } => {
+                assert_eq!(options[*index], "Fine");
+            }
+            other => panic!("expected Choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choice_field_display_shows_current_option_unmasked() {
+        let model = model_with("key", true);
+        assert_eq!(model.fields[3].display(false), "Medium");
+        assert_eq!(model.fields[3].display(true), "Medium");
+    }
+
+    #[test]
+    fn toggle_bool_on_choice_field_cycles_and_wraps() {
+        let mut model = model_with("key", true);
+        model.focus = 3; // Flow resolution
+        assert_eq!(model.focused().display(false), "Medium");
+        model.toggle_bool();
+        assert_eq!(model.focused().display(false), "Fine");
+        model.toggle_bool();
+        assert_eq!(
+            model.focused().display(false),
+            "Coarse",
+            "must wrap past the last option"
+        );
+        model.toggle_bool();
+        assert_eq!(model.focused().display(false), "Medium");
+    }
+
+    #[test]
+    fn focused_pending_edit_for_choice_yields_lowercase_str_value() {
+        let mut model = model_with("key", true);
+        model.focus = 3;
+        model.toggle_bool(); // Medium -> Fine
+        let edit = model
+            .focused_pending_edit()
+            .expect("dirty choice yields edit");
+        assert_eq!(edit.key, "playback.flow_resolution");
+        match edit.value {
+            ConfigEditValue::Str(s) => assert_eq!(s, "fine"),
+            _ => panic!("expected Str value"),
+        }
+    }
+
+    #[test]
+    fn focused_pending_edit_for_playback_smoothing_yields_bool_value() {
+        let mut model = model_with("key", true);
+        model.focus = 2;
+        model.toggle_bool();
+        let edit = model
+            .focused_pending_edit()
+            .expect("dirty bool yields edit");
+        assert_eq!(edit.key, "playback.smoothing");
+        match edit.value {
+            ConfigEditValue::Bool(b) => assert!(!b),
+            _ => panic!("expected Bool value"),
+        }
     }
 }

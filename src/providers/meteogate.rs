@@ -138,6 +138,28 @@ fn code_to_dbz(code: u8) -> Option<f32> {
     }
 }
 
+/// Precomputed code → linear reflectivity (Z) table. The bilinear sampler's
+/// hot path used `10f64.powf(dbz/10)` per corner — 4 per `sample_z_at`, 8 per
+/// interpolated sub-cell — which at 60 fps over a full braille frame is
+/// hundreds of thousands of `powf` calls and was the dominant per-frame cost.
+/// Since the input is a `u8` code (256 values), the whole map is a 256-entry
+/// table read. Values are the exact `10f64.powf(..)` results, so `sample_z_at`
+/// output is bit-identical to the prior computation; the no-data code 0 folds
+/// to `0.0` Z, matching the old `z_at` semantics.
+fn linear_z_lut() -> &'static [f64; 256] {
+    static LUT: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0.0f64; 256];
+        for (code, slot) in table.iter_mut().enumerate() {
+            *slot = match code_to_dbz(code as u8) {
+                Some(dbz) => 10f64.powf(f64::from(dbz) / 10.0),
+                None => 0.0,
+            };
+        }
+        table
+    })
+}
+
 /// Shared in-memory cache for decoded radar grids, keyed by timestamp.
 ///
 /// A small LRU keeps the frames touched during interaction (the current one
@@ -149,11 +171,18 @@ type GridCache = Arc<tokio::sync::Mutex<Vec<(i64, Arc<RadarGrid>)>>>;
 /// Each grid is ~16.7 MB of codes, so this is still among the larger resident
 /// costs.  It only pays off when the *same* timestamp is re-decoded — a zoom or
 /// pan of the frame on screen.  Preload streams distinct timestamps through it
-/// and never re-reads them, so extra slots buy almost nothing: measured over a
-/// session that decoded 144 frames, a 3-slot cache returned 1 hit.  Two slots
-/// keep the interactive frame resident against one concurrent preload; the rest
-/// is left to the on-disk `.frd` grids, which reload in ~3 ms.
-const MAX_CACHED_GRIDS: usize = 2;
+/// and never re-reads them, so for that pattern extra slots buy almost nothing.
+///
+/// Smooth playback changes the access pattern entirely: every rendered
+/// sub-frame samples both grids of the active pair (`field_warm` twice at up to
+/// 60 fps), and warming a pair ahead decodes two more. With only two slots
+/// those four grids evict each other and `field_warm` re-decodes (~3 ms each)
+/// on nearly every frame, roughly 6 to 12 ms of pure waste per frame, enough to
+/// stall playback. Sizing to the playback working set (active pair plus
+/// warm-ahead pair plus a margin) keeps all of them resident. Six grids are
+/// about 100 MB, acceptable given the on-disk `.frd` bytes are the real cache
+/// and this is just the decoded hot set.
+const MAX_CACHED_GRIDS: usize = 6;
 
 /// How long a negative HEAD result ("object not on S3 yet") is cached
 /// before the slot is probed again.
@@ -290,6 +319,38 @@ impl MeteoGateProvider {
         self.dirs
             .radar_dir
             .join(format!("meteogate/radar/{}.frd", timestamp))
+    }
+
+    /// Path of a cached flow field for a frame pair at downsample factor `n`.
+    /// Lives under `radar_dir`, so the boot prune and `--clear-cache` age and
+    /// clear it alongside the radar grids with no extra bookkeeping.
+    fn flow_path(&self, older_ts: i64, newer_ts: i64, n: u32) -> PathBuf {
+        self.dirs
+            .radar_dir
+            .join(format!("meteogate/flow/{older_ts}_{newer_ts}_n{n}.flw"))
+    }
+
+    /// Load a precomputed flow field for a pair from disk, if a valid one is
+    /// cached. Blocking (fs read + decompress) — call off the event-loop thread.
+    pub(crate) fn load_flow_disk(
+        &self,
+        older_ts: i64,
+        newer_ts: i64,
+        n: u32,
+    ) -> Option<crate::flow::FlowField> {
+        let bytes = read_if_exists(&self.flow_path(older_ts, newer_ts, n))
+            .ok()
+            .flatten()?;
+        decode_flow(&bytes).ok()
+    }
+
+    /// Persist a computed flow field for a pair so a later run reloads it
+    /// instead of re-estimating. Best-effort — a write failure just means the
+    /// pair is recomputed next time. Blocking; call off the event-loop thread.
+    pub(crate) fn store_flow_disk(&self, older_ts: i64, newer_ts: i64, n: u32, flow: &crate::flow::FlowField) {
+        if let Ok(bytes) = encode_flow(flow) {
+            let _ = write_atomic(&self.flow_path(older_ts, newer_ts, n), &bytes);
+        }
     }
 
     /// Delete GeoTIFFs left by builds that cached the source format.
@@ -839,6 +900,22 @@ impl RadarGrid {
     /// Interpolation core of [`sample_bilinear`], split out so it can be
     /// tested on fractional grid coordinates without round-tripping LAEA.
     fn sample_bilinear_at(&self, cf: f64, rf: f64) -> Option<f32> {
+        let z_mean = self.sample_z_at(cf, rf)?;
+        if z_mean <= 0.0 {
+            return None;
+        }
+        let dbz = (10.0 * z_mean.log10()) as f32;
+        (dbz >= MIN_DBZ).then_some(dbz)
+    }
+
+    /// Raw linear-Z bilinear mean at a fractional grid coordinate — the
+    /// dBZ-conversion-and-`MIN_DBZ`-gate-free core of [`sample_bilinear_at`].
+    /// Factored out so the flow interpolation blend (CP2) can mix linear Z
+    /// from two frames before converting to dBZ once, instead of converting
+    /// each frame to dBZ and back. No-data cells still count as zero Z (see
+    /// [`sample_bilinear_at`]'s doc); `None` only when `(cf, rf)` falls
+    /// outside the grid's cell-centre bounds.
+    fn sample_z_at(&self, cf: f64, rf: f64) -> Option<f64> {
         // Interpolate between cell *centres*: a sample sitting exactly on a
         // centre must reproduce that cell, so the box spans floor..floor+1.
         let c0 = cf.floor();
@@ -859,20 +936,61 @@ impl RadarGrid {
         let fx = cf - c0 as f64;
         let fy = rf - r0 as f64;
 
-        let z_at = |col: usize, row: usize| -> f64 {
-            match code_to_dbz(self.codes[row * w + col]) {
-                Some(dbz) => 10f64.powf(f64::from(dbz) / 10.0),
-                None => 0.0,
-            }
-        };
+        // Table lookup rather than a `powf` per corner — see [`linear_z_lut`].
+        let lut = linear_z_lut();
+        let z_at = |col: usize, row: usize| -> f64 { lut[self.codes[row * w + col] as usize] };
         let top = z_at(c0, r0) * (1.0 - fx) + z_at(c1, r0) * fx;
         let bot = z_at(c0, r1) * (1.0 - fx) + z_at(c1, r1) * fx;
-        let z_mean = top * (1.0 - fy) + bot * fy;
-        if z_mean <= 0.0 {
-            return None;
+        Some(top * (1.0 - fy) + bot * fy)
+    }
+
+    /// Two grids are the "same shape" the flow interpolation blend assumes:
+    /// same dims and geotransform, so a coarse flow field estimated on one
+    /// pair's coarse grids and a warp anchored on either grid's
+    /// `lat_lon_to_colrow` stay mutually consistent. Consecutive OPERA
+    /// composites satisfy this; a mismatch (e.g. a provider outage
+    /// mid-stream) must not silently mis-sample.
+    fn same_geometry(&self, other: &RadarGrid) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && (self.tie_x - other.tie_x).abs() < 1e-6
+            && (self.tie_y - other.tie_y).abs() < 1e-6
+            && (self.scale_x - other.scale_x).abs() < 1e-6
+            && (self.scale_y - other.scale_y).abs() < 1e-6
+    }
+
+    /// Box-averaged dBZ at a coarse `n×n`-cell resolution: one value per
+    /// block, row-major, dims `(width.div_ceil(n), height.div_ceil(n))` (the
+    /// edge blocks are smaller than `n×n` when the dims don't divide
+    /// evenly — averaged over however many real cells they contain, not
+    /// padded). This is the input CP2 feeds to `crate::flow::estimate_flow`.
+    /// No-data cells contribute `0.0` dBZ, the same floor `sample_z_at`
+    /// treats them as in linear Z — so a mostly-empty edge block still
+    /// averages to a low value instead of an undefined one.
+    fn coarse_dbz(&self, n: u32) -> (Vec<f32>, usize, usize) {
+        let n = n.max(1) as usize;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let cw = w.div_ceil(n);
+        let ch = h.div_ceil(n);
+        let mut out = vec![0.0f32; cw * ch];
+        for cy in 0..ch {
+            let row0 = cy * n;
+            let row1 = ((cy + 1) * n).min(h);
+            for cx in 0..cw {
+                let col0 = cx * n;
+                let col1 = ((cx + 1) * n).min(w);
+                let mut sum = 0.0f32;
+                let mut count = 0u32;
+                for row in row0..row1 {
+                    for col in col0..col1 {
+                        sum += code_to_dbz(self.codes[row * w + col]).unwrap_or(0.0);
+                        count += 1;
+                    }
+                }
+                out[cy * cw + cx] = if count > 0 { sum / count as f32 } else { 0.0 };
+            }
         }
-        let dbz = (10.0 * z_mean.log10()) as f32;
-        (dbz >= MIN_DBZ).then_some(dbz)
+        (out, cw, ch)
     }
 }
 
@@ -932,6 +1050,63 @@ fn decode_frd(bytes: &[u8]) -> Result<RadarGrid> {
         tie_y,
         scale_x,
         scale_y,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// On-disk flow format (`.flw`) — persists a computed optical-flow field so a
+// restart reloads it instead of re-running Horn–Schunck. The field is a smooth
+// vector grid, so zstd compresses it well; loading is a decompress (a few ms)
+// versus decoding two grids plus estimation (~150 ms).
+// ---------------------------------------------------------------------------
+
+const FLW_MAGIC: &[u8] = b"FLW1";
+/// magic(4) + width(u64) + height(u64) + scale(f32).
+const FLW_HEADER_LEN: usize = 4 + 8 + 8 + 4;
+
+fn encode_flow(flow: &crate::flow::FlowField) -> Result<Vec<u8>> {
+    let cells = flow.width * flow.height;
+    if flow.u.len() != cells || flow.v.len() != cells {
+        color_eyre::eyre::bail!("flow u/v length does not match dims");
+    }
+    let mut out = Vec::with_capacity(FLW_HEADER_LEN + cells * 4);
+    out.extend_from_slice(FLW_MAGIC);
+    out.extend_from_slice(&(flow.width as u64).to_le_bytes());
+    out.extend_from_slice(&(flow.height as u64).to_le_bytes());
+    out.extend_from_slice(&flow.scale.to_le_bytes());
+    let mut raw = Vec::with_capacity(cells * 2 * 4);
+    for x in flow.u.iter().chain(flow.v.iter()) {
+        raw.extend_from_slice(&x.to_le_bytes());
+    }
+    let payload = zstd::encode_all(raw.as_slice(), FRD_ZSTD_LEVEL).wrap_err("compress flow")?;
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Parse a `.flw` produced by [`encode_flow`]. Rejects a bad magic or a
+/// payload whose size disagrees with the header so a stale/corrupt file is
+/// recomputed rather than misread.
+fn decode_flow(bytes: &[u8]) -> Result<crate::flow::FlowField> {
+    if bytes.len() < FLW_HEADER_LEN || &bytes[0..4] != FLW_MAGIC {
+        color_eyre::eyre::bail!("not an flw flow field (bad magic)");
+    }
+    let width = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
+    let height = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
+    let scale = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    let cells = width.saturating_mul(height);
+    let raw = zstd::decode_all(&bytes[FLW_HEADER_LEN..]).wrap_err("decompress flow")?;
+    if raw.len() != cells.saturating_mul(2 * 4) {
+        color_eyre::eyre::bail!("flow payload size disagrees with header dims");
+    }
+    let f32_at = |i: usize| f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+    let u: Vec<f32> = (0..cells).map(f32_at).collect();
+    let v: Vec<f32> = (cells..2 * cells).map(f32_at).collect();
+    Ok(crate::flow::FlowField {
+        width,
+        height,
+        u,
+        v,
+        scale,
     })
 }
 
@@ -1172,6 +1347,150 @@ impl RadarField {
     }
 }
 
+/// Rescale factor applied to coarse dBZ buffers before Horn–Schunck flow
+/// estimation — see the comment at its use site in [`InterpolatedField::new`].
+const FLOW_DBZ_NORM: f32 = 50.0;
+
+/// Rescales a coarse dBZ buffer in place for Horn–Schunck flow estimation.
+///
+/// Horn–Schunck's fixed `ALPHA_SQUARED` smoothness weight is tuned against
+/// brightness values near `[0,1]` (see `crate::flow`'s own test fixtures).
+/// Raw dBZ spans roughly 0..70 for typical echoes but the representable
+/// ceiling is closer to 95, so dividing by [`FLOW_DBZ_NORM`] alone still
+/// leaves the most intense cells well above 1.0 — outside the amplitude
+/// band the Jacobi solve was tuned for, softening flow on exactly the
+/// echoes where accurate motion matters most. Clamping to `[0.0, 1.0]`
+/// after the divide keeps every cell in that tuned band: cells at or below
+/// `FLOW_DBZ_NORM` dBZ are unaffected (division only), and only the >50 dBZ
+/// tail is capped. Both buffers are scaled identically, so this does not
+/// bias the recovered flow.
+fn normalize_coarse_dbz(buf: &mut [f32]) {
+    for v in buf.iter_mut() {
+        *v = (*v / FLOW_DBZ_NORM).clamp(0.0, 1.0);
+    }
+}
+
+/// Full-resolution-grid displacement at a full-grid fractional coordinate
+/// `(cf, rf)`, derived from `flow` (whose vectors live in coarse-cell
+/// units; `flow.scale` full cells per coarse cell, set by
+/// [`InterpolatedField::new`]). Encapsulated here so later checkpoints'
+/// sampler never re-derive the `/N` lookup + `*N` rescale by hand.
+fn full_grid_displacement(flow: &crate::flow::FlowField, cf: f64, rf: f64) -> (f64, f64) {
+    let n = if flow.scale > 0.0 { f64::from(flow.scale) } else { 1.0 };
+    let (u, v) = flow.vector_at((cf / n) as f32, (rf / n) as f32);
+    (f64::from(u) * n, f64::from(v) * n)
+}
+
+/// Sub-frame interpolation between two consecutive radar composites: a
+/// coarse optical-flow field (`crate::flow`) advects both frames toward a
+/// phase `t ∈ [0,1]`, then blends them in linear Z, so a moving echo is
+/// displayed as moving rather than merely cross-fading in place. See
+/// `docs/design/radar-flow-interpolation.md`.
+pub struct InterpolatedField {
+    src: RadarField,
+    tgt: RadarField,
+    flow: Arc<crate::flow::FlowField>,
+    t: f32,
+}
+
+impl InterpolatedField {
+    /// Estimates the coarse (1-in-`n` full-grid cells per coarse cell)
+    /// optical flow between `src` (older) and `tgt` (newer). `None` if the
+    /// two grids' dims or geotransform differ — the same-grid assumption
+    /// consecutive OPERA composites rely on (see [`RadarGrid::same_geometry`])
+    /// — rather than silently warping against a mismatched coordinate space.
+    ///
+    /// Flow is per-*pair*, not per-render-frame: callers that display many
+    /// sub-frames of the same pair (or cache across ticks) call this once
+    /// and reuse the `Arc` via [`Self::with_flow`], rather than
+    /// re-estimating on every sample.
+    pub(crate) fn compute_flow(
+        src: &RadarField,
+        tgt: &RadarField,
+        n: u32,
+    ) -> Option<Arc<crate::flow::FlowField>> {
+        if !src.grid.same_geometry(&tgt.grid) {
+            return None;
+        }
+        let (mut src_coarse, cw, ch) = src.grid.coarse_dbz(n);
+        let (mut tgt_coarse, _, _) = tgt.grid.coarse_dbz(n);
+        normalize_coarse_dbz(&mut src_coarse);
+        normalize_coarse_dbz(&mut tgt_coarse);
+        let mut flow = crate::flow::estimate_flow(&src_coarse, &tgt_coarse, cw, ch);
+        flow.scale = n.max(1) as f32;
+        Some(Arc::new(flow))
+    }
+
+    /// Builds the interpolated field from an already-computed `flow` (see
+    /// [`Self::compute_flow`]) — no re-estimation. `None` on the same
+    /// geometry mismatch [`Self::compute_flow`] guards against.
+    pub(crate) fn with_flow(
+        src: RadarField,
+        tgt: RadarField,
+        flow: Arc<crate::flow::FlowField>,
+        t: f32,
+    ) -> Option<Self> {
+        if !src.grid.same_geometry(&tgt.grid) {
+            return None;
+        }
+        Some(InterpolatedField { src, tgt, flow, t })
+    }
+
+    /// Builds the interpolated field between `src` (older) and `tgt`
+    /// (newer), estimating flow via [`Self::compute_flow`] then constructing
+    /// via [`Self::with_flow`]. Kept for callers (and tests) that don't need
+    /// to cache/reuse the flow across frames.
+    pub fn new(src: RadarField, tgt: RadarField, n: u32, t: f32) -> Option<Self> {
+        let flow = Self::compute_flow(&src, &tgt, n)?;
+        Self::with_flow(src, tgt, flow, t)
+    }
+
+    /// Samples the interpolated field at `(lat, lon)`, mirroring
+    /// [`RadarField::sample`].
+    pub fn sample(&self, lat: f64, lon: f64) -> Option<(Rgb8, u8)> {
+        let (cf, rf) = self.src.grid.lat_lon_to_colrow(lat, lon);
+        self.sample_at(cf, rf)
+    }
+
+    /// Interpolation core of [`sample`], operating directly on fractional
+    /// full-grid coordinates — mirrors `RadarGrid::sample_bilinear_at` vs
+    /// `sample_bilinear`, letting tests exercise the warp/blend without
+    /// round-tripping the LAEA projection.
+    ///
+    /// Backward-warps both frames toward `t` and blends in linear Z: `z_src`
+    /// is `src` sampled at the position this parcel had at `t=0`, `z_tgt` is
+    /// `tgt` sampled at the position it will reach at `t=1`, weighted
+    /// `(1-t)`/`t`. Each side is skipped (weight-zero, contributes `0.0`)
+    /// rather than sampled whenever its weight is exactly zero — otherwise a
+    /// large flow vector could push the *unused* side out of grid bounds and
+    /// spuriously turn `t=0`/`t=1` into `None`, breaking exact reproduction
+    /// of the plain sampler at the endpoints.
+    fn sample_at(&self, cf: f64, rf: f64) -> Option<(Rgb8, u8)> {
+        let (vx, vy) = full_grid_displacement(&self.flow, cf, rf);
+        let t = f64::from(self.t);
+        let w_src = 1.0 - t;
+        let w_tgt = t;
+
+        let z_src = if w_src > 0.0 {
+            self.src.grid.sample_z_at(cf - t * vx, rf - t * vy)?
+        } else {
+            0.0
+        };
+        let z_tgt = if w_tgt > 0.0 {
+            self.tgt.grid.sample_z_at(cf + w_src * vx, rf + w_src * vy)?
+        } else {
+            0.0
+        };
+
+        let z = w_src * z_src + w_tgt * z_tgt;
+        if z <= 0.0 {
+            return None;
+        }
+        let dbz = (10.0 * z.log10()) as f32;
+        (dbz >= MIN_DBZ).then_some(dbz_to_color(dbz))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Date-time helper
 // ---------------------------------------------------------------------------
@@ -1377,6 +1696,29 @@ mod tests {
 
     // ── warm-cache layer (CP-3) ─────────────────────────────────────────
 
+    #[test]
+    fn flow_encode_decode_round_trips() {
+        let flow = crate::flow::FlowField {
+            width: 5,
+            height: 3,
+            u: (0..15).map(|i| i as f32 * 0.25 - 1.0).collect(),
+            v: (0..15).map(|i| 2.0 - i as f32 * 0.5).collect(),
+            scale: 4.0,
+        };
+        let bytes = encode_flow(&flow).expect("encode");
+        let back = decode_flow(&bytes).expect("decode");
+        assert_eq!(back.width, flow.width);
+        assert_eq!(back.height, flow.height);
+        assert_eq!(back.scale, flow.scale);
+        assert_eq!(back.u, flow.u, "u round-trips bit-for-bit");
+        assert_eq!(back.v, flow.v, "v round-trips bit-for-bit");
+        // A corrupt/short buffer is rejected, not misread.
+        assert!(decode_flow(b"nope").is_err());
+        let mut truncated = bytes.clone();
+        truncated.truncate(bytes.len() - 4);
+        assert!(decode_flow(&truncated).is_err());
+    }
+
     fn tiny_grid(fill: u8) -> RadarGrid {
         RadarGrid {
             codes: vec![fill; 16],
@@ -1387,6 +1729,61 @@ mod tests {
             scale_x: 1000.0,
             scale_y: 1000.0,
         }
+    }
+
+    fn bench_grid(w: u32, h: u32, seed: u64) -> RadarGrid {
+        let mut codes = vec![0u8; (w * h) as usize];
+        for (i, c) in codes.iter_mut().enumerate() {
+            // Varied non-zero codes so bilinear corners differ and the LUT is
+            // exercised across its range; deterministic per seed.
+            *c = (((i as u64).wrapping_mul(2_654_435_761).wrapping_add(seed)) % 200 + 1) as u8;
+        }
+        RadarGrid {
+            codes,
+            width: w,
+            height: h,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1000.0,
+            scale_y: 1000.0,
+        }
+    }
+
+    /// Measures the interpolated warp+blend sampler at one 120×50 braille
+    /// frame's worth of sub-cell samples (48,000). This is the per-frame hot
+    /// path for smooth playback; the linear-Z LUT that replaced `powf` here is
+    /// what makes 60 fps feasible. Run with `--nocapture` to see the number.
+    #[test]
+    fn bench_interpolated_sample_at() {
+        let (w, h) = (1024u32, 1024u32);
+        let src = RadarField {
+            grid: Arc::new(bench_grid(w, h, 1)),
+        };
+        let tgt = RadarField {
+            grid: Arc::new(bench_grid(w, h, 999)),
+        };
+        let interp = InterpolatedField::new(src, tgt, 4, 0.5).expect("same geometry");
+
+        let (cols, rows) = (240u32, 200u32); // 48,000 sub-cells
+        let iters = 300;
+        let t0 = std::time::Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..iters {
+            for ry in 0..rows {
+                for rx in 0..cols {
+                    let cf = 1.0 + f64::from(rx) * (f64::from(w - 2) / f64::from(cols));
+                    let rf = 1.0 + f64::from(ry) * (f64::from(h - 2) / f64::from(rows));
+                    if interp.sample_at(cf, rf).is_some() {
+                        acc += 1;
+                    }
+                }
+            }
+        }
+        let per_frame_ms = t0.elapsed().as_micros() as f64 / f64::from(iters) / 1000.0;
+        let fps = 1000.0 / per_frame_ms;
+        eprintln!(
+            "bench: interpolated sample_at — {per_frame_ms:.3} ms / 48k-sample frame ({fps:.0} fps max), acc={acc}"
+        );
     }
 
     /// A provider backed by a throwaway scratch dir, so tests never touch the
@@ -1451,7 +1848,10 @@ mod tests {
     #[test]
     fn decoded_grid_lru_stays_bounded_while_frd_bytes_cover_the_whole_window() {
         let provider = test_provider("lru-bound");
-        for ts in 0..5i64 {
+        // Decode more distinct timestamps than the grid LRU can hold so the
+        // bound is actually exercised (capacity-relative, not a magic number).
+        let n = (MAX_CACHED_GRIDS + 2) as i64;
+        for ts in 0..n {
             let grid = tiny_grid(ts as u8 + 1);
             let encoded = encode_frd(&grid).expect("encode");
             provider
@@ -1460,7 +1860,7 @@ mod tests {
                 .unwrap()
                 .insert(ts, Arc::new(encoded));
         }
-        for ts in 0..5i64 {
+        for ts in 0..n {
             assert!(provider.field_warm(ts).is_some(), "ts {ts} should decode");
         }
         assert_eq!(
@@ -1471,7 +1871,7 @@ mod tests {
         );
         assert_eq!(
             provider.frd_cache.lock().unwrap().len(),
-            5,
+            n as usize,
             ".frd bytes stay resident window-wide, not bounded like the grid LRU"
         );
     }
@@ -1653,6 +2053,250 @@ mod tests {
             color_mid,
             dbz_to_color(expect_dbz as f32).0,
             "mid-cell colour must match the interpolated dBZ, not a hard jump"
+        );
+    }
+
+    // ── flow interpolation sampler (CP2) ────────────────────────────────
+
+    fn field_of(grid: RadarGrid) -> RadarField {
+        RadarField {
+            grid: Arc::new(grid),
+        }
+    }
+
+    #[test]
+    fn coarse_dbz_box_averages_and_floors_nodata_at_zero() {
+        // 4x4 grid; top-left 2x2 block is two 20 dBZ cells, one no-data,
+        // one 40 dBZ cell — mean (20+20+0+40)/4 = 20. Every other block is
+        // entirely no-data and must floor to 0.0, not skip/NaN.
+        let codes = vec![
+            dbz_to_code(20.0).unwrap(),
+            dbz_to_code(20.0).unwrap(),
+            0,
+            0,
+            0,
+            dbz_to_code(40.0).unwrap(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let grid = RadarGrid {
+            codes,
+            width: 4,
+            height: 4,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1000.0,
+            scale_y: 1000.0,
+        };
+        let (coarse, cw, ch) = grid.coarse_dbz(2);
+        assert_eq!((cw, ch), (2, 2));
+        assert!((coarse[0] - 20.0).abs() < 1e-4, "got {}", coarse[0]);
+        assert_eq!(coarse[1], 0.0);
+        assert_eq!(coarse[2], 0.0);
+        assert_eq!(coarse[3], 0.0);
+    }
+
+    #[test]
+    fn normalize_coarse_dbz_clamps_intense_cells_but_not_in_range_ones() {
+        // A cell at exactly FLOW_DBZ_NORM (50 dBZ) is unchanged by the
+        // clamp (division only); an intense cell near the representable
+        // ceiling (~95 dBZ) would divide to ~1.9 without the clamp — well
+        // outside the [0,1] band `estimate_flow` is tuned for.
+        let mut buf = vec![0.0, 25.0, 50.0, 95.0];
+        normalize_coarse_dbz(&mut buf);
+
+        assert_eq!(buf[0], 0.0);
+        assert!((buf[1] - 0.5).abs() < 1e-6, "got {}", buf[1]);
+        assert!((buf[2] - 1.0).abs() < 1e-6, "got {}", buf[2]);
+        assert!(
+            buf.iter().all(|v| *v <= 1.0),
+            "no value fed to estimate_flow may exceed 1.0: {buf:?}"
+        );
+        assert_eq!(buf[3], 1.0, "intense cell must clamp to the ceiling");
+    }
+
+    #[test]
+    fn coarse_dbz_dims_use_div_ceil_for_non_divisible_size() {
+        let grid = tiny_grid(dbz_to_code(20.0).unwrap()); // 4x4, all one value
+        let (coarse, cw, ch) = grid.coarse_dbz(3);
+        assert_eq!((cw, ch), (2, 2), "4.div_ceil(3) = 2");
+        for v in coarse {
+            assert!((v - 20.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn interpolated_field_new_rejects_mismatched_grid_geometry() {
+        let src = field_of(tiny_grid(dbz_to_code(20.0).unwrap()));
+        let mismatched = RadarGrid {
+            codes: vec![dbz_to_code(20.0).unwrap(); 32],
+            width: 8,
+            height: 4,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1000.0,
+            scale_y: 1000.0,
+        };
+        let tgt = field_of(mismatched);
+        assert!(
+            InterpolatedField::new(src, tgt, 2, 0.5).is_none(),
+            "differing dims must not silently mis-sample"
+        );
+    }
+
+    /// `t=0` and `t=1` must reproduce the plain per-grid sampler cell for
+    /// cell, *even under a large flow vector* that would push the unused
+    /// side of the blend out of grid bounds — proving the weight-zero skip
+    /// in `sample_at`, not merely that zero flow reproduces the endpoints.
+    #[test]
+    fn interpolated_field_matches_direct_sample_at_t0_and_t1() {
+        let src = field_of(grid_row(vec![105, 145, 105, 145]));
+        let tgt = field_of(grid_row(vec![145, 105, 145, 105]));
+        let flow = crate::flow::FlowField {
+            width: 1,
+            height: 1,
+            u: vec![50.0],
+            v: vec![50.0],
+            scale: 4.0,
+        };
+
+        let flow = Arc::new(flow);
+        let field0 = InterpolatedField {
+            src: src.clone(),
+            tgt: tgt.clone(),
+            flow: flow.clone(),
+            t: 0.0,
+        };
+        let field1 = InterpolatedField {
+            src: src.clone(),
+            tgt: tgt.clone(),
+            flow,
+            t: 1.0,
+        };
+
+        for cf in [0.0, 1.5, 3.0] {
+            let direct_src = src.grid.sample_bilinear_at(cf, 0.0).map(dbz_to_color);
+            assert_eq!(
+                field0.sample_at(cf, 0.0),
+                direct_src,
+                "t=0 must equal direct src sample at cf={cf}"
+            );
+            let direct_tgt = tgt.grid.sample_bilinear_at(cf, 0.0).map(dbz_to_color);
+            assert_eq!(
+                field1.sample_at(cf, 0.0),
+                direct_tgt,
+                "t=1 must equal direct tgt sample at cf={cf}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpolated_field_nodata_out_of_bounds_returns_none() {
+        let src = field_of(tiny_grid(0));
+        let tgt = field_of(tiny_grid(0));
+        let flow = crate::flow::FlowField {
+            width: 1,
+            height: 1,
+            u: vec![0.0],
+            v: vec![0.0],
+            scale: 1.0,
+        };
+        let field = InterpolatedField {
+            src,
+            tgt,
+            flow: Arc::new(flow),
+            t: 0.5,
+        };
+        assert_eq!(
+            field.sample_at(0.0, 0.0),
+            None,
+            "no-data at both frames yields None"
+        );
+        assert_eq!(
+            field.sample_at(-1.0, 0.0),
+            None,
+            "out-of-grid coordinate yields None"
+        );
+    }
+
+    /// A synthetic gaussian blob, quantised onto the same 0.5 dBZ code grid
+    /// the real decoder uses.
+    fn synthetic_blob_grid(size: u32, cx: f32, cy: f32) -> RadarGrid {
+        const SIGMA2: f32 = 25.0;
+        let codes: Vec<u8> = (0..size * size)
+            .map(|i| {
+                let (x, y) = (i % size, i / size);
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let g = (-(dx * dx + dy * dy) / (2.0 * SIGMA2)).exp();
+                let raw = 20.0 + 30.0 * g;
+                let stepped = (raw / 0.5).round() * 0.5; // land exactly on the 0.5 dBZ grid
+                dbz_to_code(stepped).unwrap()
+            })
+            .collect();
+        RadarGrid {
+            codes,
+            width: size,
+            height: size,
+            tie_x: 0.0,
+            tie_y: 0.0,
+            scale_x: 1000.0,
+            scale_y: 1000.0,
+        }
+    }
+
+    /// A translating echo must land at the flow-interpolated position at
+    /// `0 < t < 1` — advected, not merely cross-faded in place. Proven by
+    /// comparison against a zero-flow baseline built from the same frames
+    /// and the same `t`: at the true midpoint of the blob's travel, a
+    /// correctly-advected sample should be markedly brighter than a static
+    /// cross-fade, which only sees each frame's fading tail there.
+    #[test]
+    fn translating_blob_lands_at_flow_interpolated_position_not_static_crossfade() {
+        let size = 128u32;
+        let n = 4u32;
+        let (dx, dy) = (12.0f32, 8.0f32); // full-grid cells; coarse ~(3,2)
+        let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
+
+        let src = field_of(synthetic_blob_grid(size, cx, cy));
+        let tgt = field_of(synthetic_blob_grid(size, cx + dx, cy + dy));
+
+        let advected = InterpolatedField::new(src.clone(), tgt.clone(), n, 0.5)
+            .expect("matching geometry");
+
+        let mut static_flow = advected.flow.clone();
+        let static_flow_mut = Arc::make_mut(&mut static_flow);
+        static_flow_mut.u.iter_mut().for_each(|v| *v = 0.0);
+        static_flow_mut.v.iter_mut().for_each(|v| *v = 0.0);
+        let static_crossfade = InterpolatedField {
+            src,
+            tgt,
+            flow: static_flow,
+            t: 0.5,
+        };
+
+        let (mid_c, mid_r) = (cx + dx / 2.0, cy + dy / 2.0);
+        let advected_intensity = advected
+            .sample_at(mid_c as f64, mid_r as f64)
+            .map(|(_, i)| i)
+            .unwrap_or(0);
+        let static_intensity = static_crossfade
+            .sample_at(mid_c as f64, mid_r as f64)
+            .map(|(_, i)| i)
+            .unwrap_or(0);
+
+        assert!(
+            advected_intensity > static_intensity,
+            "advected intensity {advected_intensity} should exceed static \
+             cross-fade {static_intensity} at the interpolated position"
         );
     }
 
