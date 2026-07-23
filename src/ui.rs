@@ -30,13 +30,13 @@ use crate::app::{
 };
 use crate::cache::write_log;
 use crate::geo::{
-    lat_lon_to_world, tile_bounds, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, CITY_MATCH_KM,
+    lat_lon_to_world, world_to_lat_lon, Bounds, GeoPoint, WorldPoint, CITY_MATCH_KM,
     EUROPEAN_CAPITALS, EUROPEAN_CAPITAL_NAMES, EUROPEAN_MAJOR_CITIES, OBS_TIER_ZOOM_CUTOFF,
 };
 use crate::keys::{self, Action, Category};
 use crate::layers::{
     BorderLine, BorderLineKind, BorderResolution, LayerId, LayerOption, LayerRegistry, LayerStatus,
-    MainItem, ObservationPoint, ObservationProperty, RadarFrame, RenderMode, RenderModeState, Rgb8,
+    MainItem, ObservationPoint, ObservationProperty, RenderMode, RenderModeState, Rgb8,
 };
 use crate::providers::location::LocationFix;
 use crate::providers::verify::VerifyOutcome;
@@ -373,8 +373,9 @@ async fn run_loop(
     loop {
         // Any of these can change what the map shows, so a redraw they cause
         // must re-rasterise rather than reuse the cached frame.
-        let drained = app.drain_refresh_results()
-            | app.drain_preload_results()
+        let drained = app.drain_border_results()
+            | app.drain_field_results()
+            | app.drain_field_preload_results()
             | app.drain_frame_list()
             | app.drain_task_messages()
             | app.drain_obs_results()
@@ -390,7 +391,7 @@ async fn run_loop(
         // Re-request radar slots whose backoff has expired, so a frame that
         // failed to load recovers on its own instead of waiting for the user
         // to pan or zoom.
-        app.retry_due_frames();
+        app.retry_due_fields();
         if app.pending_warning_refresh {
             app.pending_warning_refresh = false;
             app.warn_last_attempt = None; // force an immediate fetch
@@ -1392,7 +1393,7 @@ fn timeline_bar_width(hours: u8, space: usize) -> Option<usize> {
 fn timeline_line(app: &App, avail: u16) -> TextLine<'static> {
     let frame_count = app.timestamps.len();
 
-    let time_str = if app.radar_frame.is_some() {
+    let time_str = if app.timestamps.get(app.frame_index).is_some() {
         app.frame_label()
     } else {
         "--:--".to_string()
@@ -2086,8 +2087,15 @@ fn raster_map_rows(
     let modes = app.layers.mode_state();
 
     if modes.has_any(LayerId::Radar) {
-        if let Some(radar) = &app.radar_frame {
-            raster_radar(cells, radar, bounds, width, height, modes);
+        if let Some(field) = &app.current_field {
+            raster_radar(
+                cells,
+                |lat, lon| field.sample(lat, lon),
+                bounds,
+                width,
+                height,
+                modes,
+            );
         }
     }
 
@@ -2426,9 +2434,20 @@ fn show_roads(app: &App) -> bool {
     app.viewport.zoom >= 3.5 && app.layers.enabled(LayerId::MajorRoads)
 }
 
+/// Rasterise radar by sampling `sample(lat, lon)` per screen sub-cell,
+/// mapping each output position back to geographic space rather than
+/// iterating tiles/runs. `sample` returns the band colour + Braille
+/// intensity (1–14) at a point, or `None` for no echo / off-grid — this
+/// keeps the renderer decoupled from the provider's private `RadarGrid`.
+///
+/// Braille draws at full sub-cell (dot) resolution. Color/text need only
+/// one colour per terminal cell, so both sample a single designated
+/// sub-cell (column 0, row 2 of the 2×4 dot grid) rather than every dot —
+/// `raster_radar_reference` in the tests below samples that exact same
+/// point, so the two agree even where the field varies within a cell.
 fn raster_radar(
     cells: &mut [RasterCell],
-    radar: &RadarFrame,
+    sample: impl Fn(f64, f64) -> Option<(Rgb8, u8)> + Sync,
     bounds: Bounds,
     width: u16,
     height: u16,
@@ -2444,7 +2463,6 @@ fn raster_radar(
 
     let sub_width = u32::from(width) * 2;
     let sub_height = u32::from(height) * 4;
-    let cells_len = cells.len();
     let w_usize = usize::from(width);
 
     let sx_scale = sub_width as f64 / bounds.width().max(f64::EPSILON);
@@ -2452,192 +2470,68 @@ fn raster_radar(
     let min_x = bounds.min_x;
     let min_y = bounds.min_y;
 
-    // Color-only fast path: one bg write per terminal cell.  Skips
-    // braille bit computation and coalesces radar rows that map to the
-    // same terminal cell row (4 subcell rows per cell).
-    if in_color && !in_braille && !in_text {
-        for tile in &radar.tiles {
-            let tb = tile_bounds(tile.coord);
-            if !bounds.intersects(tb) {
-                continue;
-            }
-            let tile_world_width = tb.max_x - tb.min_x;
-            let tile_world_height = tb.max_y - tb.min_y;
-            let inv_size = 1.0 / f64::from(tile.size);
-            let tile_rows = &tile.rows;
+    // Sub-cell (sx, sy) -> (lat, lon), shared by every mode so cell-centre
+    // sampling (color/text) and per-dot sampling (braille) agree exactly.
+    let geo_at = |sx: u32, sy: u32| -> (f64, f64) {
+        let world_x = min_x + (sx as f64 + 0.5) / sx_scale;
+        let world_y = min_y + (sy as f64 + 0.5) / sy_scale;
+        let g = world_to_lat_lon(WorldPoint {
+            x: world_x,
+            y: world_y,
+        });
+        (g.lat, g.lon)
+    };
 
-            let mut row_idx = 0usize;
-            while row_idx < tile_rows.len() {
-                let world_y_start = tb.min_y + row_idx as f64 * inv_size * tile_world_height;
-                let start_sy = ((world_y_start - min_y) * sy_scale).floor() as i32;
-                let start_cell_y = (start_sy.clamp(0, sub_height as i32) as u32 / 4) as usize;
-
-                // Find the last radar row that maps to the same cell row.
-                let mut end_idx = row_idx;
-                while end_idx + 1 < tile_rows.len() {
-                    let ny = tb.min_y + (end_idx + 2) as f64 * inv_size * tile_world_height;
-                    let next_sy = ((ny - min_y) * sy_scale).floor() as i32;
-                    let next_cell_y = (next_sy.clamp(0, sub_height as i32) as u32 / 4) as usize;
-                    if next_cell_y != start_cell_y {
-                        break;
-                    }
-                    end_idx += 1;
-                }
-
-                let runs = &tile_rows[end_idx];
-                for run in runs {
-                    let world_x_start =
-                        tb.min_x + f64::from(run.start_x) * inv_size * tile_world_width;
-                    let world_x_end = tb.min_x + f64::from(run.end_x) * inv_size * tile_world_width;
-                    let start_sx = ((world_x_start - min_x) * sx_scale).floor() as i32;
-                    let end_sx = ((world_x_end - min_x) * sx_scale).ceil() as i32;
-                    let start_sx = start_sx.clamp(0, sub_width as i32) as u32;
-                    let end_sx = end_sx.clamp(0, sub_width as i32) as u32;
-                    if start_sx >= end_sx {
-                        continue;
-                    }
-
-                    let color = run.color;
-                    let start_cell_x = (start_sx / 2) as usize;
-                    let end_cell_x = ((end_sx - 1) / 2) as usize + 1;
-                    let row_base = start_cell_y * w_usize;
-                    for cx in start_cell_x..end_cell_x {
-                        let idx = row_base + cx;
-                        if idx < cells_len {
-                            cells[idx].bg = Some(color);
-                        }
-                    }
-                }
-
-                row_idx = end_idx + 1;
-            }
-        }
-        return;
-    }
-
-    // Full path: braille + optional color/text overlays.
-    //
-    // Split into horizontal bands of terminal rows.  Each band owns a
+    // Split into horizontal bands of terminal rows. Each band owns a
     // disjoint slice of `cells`, so bands can run in parallel without
-    // synchronisation, and within a band tiles/rows/runs are still visited
-    // in the original order — so the output is identical either way.  Rows
-    // outside a band are rejected before touching that row's runs, which is
-    // where nearly all the work is.
+    // synchronisation — sampling rows are independent of each other.
     let draw_band = |band: &mut [RasterCell], cy_lo: usize| {
         let cy_hi = cy_lo + band.len() / w_usize;
-        for tile in &radar.tiles {
-            let tb = tile_bounds(tile.coord);
-            if !bounds.intersects(tb) {
-                continue;
-            }
-
-            let tile_world_width = tb.max_x - tb.min_x;
-            let tile_world_height = tb.max_y - tb.min_y;
-            let inv_size = 1.0 / f64::from(tile.size);
-
-            // Radar rows map linearly onto subcell-Y, so derive the window of
-            // rows that can touch this band rather than scanning them all —
-            // otherwise every band pays for every row of every tile.  The
-            // window is deliberately loose (±1 row); the per-row band check
-            // below stays the authority on what actually gets drawn.
-            let rows_len = tile.rows.len();
-            let sy_per_row = inv_size * tile_world_height * sy_scale;
-            let sy_row0 = (tb.min_y - min_y) * sy_scale;
-            let (i_lo, i_hi) = if sy_per_row > 0.0 {
-                let lo = (((cy_lo * 4) as f64 - sy_row0) / sy_per_row).floor() as i64 - 1;
-                let hi = (((cy_hi * 4) as f64 - sy_row0) / sy_per_row).ceil() as i64 + 1;
-                let max = rows_len as i64;
-                (lo.clamp(0, max) as usize, hi.clamp(0, max) as usize)
-            } else {
-                (0, rows_len)
-            };
-
-            for (row_index, runs) in tile.rows.iter().enumerate().take(i_hi).skip(i_lo) {
-                let world_y_start = tb.min_y + row_index as f64 * inv_size * tile_world_height;
-                let world_y_end = tb.min_y + (row_index + 1) as f64 * inv_size * tile_world_height;
-
-                let start_sy = ((world_y_start - min_y) * sy_scale).floor() as i32;
-                let end_sy = ((world_y_end - min_y) * sy_scale).ceil() as i32;
-                let start_sy = start_sy.clamp(0, sub_height as i32) as u32;
-                let end_sy = end_sy.clamp(0, sub_height as i32) as u32;
-                if start_sy >= end_sy {
+        for cy in cy_lo..cy_hi {
+            let row_base = (cy - cy_lo) * w_usize;
+            for cx in 0..w_usize {
+                let idx = row_base + cx;
+                if idx >= band.len() {
                     continue;
                 }
+                let cell = &mut band[idx];
 
-                let cy_start = (start_sy / 4) as usize;
-                let cy_end = ((end_sy - 1) / 4) as usize;
-                // This row lands entirely outside the band — skip its runs.
-                if cy_end < cy_lo || cy_start >= cy_hi {
-                    continue;
-                }
-
-                for run in runs {
-                    let world_x_start =
-                        tb.min_x + f64::from(run.start_x) * inv_size * tile_world_width;
-                    let world_x_end = tb.min_x + f64::from(run.end_x) * inv_size * tile_world_width;
-
-                    let start_sx = ((world_x_start - min_x) * sx_scale).floor() as i32;
-                    let end_sx = ((world_x_end - min_x) * sx_scale).ceil() as i32;
-                    let start_sx = start_sx.clamp(0, sub_width as i32) as u32;
-                    let end_sx = end_sx.clamp(0, sub_width as i32) as u32;
-                    if start_sx >= end_sx {
-                        continue;
-                    }
-
-                    let color = run.color;
-                    let intensity = run.intensity;
-
-                    // Iterate terminal cells, not subcells: a run spans up to
-                    // 8 subcells per cell, so accumulating the braille bits per
-                    // cell (rather than one write per dot) cuts the inner loop
-                    // ~8× while producing byte-identical output.
-                    let glyph = in_text.then(|| radar_glyph(intensity));
-                    let cx_start = (start_sx / 2) as usize;
-                    let cx_end = ((end_sx - 1) / 2) as usize;
-
-                    for cy in cy_start.max(cy_lo)..=cy_end.min(cy_hi.saturating_sub(1)) {
-                        // Braille bit masks for the left/right columns, ORed
-                        // over this cell's covered sub-rows.
-                        let (mut col0, mut col1) = (0u8, 0u8);
-                        if in_braille {
-                            let cell_sy0 = cy as u32 * 4;
-                            let sy_lo = start_sy.max(cell_sy0);
-                            let sy_hi = end_sy.min(cell_sy0 + 4);
-                            for sy in sy_lo..sy_hi {
-                                let r = sy & 3;
-                                col0 |= braille_bit(0, r);
-                                col1 |= braille_bit(1, r);
+                if in_braille {
+                    let mut bits = 0u8;
+                    let mut max_intensity = 0u8;
+                    let mut max_color = None;
+                    for sub_y in 0..4u32 {
+                        let sy = cy as u32 * 4 + sub_y;
+                        for sub_x in 0..2u32 {
+                            let sx = cx as u32 * 2 + sub_x;
+                            let (lat, lon) = geo_at(sx, sy);
+                            if let Some((color, intensity)) = sample(lat, lon) {
+                                bits |= braille_bit(sub_x, sub_y);
+                                if intensity >= max_intensity {
+                                    max_intensity = intensity;
+                                    max_color = Some(color);
+                                }
                             }
                         }
-                        let row_base = (cy - cy_lo) * w_usize;
-                        for cx in cx_start..=cx_end {
-                            let idx = row_base + cx;
-                            if cx >= w_usize || idx >= band.len() {
-                                continue;
-                            }
-                            let cell = &mut band[idx];
-                            if in_braille {
-                                let cell_sx0 = cx as u32 * 2;
-                                let mut bits = 0u8;
-                                if cell_sx0 >= start_sx && cell_sx0 < end_sx {
-                                    bits |= col0;
-                                }
-                                if cell_sx0 + 1 >= start_sx && cell_sx0 + 1 < end_sx {
-                                    bits |= col1;
-                                }
-                                cell.bits |= bits;
-                                if intensity >= cell.intensity {
-                                    cell.color = Some(color);
-                                    cell.intensity = intensity;
-                                }
-                            }
-                            if in_color {
-                                cell.bg = Some(color);
-                            }
-                            if in_text {
-                                cell.glyph = glyph;
-                                cell.color = Some(color);
-                            }
+                    }
+                    if bits != 0 {
+                        cell.bits |= bits;
+                        if max_intensity >= cell.intensity {
+                            cell.color = max_color;
+                            cell.intensity = max_intensity;
+                        }
+                    }
+                }
+
+                if in_color || in_text {
+                    let (lat, lon) = geo_at(cx as u32 * 2, cy as u32 * 4 + 2);
+                    if let Some((color, intensity)) = sample(lat, lon) {
+                        if in_color {
+                            cell.bg = Some(color);
+                        }
+                        if in_text {
+                            cell.glyph = Some(radar_glyph(intensity));
+                            cell.color = Some(color);
                         }
                     }
                 }
@@ -2645,8 +2539,8 @@ fn raster_radar(
         }
     };
 
-    // One band per worker, but never thinner than a few rows — below that the
-    // per-band tile/row rescan costs more than the parallelism returns.
+    // One band per worker, but never thinner than a few rows — below that
+    // the per-band overhead costs more than the parallelism returns.
     const MIN_BAND_ROWS: usize = 4;
     let threads = rayon::current_num_threads();
     let rows_per_band = (usize::from(height).div_ceil(threads)).max(MIN_BAND_ROWS);
@@ -4938,7 +4832,6 @@ fn braille_marquee(phase: f64, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::TaskKind;
-    use crate::layers::{RadarRun, RadarTile};
     use std::cell::Cell;
 
     /// `ActiveTask` has pub fields; build fixtures directly rather than
@@ -7278,45 +7171,30 @@ mod tests {
         }
     }
 
-    fn synthetic_radar_frame(z: u8, bounds: Bounds) -> RadarFrame {
-        use crate::geo::visible_tiles;
-        let tiles_coords = visible_tiles(bounds, z);
-        let mut tiles = Vec::with_capacity(tiles_coords.len());
-        for coord in tiles_coords {
-            let size = 256u32;
-            let mut rows = Vec::with_capacity(size as usize);
-            for _ in 0..size {
-                let row = vec![RadarRun {
-                    start_x: 0,
-                    end_x: size as u16,
-                    color: Rgb8::new(180, 80, 160),
-                    intensity: 3,
-                }];
-                rows.push(row);
-            }
-            tiles.push(RadarTile { coord, size, rows });
+    /// Synthetic radar field for tests: colour/intensity vary with lat/lon
+    /// (and a stripe of "no echo"), so both the `Some`/`None` sample
+    /// outcomes and colour selection are exercised without needing a real
+    /// `RadarGrid`. A bare fn item rather than a closure so it's trivially
+    /// `Copy` and can be passed to `raster_radar` by value repeatedly.
+    fn synthetic_sampler(lat: f64, lon: f64) -> Option<(Rgb8, u8)> {
+        if (lon * 10.0).rem_euclid(10.0) < 0.5 {
+            return None;
         }
-        RadarFrame {
-            time: 0,
-            path: String::new(),
-            tiles,
-            missing_tiles: 0,
-            target_zoom: z,
-        }
+        let intensity = ((lat.abs() * 37.0) as i64).rem_euclid(14) as u8 + 1;
+        let g = ((lon + 180.0) * 3.0) as i64;
+        Some((Rgb8::new(180, g.rem_euclid(256) as u8, 160), intensity))
     }
 
     #[test]
     fn bench_raster_radar_color_mode() {
         let width = 120u16;
         let height = 50u16;
-        let z = 5u8;
         let bounds = Bounds {
             min_x: 0.35,
             max_x: 0.55,
             min_y: 0.30,
             max_y: 0.70,
         };
-        let radar = synthetic_radar_frame(z, bounds);
         let modes = RenderModeState {
             braille: None,
             color: Some(LayerId::Radar),
@@ -7332,7 +7210,7 @@ mod tests {
             for c in &mut cells {
                 c.clear();
             }
-            raster_radar(&mut cells, &radar, bounds, width, height, &modes);
+            raster_radar(&mut cells, synthetic_sampler, bounds, width, height, &modes);
         }
         let elapsed = t0.elapsed();
         let per_frame_us = elapsed.as_micros() / iters;
@@ -7347,11 +7225,11 @@ mod tests {
         );
     }
 
-    /// Render `radar` into a fresh grid, forcing the given rayon width so the
+    /// Render into a fresh grid, forcing the given rayon width so the
     /// sequential (1 thread) and banded-parallel paths can be compared.
     fn render_with_threads(
         threads: usize,
-        radar: &RadarFrame,
+        sample: impl Fn(f64, f64) -> Option<(Rgb8, u8)> + Sync + Send,
         bounds: Bounds,
         width: u16,
         height: u16,
@@ -7363,7 +7241,7 @@ mod tests {
             .unwrap();
         pool.install(|| {
             let mut cells = vec![RasterCell::default(); usize::from(width) * usize::from(height)];
-            raster_radar(&mut cells, radar, bounds, width, height, modes);
+            raster_radar(&mut cells, sample, bounds, width, height, modes);
             cells
         })
     }
@@ -7376,7 +7254,6 @@ mod tests {
             min_y: 0.30,
             max_y: 0.70,
         };
-        let radar = synthetic_radar_frame(5, bounds);
         // Braille alone, and braille+colour+text together, exercise every
         // write path a band can take.
         let cases = [
@@ -7396,9 +7273,16 @@ mod tests {
         // Heights that divide evenly and that leave a short trailing band.
         for (width, height) in [(120u16, 50u16), (80, 17), (60, 5), (40, 3)] {
             for modes in &cases {
-                let seq = render_with_threads(1, &radar, bounds, width, height, modes);
+                let seq = render_with_threads(1, synthetic_sampler, bounds, width, height, modes);
                 for threads in [2usize, 4, 8] {
-                    let par = render_with_threads(threads, &radar, bounds, width, height, modes);
+                    let par = render_with_threads(
+                        threads,
+                        synthetic_sampler,
+                        bounds,
+                        width,
+                        height,
+                        modes,
+                    );
                     assert_eq!(
                         seq, par,
                         "banded output differs at {width}x{height} with {threads} threads"
@@ -7412,14 +7296,12 @@ mod tests {
     fn bench_raster_radar_braille_mode() {
         let width = 120u16;
         let height = 50u16;
-        let z = 5u8;
         let bounds = Bounds {
             min_x: 0.35,
             max_x: 0.55,
             min_y: 0.30,
             max_y: 0.70,
         };
-        let radar = synthetic_radar_frame(z, bounds);
         let modes = RenderModeState {
             braille: Some(LayerId::Radar),
             color: None,
@@ -7435,7 +7317,7 @@ mod tests {
             for c in &mut cells {
                 c.clear();
             }
-            raster_radar(&mut cells, &radar, bounds, width, height, &modes);
+            raster_radar(&mut cells, synthetic_sampler, bounds, width, height, &modes);
         }
         let elapsed = t0.elapsed();
         let per_frame_us = elapsed.as_micros() / iters;
@@ -7450,11 +7332,15 @@ mod tests {
         );
     }
 
-    /// Naive per-subcell reference rasteriser, used only to prove the
-    /// optimised per-cell path in `raster_radar` produces identical output.
+    /// Naive per-subcell reference rasteriser, used only to prove
+    /// `raster_radar`'s per-cell path produces identical output. Loops every
+    /// sub-cell directly (no row-band splitting), sampling the exact same
+    /// designated centre sub-cell for color/text (column 0, row 2 of the
+    /// 2×4 dot grid) that `raster_radar` does, so the two agree even though
+    /// the field varies within a cell.
     fn raster_radar_reference(
         cells: &mut [RasterCell],
-        radar: &RadarFrame,
+        sample: impl Fn(f64, f64) -> Option<(Rgb8, u8)>,
         bounds: Bounds,
         width: u16,
         height: u16,
@@ -7470,58 +7356,55 @@ mod tests {
         let w_usize = usize::from(width);
         let sx_scale = sub_width as f64 / bounds.width().max(f64::EPSILON);
         let sy_scale = sub_height as f64 / bounds.height().max(f64::EPSILON);
-        for tile in &radar.tiles {
-            let tb = tile_bounds(tile.coord);
-            if !bounds.intersects(tb) {
-                continue;
-            }
-            let tww = tb.max_x - tb.min_x;
-            let twh = tb.max_y - tb.min_y;
-            let inv = 1.0 / f64::from(tile.size);
-            for (row_index, runs) in tile.rows.iter().enumerate() {
-                let wy0 = tb.min_y + row_index as f64 * inv * twh;
-                let wy1 = tb.min_y + (row_index + 1) as f64 * inv * twh;
-                let start_sy = (((wy0 - bounds.min_y) * sy_scale).floor() as i32)
-                    .clamp(0, sub_height as i32) as u32;
-                let end_sy = (((wy1 - bounds.min_y) * sy_scale).ceil() as i32)
-                    .clamp(0, sub_height as i32) as u32;
-                if start_sy >= end_sy {
+
+        let geo_at = |sx: u32, sy: u32| -> (f64, f64) {
+            let world_x = bounds.min_x + (sx as f64 + 0.5) / sx_scale;
+            let world_y = bounds.min_y + (sy as f64 + 0.5) / sy_scale;
+            let g = world_to_lat_lon(WorldPoint {
+                x: world_x,
+                y: world_y,
+            });
+            (g.lat, g.lon)
+        };
+
+        // Cell-major, not a flat subcell scan: color/text must sample and
+        // write *after* every braille dot in the same cell, exactly as
+        // `raster_radar` orders it — an interleaved scan would let a later
+        // braille dot's colour clobber the text/color write for the same
+        // cell whenever it out-intensifies the dot braille had already used.
+        for cy in 0..usize::from(height) {
+            for cx in 0..w_usize {
+                let idx = cy * w_usize + cx;
+                if idx >= cells_len {
                     continue;
                 }
-                for run in runs {
-                    let wx0 = tb.min_x + f64::from(run.start_x) * inv * tww;
-                    let wx1 = tb.min_x + f64::from(run.end_x) * inv * tww;
-                    let start_sx = (((wx0 - bounds.min_x) * sx_scale).floor() as i32)
-                        .clamp(0, sub_width as i32) as u32;
-                    let end_sx = (((wx1 - bounds.min_x) * sx_scale).ceil() as i32)
-                        .clamp(0, sub_width as i32) as u32;
-                    if start_sx >= end_sx {
-                        continue;
-                    }
-                    for sy in start_sy..end_sy {
-                        let cell_y = (sy / 4) as usize;
-                        let sub_y = sy % 4;
-                        let row_base = cell_y * w_usize;
-                        for sx in start_sx..end_sx {
-                            let idx = row_base + (sx / 2) as usize;
-                            if idx >= cells_len {
-                                continue;
-                            }
-                            let cell = &mut cells[idx];
-                            if in_braille {
-                                cell.bits |= braille_bit(sx % 2, sub_y);
-                                if run.intensity >= cell.intensity {
-                                    cell.color = Some(run.color);
-                                    cell.intensity = run.intensity;
+                if in_braille {
+                    for sub_y in 0..4u32 {
+                        let sy = cy as u32 * 4 + sub_y;
+                        for sub_x in 0..2u32 {
+                            let sx = cx as u32 * 2 + sub_x;
+                            let (lat, lon) = geo_at(sx, sy);
+                            if let Some((color, intensity)) = sample(lat, lon) {
+                                let cell = &mut cells[idx];
+                                cell.bits |= braille_bit(sub_x, sub_y);
+                                if intensity >= cell.intensity {
+                                    cell.color = Some(color);
+                                    cell.intensity = intensity;
                                 }
                             }
-                            if in_color {
-                                cell.bg = Some(run.color);
-                            }
-                            if in_text {
-                                cell.glyph = Some(radar_glyph(run.intensity));
-                                cell.color = Some(run.color);
-                            }
+                        }
+                    }
+                }
+                if in_color || in_text {
+                    let (lat, lon) = geo_at(cx as u32 * 2, cy as u32 * 4 + 2);
+                    if let Some((color, intensity)) = sample(lat, lon) {
+                        let cell = &mut cells[idx];
+                        if in_color {
+                            cell.bg = Some(color);
+                        }
+                        if in_text {
+                            cell.glyph = Some(radar_glyph(intensity));
+                            cell.color = Some(color);
                         }
                     }
                 }
@@ -7538,7 +7421,6 @@ mod tests {
             min_y: 0.30,
             max_y: 0.70,
         };
-        let radar = synthetic_radar_frame(5, bounds);
         let n = usize::from(width) * usize::from(height);
         let mode = |b: bool, c: bool, t: bool| RenderModeState {
             braille: b.then_some(LayerId::Radar),
@@ -7557,8 +7439,8 @@ mod tests {
             let modes = mode(b, c, t);
             let mut got = vec![RasterCell::default(); n];
             let mut want = vec![RasterCell::default(); n];
-            raster_radar(&mut got, &radar, bounds, width, height, &modes);
-            raster_radar_reference(&mut want, &radar, bounds, width, height, &modes);
+            raster_radar(&mut got, synthetic_sampler, bounds, width, height, &modes);
+            raster_radar_reference(&mut want, synthetic_sampler, bounds, width, height, &modes);
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
                 assert_eq!(
                     g.packed(),

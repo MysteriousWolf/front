@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::geo::{tile_bounds, visible_tiles, Bounds, GeoPoint, TileCoord, WorldPoint};
+use crate::geo::{Bounds, GeoPoint, WorldPoint};
 
 /// Global render modes.  Each mode can be assigned to at most one layer
 /// at a time so that different rendering techniques (braille dots,
@@ -1463,82 +1463,6 @@ pub fn resolution_distance(a: BorderResolution, b: BorderResolution) -> u32 {
     rep_zoom(a).abs_diff(rep_zoom(b))
 }
 
-impl RadarFrame {
-    pub fn merge_tiles(&mut self, frame: Self) {
-        if self.time != frame.time || self.path != frame.path {
-            *self = frame;
-            return;
-        }
-
-        // If the user changed zoom and the new frame is at a different
-        // tile-zoom, evict the stale tiles before merging.  Without
-        // this, zoom-N and zoom-(N±1) tiles would render together
-        // and produce the "huge squares + fine details" artifact.
-        if self.target_zoom != frame.target_zoom {
-            self.tiles.retain(|t| t.coord.z == frame.target_zoom);
-        }
-        self.target_zoom = frame.target_zoom;
-
-        for tile in frame.tiles {
-            if !self
-                .tiles
-                .iter()
-                .any(|existing| existing.coord == tile.coord)
-            {
-                self.tiles.push(tile);
-            }
-        }
-        self.missing_tiles = frame.missing_tiles;
-    }
-
-    pub fn covers_bounds(&self, bounds: Bounds, z: u8) -> bool {
-        let tiles = visible_tiles(bounds, z);
-        tiles
-            .into_iter()
-            .all(|coord| self.tiles.iter().any(|tile| tile.coord == coord))
-    }
-
-    /// Remove tiles whose bounds don't intersect `bounds`.  Keeps the
-    /// tile list bounded during extended panning sessions.
-    pub fn trim_to_bounds(&mut self, bounds: Bounds) {
-        self.tiles
-            .retain(|t| bounds.intersects(tile_bounds(t.coord)));
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RadarFrame {
-    pub time: i64,
-    pub path: String,
-    pub tiles: Vec<RadarTile>,
-    pub missing_tiles: usize,
-    /// The discrete Web-Mercator zoom level that all tiles in this
-    /// frame were built at.  Used by `merge_tiles` to evict tiles from
-    /// a previous zoom level when the user zooms in or out.
-    pub target_zoom: u8,
-}
-
-#[derive(Debug, Clone)]
-pub struct RadarBatch {
-    pub color: Rgb8,
-    pub coords: Vec<(f64, f64)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RadarTile {
-    pub coord: TileCoord,
-    pub size: u32,
-    pub rows: Vec<Vec<RadarRun>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RadarRun {
-    pub start_x: u16,
-    pub end_x: u16,
-    pub color: Rgb8,
-    pub intensity: u8,
-}
-
 /// A single MeteoAlarm weather warning feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WarningFeature {
@@ -2129,53 +2053,6 @@ mod tests {
         );
     }
 
-    // ── RadarFrame::covers_bounds ──────────────────────────────────────
-
-    #[test]
-    fn test_radar_frame_covers_bounds_true_when_all_tiles_present() {
-        use crate::geo::{Bounds, TileCoord};
-        // At z=1 the full world needs tiles (0,0), (1,0), (0,1), (1,1).
-        let mut frame = RadarFrame {
-            time: 0,
-            path: "test".into(),
-            tiles: vec![
-                RadarTile {
-                    coord: TileCoord { z: 1, x: 0, y: 0 },
-                    size: 256,
-                    rows: vec![],
-                },
-                RadarTile {
-                    coord: TileCoord { z: 1, x: 1, y: 0 },
-                    size: 256,
-                    rows: vec![],
-                },
-                RadarTile {
-                    coord: TileCoord { z: 1, x: 0, y: 1 },
-                    size: 256,
-                    rows: vec![],
-                },
-                RadarTile {
-                    coord: TileCoord { z: 1, x: 1, y: 1 },
-                    size: 256,
-                    rows: vec![],
-                },
-            ],
-            missing_tiles: 0,
-            target_zoom: 1,
-        };
-        let full = Bounds {
-            min_x: 0.0,
-            max_x: 1.0,
-            min_y: 0.0,
-            max_y: 1.0,
-        };
-        assert!(frame.covers_bounds(full, 1));
-
-        // Remove one tile → no longer covers.
-        frame.tiles.pop();
-        assert!(!frame.covers_bounds(full, 1));
-    }
-
     // ── resolution_distance ────────────────────────────────────────────
 
     #[test]
@@ -2269,60 +2146,6 @@ mod tests {
         };
         line.compute_bbox();
         line
-    }
-
-    fn tile(z: u8, x: u32, y: u32) -> RadarTile {
-        RadarTile {
-            coord: TileCoord { z, x, y },
-            size: 256,
-            rows: Vec::new(),
-        }
-    }
-
-    fn frame(time: i64, z: u8, tiles: Vec<RadarTile>) -> RadarFrame {
-        RadarFrame {
-            time,
-            path: format!("DBZH/{time}"),
-            tiles,
-            missing_tiles: 0,
-            target_zoom: z,
-        }
-    }
-
-    #[test]
-    fn merge_tiles_at_same_zoom_merges() {
-        let mut a = frame(100, 4, vec![tile(4, 0, 0), tile(4, 1, 0)]);
-        let b = frame(100, 4, vec![tile(4, 1, 0), tile(4, 2, 0)]);
-        a.merge_tiles(b);
-        assert_eq!(a.tiles.len(), 3, "duplicate (1,0) is deduped");
-        assert_eq!(a.target_zoom, 4);
-    }
-
-    #[test]
-    fn merge_tiles_at_different_zoom_evicts_stale() {
-        // Regression: previously, zoom-3 and zoom-4 tiles would coexist
-        // in the same frame, producing the "huge squares + fine
-        // details" visual artifact.  Merging a higher-zoom frame
-        // should evict the lower-zoom tiles.
-        let mut a = frame(100, 3, vec![tile(3, 0, 0), tile(3, 1, 1)]);
-        let b = frame(100, 4, vec![tile(4, 5, 5), tile(4, 6, 6)]);
-        a.merge_tiles(b);
-        let zooms: Vec<u8> = a.tiles.iter().map(|t| t.coord.z).collect();
-        assert!(
-            zooms.iter().all(|&z| z == 4),
-            "stale zoom-3 tiles must be evicted"
-        );
-        assert_eq!(a.tiles.len(), 2);
-        assert_eq!(a.target_zoom, 4);
-    }
-
-    #[test]
-    fn merge_tiles_with_different_time_replaces() {
-        let mut a = frame(100, 4, vec![tile(4, 0, 0)]);
-        let b = frame(200, 4, vec![tile(4, 1, 1)]);
-        a.merge_tiles(b);
-        assert_eq!(a.time, 200);
-        assert_eq!(a.tiles.len(), 1);
     }
 
     #[test]

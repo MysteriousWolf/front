@@ -21,15 +21,14 @@ use crate::config::{
 use crate::geo::{haversine_m, world_to_lat_lon, GeoPoint, Viewport, WorldPoint};
 use crate::layers::{
     resolution_distance, BorderLayer, BorderLine, BorderLineKind, BorderResolution, LayerId,
-    LayerRegistry, LayerStatus, ObservationLayer, ObservationPoint, RadarFrame, RadarTile,
-    RenderMode, WarningLayer,
+    LayerRegistry, LayerStatus, ObservationLayer, ObservationPoint, RenderMode, WarningLayer,
 };
 use crate::providers::eumetnet::EumetnetProvider;
 use crate::providers::geocode::{GeocodeProvider, Place};
 use crate::providers::location::{LocationArbiter, LocationFix, LocationSource};
 use crate::providers::maps::NaturalEarthProvider;
 use crate::providers::meteoalarm::MeteoAlarmProvider;
-use crate::providers::meteogate::MeteoGateProvider;
+use crate::providers::meteogate::{MeteoGateProvider, RadarField};
 use crate::providers::verify::VerifyOutcome;
 use crate::retry::RetryPolicy;
 use crate::settings::SettingsModel;
@@ -74,12 +73,12 @@ pub struct BorderMaskPoint {
 /// and `ui` (frame selection).
 pub(crate) const LIGHTNING_IMPACT_MS: u32 = 900;
 
-struct RadarPreloadResult {
+/// Outcome of warming one timestamp's `.frd` bytes during a field preload
+/// pass. Carries only success/failure — the bytes themselves live in the
+/// provider's RAM cache, not here.
+struct FieldPreloadResult {
     timestamp: i64,
-    tile_zoom: u8,
-    /// `None` when the fetch failed; the slot is then queued for another
-    /// attempt rather than left as a permanent hole in the timeline.
-    frame: Option<RadarFrame>,
+    ok: bool,
 }
 
 /// Retry bookkeeping for a radar slot whose fetch failed.
@@ -119,7 +118,7 @@ const FRAME_RETRY_GIVE_UP: u32 = 8;
 
 /// Shared backoff policy for radar frame retries, built from the constants
 /// above. `attempts` here is 1-based (pre-incremented before use in
-/// `note_frame_failure`), so `delay_for(entry.attempts)` — not `attempts - 1`
+/// `note_field_failure`), so `delay_for(entry.attempts)` — not `attempts - 1`
 /// — reproduces the existing sequence: first failure is `base * 2^1`.
 const FRAME_RETRY_POLICY: RetryPolicy =
     RetryPolicy::new(FRAME_RETRY_BASE, FRAME_RETRY_MAX, Some(FRAME_RETRY_GIVE_UP));
@@ -129,14 +128,6 @@ const FRAME_RETRY_POLICY: RetryPolicy =
 /// history window is; the window re-centres as the playhead moves, so the rest
 /// of a 24 h timeline streams in as it is approached rather than all at once.
 const PRELOAD_WINDOW: usize = 36;
-
-/// Cap on decoded frames held in RAM, evicted by distance from the playhead.
-///
-/// `frame_cache` holds built tiles, ~5 MB per frame at zoom 7.  Without a cap
-/// it grows to the full timeline as the playhead sweeps: 24 h is 288 slots,
-/// about 1.4 GB.  The GeoTIFFs stay on disk, so an evicted frame reloads
-/// without touching the network — RAM holds a window, disk holds the day.
-const FRAME_CACHE_MAX: usize = 48;
 
 /// Steps between `index` and `playhead` along the timeline, the short way
 /// round.
@@ -182,30 +173,52 @@ fn stepped_index(current: usize, len: usize, dir: Step) -> Option<usize> {
     })
 }
 
-/// Pick which cached frames to drop so at most `cap` remain.
+/// True when `ts` may be (re-)requested: no failure recorded yet, or the
+/// recorded failure's backoff has elapsed and it hasn't been given up on.
+fn retry_due(failures: &HashMap<i64, FrameRetry>, ts: i64, now: Instant) -> bool {
+    failures
+        .get(&ts)
+        .is_none_or(|retry| now >= retry.next_at && !FRAME_RETRY_POLICY.exhausted(retry.attempts))
+}
+
+/// True when a completed field-fetch `result_ts` should still be applied to
+/// `current_field` given the currently-requested display ts.
 ///
-/// Ranks by [`ring_distance`] from the playhead rather than by insert order:
-/// preload fills outward from the playhead, so the frames worth keeping are the
-/// ones it is about to reach, not the ones most recently decoded.  The
-/// displayed frame is at distance zero and is never evicted.  Frames no longer
-/// on the timeline rank last and go first.
-fn frames_to_evict(cached: &[i64], timestamps: &[i64], frame_index: usize, cap: usize) -> Vec<i64> {
-    if cached.len() <= cap {
-        return Vec::new();
-    }
-    let index: HashMap<i64, usize> = timestamps
-        .iter()
-        .enumerate()
-        .map(|(i, &ts)| (ts, i))
-        .collect();
-    let mut keys = cached.to_vec();
-    keys.sort_by_key(|ts| {
-        index
-            .get(ts)
-            .map(|&i| ring_distance(i, frame_index, timestamps.len()))
-            .unwrap_or(usize::MAX)
+/// A warm timeline step updates `field_requested_ts` without bumping
+/// `field_refresh_id`, so `id`-gating alone can't catch an in-flight fetch
+/// for a frame that is no longer the one the user is looking at — this is
+/// the second, ts-based check `drain_field_results` applies on top of it.
+fn field_result_wanted(requested_ts: Option<i64>, result_ts: i64) -> bool {
+    requested_ts == Some(result_ts)
+}
+
+/// Record a failed slot in `failures` and schedule its next attempt.
+///
+/// The backoff grows per attempt but is capped, so retries continue for as
+/// long as the slot is on the timeline: a failure that was transient fills
+/// itself in once conditions improve, with no user action — and, per F-1,
+/// a slot is never left permanently wedged: it is always re-tried once its
+/// backoff elapses, until `FRAME_RETRY_GIVE_UP` is reached.
+fn note_failure(failures: &mut HashMap<i64, FrameRetry>, ts: i64, log: &Path, label: &str) {
+    let entry = failures.entry(ts).or_insert(FrameRetry {
+        attempts: 0,
+        next_at: Instant::now(),
     });
-    keys.split_off(cap)
+    entry.attempts = entry.attempts.saturating_add(1);
+    let backoff = FRAME_RETRY_POLICY.delay_for(entry.attempts);
+    entry.next_at = Instant::now() + backoff;
+    let msg = if entry.attempts >= FRAME_RETRY_GIVE_UP {
+        format!(
+            "{label}: frame {ts} failed (attempt {}) — giving up this session",
+            entry.attempts
+        )
+    } else {
+        format!(
+            "{label}: frame {ts} failed (attempt {}) — retrying in {backoff:?}",
+            entry.attempts
+        )
+    };
+    write_log(log, msg);
 }
 
 /// Resets the observation accumulator for a freshly kicked-off refresh.
@@ -222,38 +235,6 @@ fn reset_obs_accumulator(
     obs_incoming.clear();
     *obs_incoming_id = new_id;
     obs_partial.clear();
-}
-
-/// Remove `req_ts` from `timestamps` and work out which index should stay
-/// displayed, or `None` when the slot wasn't on the timeline.
-///
-/// The viewer keeps looking at the same *time* across the removal rather
-/// than the same index, which would otherwise slide onto a neighbour.  If
-/// the viewed slot was the phantom itself, it falls back to the time the
-/// provider actually resolved to.
-fn timeline_without_phantom(
-    timestamps: &[i64],
-    frame_index: usize,
-    req_ts: i64,
-    resolved_ts: i64,
-    live: bool,
-) -> Option<(Vec<i64>, usize)> {
-    if !timestamps.contains(&req_ts) {
-        return None;
-    }
-    let viewing = timestamps.get(frame_index).copied();
-    let remaining: Vec<i64> = timestamps
-        .iter()
-        .copied()
-        .filter(|&t| t != req_ts)
-        .collect();
-    let index = if live {
-        0
-    } else {
-        let target = viewing.filter(|&t| t != req_ts).unwrap_or(resolved_ts);
-        remaining.iter().position(|&t| t == target).unwrap_or(0)
-    };
-    Some((remaining, index))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,14 +302,14 @@ pub struct App {
     /// Depth of radar history on the timeline, in hours.  Cycled with `i`
     /// through [`HISTORY_OPTIONS`](crate::providers::meteogate::HISTORY_OPTIONS).
     pub history_hours: u8,
-    /// Timestamps whose GeoTIFF is on disk.  A superset of `frame_cache` once
-    /// eviction starts: these still load without a fetch, so the timeline marks
-    /// them as available rather than missing.
+    /// Timestamps whose `.frd` grid is on disk.  These still load without a
+    /// network fetch, so the timeline marks them as available rather than
+    /// missing.
     pub disk_frames: HashSet<i64>,
-    /// Slots whose fetch failed, with when to try them again.  Entries are
-    /// removed on success and pruned when the slot leaves the timeline.
-    radar_failures: HashMap<i64, FrameRetry>,
-    pub radar_frame: Option<RadarFrame>,
+    /// The direct-resample field for the currently displayed frame — what
+    /// `raster_radar` samples per sub-cell. Populated by
+    /// `request_field_refresh`.
+    pub current_field: Option<RadarField>,
     pub border_mask_cache: Option<(BorderMaskStamp, BorderMask)>,
     /// Mask from the _previous_ resolution level, kept alive for one
     /// frame across resolution cutovers to avoid a blank flash while
@@ -410,31 +391,24 @@ pub struct App {
     pub obs_last_attempt: Option<Instant>,
     /// When a warning refresh was last started (same backoff rationale).
     pub warn_last_attempt: Option<Instant>,
-    /// The timestamp the current radar refresh was requested for.  Used
-    /// to detect frame stepping: tile coverage alone can't tell frames
-    /// of different times apart.
-    radar_requested_ts: Option<i64>,
-    /// The request timestamp of the tiles currently in `radar_frame`.
-    /// When it differs from `radar_requested_ts`, incoming streamed
-    /// tiles belong to a different frame time and the old tiles must be
-    /// evicted instead of merged.
-    radar_frame_ts: Option<i64>,
-    /// Rendered radar frames cached by timestamp, valid for `frame_cache_zoom`.
-    pub frame_cache: HashMap<i64, RadarFrame>,
-    /// Tile zoom the frame_cache entries were built at; cleared on change.
-    frame_cache_zoom: u8,
-    /// Single sequential background task preloading uncached radar frames.
-    radar_preload_task: Option<JoinHandle<()>>,
-    radar_preload_tx: UnboundedSender<RadarPreloadResult>,
-    radar_preload_rx: UnboundedReceiver<RadarPreloadResult>,
     maps: NaturalEarthProvider,
     meteogate: MeteoGateProvider,
     meteoalarm: MeteoAlarmProvider,
     eumetnet: EumetnetProvider,
-    refresh_tx: UnboundedSender<RadarRefreshResult>,
-    refresh_rx: UnboundedReceiver<RadarRefreshResult>,
-    refresh_task: Option<JoinHandle<()>>,
-    refresh_id: u64,
+    field_tx: UnboundedSender<FieldRefreshResult>,
+    field_rx: UnboundedReceiver<FieldRefreshResult>,
+    field_refresh_id: u64,
+    /// The timestamp `current_field` was last requested for, so a repeated
+    /// request for the same frame (e.g. a pan that doesn't change the
+    /// timeline slot) doesn't re-fetch.
+    field_requested_ts: Option<i64>,
+    /// Field slots whose fetch failed, with when to try them again (F-1).
+    field_failures: HashMap<i64, FrameRetry>,
+    /// Single sequential background task warming uncached playback-window
+    /// frames' `.frd` bytes into RAM.
+    field_preload_task: Option<JoinHandle<()>>,
+    field_preload_tx: UnboundedSender<FieldPreloadResult>,
+    field_preload_rx: UnboundedReceiver<FieldPreloadResult>,
     border_tx: UnboundedSender<BorderRefreshResult>,
     border_rx: UnboundedReceiver<BorderRefreshResult>,
     border_task: Option<JoinHandle<()>>,
@@ -536,7 +510,7 @@ impl App {
 
         write_log(&log, "boot: initial viewport");
         let (viewport, location, location_rx) = initial_viewport(cli, &config, &log).await;
-        let (refresh_tx, refresh_rx) = unbounded_channel();
+        let (field_tx, field_rx) = unbounded_channel();
         let (border_tx, border_rx) = unbounded_channel();
         let (obs_tx, obs_rx) = unbounded_channel();
         let (warn_tx, warn_rx) = unbounded_channel();
@@ -545,7 +519,7 @@ impl App {
         let (location_label_tx, location_label_rx) = unbounded_channel();
         let (task_tx, task_rx) = unbounded_channel();
         let (frame_list_tx, frame_list_rx) = unbounded_channel();
-        let (radar_preload_tx, radar_preload_rx) = unbounded_channel::<RadarPreloadResult>();
+        let (field_preload_tx, field_preload_rx) = unbounded_channel::<FieldPreloadResult>();
         let (lightning_tx, lightning_rx) = unbounded_channel::<(WorldPoint, i8)>();
         write_log(&log, "boot: creating providers");
         let cancel = Arc::new(AtomicBool::new(false));
@@ -570,8 +544,7 @@ impl App {
             timestamps: Vec::new(),
             history_hours: crate::providers::meteogate::DEFAULT_HISTORY_HOURS,
             disk_frames: HashSet::new(),
-            radar_failures: HashMap::new(),
-            radar_frame: None,
+            current_field: None,
             border_mask_cache: None,
             fallback_mask_cache: None,
             border_layers: HashMap::new(),
@@ -620,13 +593,6 @@ impl App {
             pending_warning_refresh: false,
             obs_last_attempt: None,
             warn_last_attempt: None,
-            radar_requested_ts: None,
-            radar_frame_ts: None,
-            frame_cache: HashMap::new(),
-            frame_cache_zoom: 0,
-            radar_preload_task: None,
-            radar_preload_tx,
-            radar_preload_rx,
             dirs,
             config,
             client,
@@ -634,10 +600,14 @@ impl App {
             meteogate,
             meteoalarm,
             eumetnet,
-            refresh_tx,
-            refresh_rx,
-            refresh_task: None,
-            refresh_id: 0,
+            field_tx,
+            field_rx,
+            field_refresh_id: 0,
+            field_requested_ts: None,
+            field_failures: HashMap::new(),
+            field_preload_task: None,
+            field_preload_tx,
+            field_preload_rx,
             border_tx,
             border_rx,
             border_task: None,
@@ -748,142 +718,212 @@ impl App {
         Ok(app)
     }
 
-    pub fn request_meteogate_refresh(&mut self, width: u16, height: u16) {
+    /// Request the current frame's direct-sampling field and start warming
+    /// the playback window around it.
+    ///
+    /// `width`/`height` are unused — kept for call-site compatibility, since
+    /// the field path is bounds-independent (whole grid) and a pure pan/zoom
+    /// re-request for the same timeline slot is already a no-op inside
+    /// [`Self::request_field_refresh`]. Radar renders by direct-sampling the
+    /// field per sub-cell.
+    pub fn request_meteogate_refresh(&mut self, _width: u16, _height: u16) {
         if !self.layers.enabled(LayerId::Radar) {
             return;
         }
         let Some(ts) = self.timestamps.get(self.frame_index).copied() else {
             return;
         };
-        let tile_zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
+        self.request_field_refresh(ts);
+        self.trigger_field_preload();
+    }
 
-        // Invalidate frame cache when zoom level changes.
-        if tile_zoom != self.frame_cache_zoom {
-            self.frame_cache.clear();
-            self.frame_cache_zoom = tile_zoom;
-            if let Some(task) = self.radar_preload_task.take() {
-                task.abort();
-            }
-        }
-
-        let bounds = self.viewport.bounds(width, height);
-
-        // Serve from cache when the cached frame already covers the viewport.
-        if let Some(cached) = self.frame_cache.get(&ts) {
-            if cached.covers_bounds(bounds, tile_zoom) {
-                let mut frame = cached.clone();
-                frame.trim_to_bounds(bounds);
-                self.radar_frame = Some(frame);
-                self.radar_requested_ts = Some(ts);
-                self.radar_frame_ts = Some(ts);
-                self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
-                self.trigger_radar_preload();
-                return;
-            }
-        }
-
-        // Cache miss or stale coverage: abort preload to avoid grid_cache
-        // mutex contention, then proceed with normal streaming fetch.
-        if let Some(task) = self.radar_preload_task.take() {
-            task.abort();
-        }
-
-        // Skip only when the current frame already covers the viewport
-        // AND is for the same timestamp — coverage alone can't tell two
-        // frame times apart, which used to break `[`/`]` stepping.
-        if self.radar_requested_ts == Some(ts)
-            && self
-                .radar_frame
-                .as_ref()
-                .is_some_and(|frame| frame.covers_bounds(bounds, tile_zoom))
-        {
+    /// Serve or kick off the samplable [`RadarField`] for `ts` — what
+    /// `raster_radar` samples per sub-cell. The field covers the whole grid,
+    /// so a pan/zoom that leaves `ts` unchanged is a no-op; only a different
+    /// timeline frame refetches.
+    ///
+    /// A warm `ts` (already decoded, or its `.frd` bytes already RAM-cached)
+    /// is served synchronously — no async round trip, so stepping onto an
+    /// already-loaded frame swaps `current_field` this tick. F-1: a `ts`
+    /// with a recorded failure is only re-requested once its backoff has
+    /// elapsed, so one transient error never wedges the frame permanently.
+    pub fn request_field_refresh(&mut self, ts: i64) {
+        if self.field_requested_ts == Some(ts) && !self.field_failures.contains_key(&ts) {
             return;
         }
-        // Don't restart if a task for this timestamp is already
-        // in-flight — the existing fetch will produce the same tiles.
-        if self.refresh_task.is_some() && self.radar_requested_ts == Some(ts) {
+        if !retry_due(&self.field_failures, ts, Instant::now()) {
             return;
         }
-        self.radar_requested_ts = Some(ts);
-        if let Some(task) = self.refresh_task.take() {
-            task.abort();
+        if let Some(field) = self.meteogate.field_warm(ts) {
+            self.field_requested_ts = Some(ts);
+            self.current_field = Some(field);
+            self.field_failures.remove(&ts);
+            self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
+            return;
         }
-        self.refresh_id = self.refresh_id.wrapping_add(1);
-        let id = self.refresh_id;
+        self.field_requested_ts = Some(ts);
+        // Push the retry clock forward so a re-request already in flight
+        // isn't relaunched again next tick before it resolves.
+        if let Some(retry) = self.field_failures.get_mut(&ts) {
+            retry.next_at = Instant::now() + FRAME_RETRY_POLICY.delay_for(retry.attempts);
+        }
+        self.field_refresh_id = self.field_refresh_id.wrapping_add(1);
+        let id = self.field_refresh_id;
         let provider = self.meteogate.clone();
-        let tx = self.refresh_tx.clone();
-        let zoom = self.viewport.zoom;
-        // Prefetch tiles for a slightly larger area so small pans hit
-        // the cache instead of triggering a network round-trip.
-        let fetch_bounds = bounds.expanded(0.5);
+        let tx = self.field_tx.clone();
         self.layers.set_status(LayerId::Radar, LayerStatus::Loading);
-
-        let task_id = next_task_id();
-        let task_tx = self.task_tx.clone();
-        let _ = task_tx.send(TaskMsg::Start {
-            id: task_id,
-            label: format!("frame {ts}"),
-            kind: TaskKind::RadarFrame,
+        tokio::spawn(async move {
+            let result = provider.field(ts).await.map_err(|e| e.to_string());
+            let _ = tx.send(FieldRefreshResult { id, ts, result });
         });
+    }
 
-        // Create a tile-level channel for streaming tiles.  The
-        // provider will send each tile individually as it completes,
-        // in centre-first clockwise spiral order.
-        let (tile_tx, mut tile_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        self.refresh_task = Some(tokio::spawn(async move {
-            // Forward each tile through the outer refresh channel
-            // as it arrives, so the UI can render progressively.
-            let tx2 = tx.clone();
-            let task_tx2 = task_tx.clone();
-            let forwarder = tokio::spawn(async move {
-                let mut tile_count = 0u32;
-                while let Some(tile_result) = tile_rx.recv().await {
-                    let payload = match tile_result {
-                        Ok(tile) => {
-                            tile_count += 1;
-                            // Asymptotic fraction: each tile moves the bar
-                            // closer to 95 %.  Assume ~30 tiles is typical.
-                            let fraction = (1.0 - 0.5f64.powi(tile_count as i32 / 3)).min(0.95);
-                            let _ = task_tx2.send(TaskMsg::Progress {
-                                id: task_id,
-                                action: format!("{} tiles", tile_count),
-                                fraction: Some(fraction),
-                            });
-                            RadarRefreshPayload::Tile(tile)
-                        }
-                        Err(_) => continue, // skip errored tiles
-                    };
-                    let _ = tx2.send(RadarRefreshResult {
-                        id,
-                        result: payload,
-                    });
-                }
-            });
-
-            // Launch the streaming frame load.
-            let frame_result = provider
-                .frame_streamed(ts, fetch_bounds, zoom, tile_tx)
-                .await;
-
-            // Wait for the forwarder to drain any in-flight tiles.
-            let _ = forwarder.await;
-
-            let result = match frame_result {
-                Ok(frame) => {
-                    let _ = task_tx.send(TaskMsg::Complete { id: task_id });
-                    RadarRefreshPayload::Ready(frame)
+    /// Drain completed field fetches into `current_field`. Stale results
+    /// (a later frame was requested before this one finished) are
+    /// discarded — same `refresh_id`-gating pattern as the other drains.
+    ///
+    /// The result carries its own `ts` (the frame it was fetched for), so a
+    /// warm step to a different frame — which updates `field_requested_ts`
+    /// without bumping `field_refresh_id` — can't have its still-in-flight
+    /// predecessor overwrite `current_field` once it lands:
+    /// [`field_result_wanted`] gates `current_field` on the result's own
+    /// `ts` still matching the frame we actually want displayed.
+    pub fn drain_field_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.field_rx.try_recv() {
+            if result.id != self.field_refresh_id {
+                continue;
+            }
+            changed = true;
+            let ts = result.ts;
+            let wanted = field_result_wanted(self.field_requested_ts, ts);
+            match result.result {
+                Ok(field) => {
+                    if wanted {
+                        self.current_field = Some(field);
+                        self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
+                    }
+                    self.field_failures.remove(&ts);
                 }
                 Err(error) => {
-                    let _ = task_tx.send(TaskMsg::Error {
-                        id: task_id,
-                        error: error.to_string(),
-                    });
-                    RadarRefreshPayload::Error(error.to_string())
+                    // Leave the previous field on screen rather than
+                    // blanking the map on a transient fetch failure. F-1:
+                    // record the failure so it is retried with backoff
+                    // instead of never being requested again.
+                    write_log(
+                        &self.dirs.log_path,
+                        format!("field refresh failed for ts={ts}: {error}"),
+                    );
+                    if wanted {
+                        self.layers
+                            .set_status(LayerId::Radar, LayerStatus::Error(error.clone()));
+                    }
+                    self.note_field_failure(ts);
                 }
-            };
-            let _ = tx.send(RadarRefreshResult { id, result });
+            }
+        }
+        changed
+    }
+
+    /// Spawn a background task that warms uncached playback-window frames'
+    /// `.frd` bytes into RAM, keyed off ring-distance from the playhead so
+    /// nearby slots warm first, but only the compact `.frd` bytes — no
+    /// decode — so the window stays resident without paying for
+    /// `MAX_CACHED_GRIDS`-sized decoded grids.
+    pub fn trigger_field_preload(&mut self) {
+        if self.is_dragging || self.timestamps.is_empty() || !self.layers.enabled(LayerId::Radar) {
+            return;
+        }
+        if let Some(task) = self.field_preload_task.take() {
+            task.abort();
+        }
+        let len = self.timestamps.len();
+        let now = Instant::now();
+        let current_ts = self.timestamps.get(self.frame_index).copied();
+        let mut by_distance: Vec<(usize, i64)> = self
+            .timestamps
+            .iter()
+            .enumerate()
+            .filter(|(_, ts)| Some(**ts) != current_ts)
+            .map(|(i, &ts)| (ring_distance(i, self.frame_index, len), ts))
+            .collect();
+        by_distance.sort_by_key(|&(d, _)| d);
+        by_distance.truncate(PRELOAD_WINDOW);
+
+        // Keep the RAM byte cache scoped to this window: frames that have
+        // scrolled out of it entirely don't need to sit in RAM for the rest
+        // of the session (the RAM criterion this cache exists to satisfy).
+        let mut keep: HashSet<i64> = by_distance.iter().map(|(_, ts)| *ts).collect();
+        keep.extend(current_ts);
+        self.meteogate.prune_field_window(&keep);
+
+        let to_load: Vec<i64> = by_distance
+            .into_iter()
+            .map(|(_, ts)| ts)
+            .filter(|ts| !self.meteogate.field_is_warm(*ts))
+            .filter(|ts| retry_due(&self.field_failures, *ts, now))
+            .collect();
+        if to_load.is_empty() {
+            return;
+        }
+        for ts in &to_load {
+            if let Some(retry) = self.field_failures.get_mut(ts) {
+                retry.next_at = Instant::now() + FRAME_RETRY_POLICY.delay_for(retry.attempts);
+            }
+        }
+        let provider = self.meteogate.clone();
+        let tx = self.field_preload_tx.clone();
+        self.field_preload_task = Some(tokio::spawn(async move {
+            const MAX_CONCURRENT_FIELD_PRELOADS: usize = 2;
+            let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FIELD_PRELOADS));
+            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+            for ts in to_load {
+                let provider = provider.clone();
+                let tx = tx.clone();
+                let sem = Arc::clone(&sem);
+                futs.push(async move {
+                    let _permit = sem.acquire().await;
+                    let ok = provider.warm_field(ts).await.is_ok();
+                    let _ = tx.send(FieldPreloadResult { timestamp: ts, ok });
+                });
+            }
+            while futs.next().await.is_some() {}
         }));
+    }
+
+    /// Drain completed field preload results, clearing or recording backoff
+    /// on each timestamp per the outcome.
+    pub fn drain_field_preload_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.field_preload_rx.try_recv() {
+            if !self.timestamps.contains(&result.timestamp) {
+                continue;
+            }
+            changed = true;
+            if result.ok {
+                self.field_failures.remove(&result.timestamp);
+            } else {
+                self.note_field_failure(result.timestamp);
+            }
+        }
+        changed
+    }
+
+    /// Re-request a failed field slot once its backoff has expired.  Called
+    /// every tick; cheap when nothing has failed. Without this, a field that
+    /// failed while the user sat still on that frame would stay missing
+    /// indefinitely.
+    pub fn retry_due_fields(&mut self) {
+        if self.field_failures.is_empty() || self.is_dragging {
+            return;
+        }
+        let live: HashSet<i64> = self.timestamps.iter().copied().collect();
+        self.field_failures.retain(|ts, _| live.contains(ts));
+        if let Some(ts) = self.timestamps.get(self.frame_index).copied() {
+            if self.field_failures.contains_key(&ts) {
+                self.request_field_refresh(ts);
+            }
+        }
     }
 
     pub fn request_border_refresh(&mut self) {
@@ -912,9 +952,6 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         let _ = self.border_task.take();
-        if let Some(task) = self.radar_preload_task.take() {
-            task.abort();
-        }
         let spawn_cancel = Arc::new(AtomicBool::new(false));
         self.border_spawn_cancel = Some(spawn_cancel.clone());
         self.border_fetch_resolution = Some(resolution);
@@ -988,7 +1025,7 @@ impl App {
             // Layer already cached — use it immediately and let the
             // in‑flight task (if any) finish on its own.  Its result
             // will carry a stale border_refresh_id and be discarded
-            // by drain_refresh_results, but the spawn_blocking work
+            // by drain_border_results, but the spawn_blocking work
             // it does (tile loading / generation) populates the on‑
             // disk cache for future launches.
             self.borders = Some(layer);
@@ -1014,9 +1051,6 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         let _ = self.border_task.take();
-        if let Some(task) = self.radar_preload_task.take() {
-            task.abort();
-        }
         let spawn_cancel = Arc::new(AtomicBool::new(false));
         self.border_spawn_cancel = Some(spawn_cancel.clone());
         self.border_fetch_resolution = Some(desired);
@@ -1486,117 +1520,10 @@ impl App {
         }
     }
 
-    pub fn drain_refresh_results(&mut self) -> bool {
+    /// Drain completed border-fetch results (initial load, preload, and tile
+    /// build progress).
+    pub fn drain_border_results(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(result) = self.refresh_rx.try_recv() {
-            if result.id != self.refresh_id {
-                continue;
-            }
-            changed = true;
-            match result.result {
-                RadarRefreshPayload::Tile(tile) => {
-                    // Tiles for a different frame time must not merge
-                    // with the old frame — coords collide and the stale
-                    // tile would win.  Evict on first new-time tile.
-                    if self.radar_frame_ts != self.radar_requested_ts {
-                        self.radar_frame = None;
-                        self.radar_frame_ts = self.radar_requested_ts;
-                    }
-                    // Merge individual tile into the current frame
-                    // so the UI renders progressively.
-                    if let Some(frame) = &mut self.radar_frame {
-                        // If zoom changed, evict stale tiles from the
-                        // previous zoom so we don't render multiple
-                        // detail levels at the same time.
-                        if tile.coord.z != frame.target_zoom {
-                            frame.tiles.retain(|t| t.coord.z == tile.coord.z);
-                            frame.target_zoom = tile.coord.z;
-                        }
-                        if !frame.tiles.iter().any(|t| t.coord == tile.coord) {
-                            frame.tiles.push(tile);
-                        }
-                    } else {
-                        let z = tile.coord.z;
-                        self.radar_frame = Some(RadarFrame {
-                            time: self.radar_requested_ts.unwrap_or(0),
-                            path: String::new(),
-                            tiles: vec![tile],
-                            missing_tiles: 0,
-                            target_zoom: z,
-                        });
-                    }
-                }
-                RadarRefreshPayload::Ready(frame) => {
-                    self.radar_frame_ts = self.radar_requested_ts;
-                    if !frame.tiles.is_empty() {
-                        // Non-streaming path (initial load): merge normally.
-                        self.merge_radar_frame(frame);
-                    } else {
-                        // Streaming path: just update metadata.
-                        if let Some(existing) = &mut self.radar_frame {
-                            existing.time = frame.time;
-                            existing.path = frame.path;
-                            existing.target_zoom = frame.target_zoom;
-                            existing.missing_tiles = frame.missing_tiles;
-                        } else {
-                            self.radar_frame = Some(frame);
-                        }
-                    }
-                    // Trim off-screen tiles so the tile list doesn't grow
-                    // unbounded across successive pan-triggered refreshes.
-                    if let Some(rf) = &mut self.radar_frame {
-                        let b = self.viewport.bounds(self.map_width, self.map_height);
-                        rf.trim_to_bounds(b);
-                    }
-                    self.layers.set_status(LayerId::Radar, LayerStatus::Ready);
-                    self.refresh_task = None;
-                    // If the provider resolved a different timestamp than requested,
-                    // that slot is a phantom (not yet published on S3). Remove it so
-                    // it can't masquerade as a distinct frame on the timeline.
-                    if let (Some(req_ts), Some(actual_ts)) = (
-                        self.radar_requested_ts,
-                        self.radar_frame.as_ref().map(|f| f.time),
-                    ) {
-                        if actual_ts != req_ts {
-                            self.drop_phantom_slot(req_ts, actual_ts);
-                        }
-                    }
-                    // Cache the completed frame and kick off preload for the rest.
-                    // Key by the frame's real time, not the requested slot, so a
-                    // resolved-elsewhere frame can't occupy two timeline slots.
-                    // It loaded — drop any retry bookkeeping for this slot.
-                    if let Some(req) = self.radar_requested_ts {
-                        self.radar_failures.remove(&req);
-                    }
-                    if let Some(f) = self.radar_frame.as_ref() {
-                        let ts = f.time;
-                        self.radar_failures.remove(&ts);
-                        let zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
-                        if zoom == self.frame_cache_zoom && self.timestamps.contains(&ts) {
-                            let f = f.clone();
-                            self.frame_cache.insert(ts, f);
-                            // Evict oldest entries beyond 6 to bound memory.
-                            if self.frame_cache.len() > 6 {
-                                let evict_ts = self.frame_cache.keys().copied().min().unwrap_or(ts);
-                                self.frame_cache.remove(&evict_ts);
-                            }
-                        }
-                    }
-                    self.trigger_radar_preload();
-                }
-                RadarRefreshPayload::Error(error) => {
-                    self.layers
-                        .set_status(LayerId::Radar, LayerStatus::Error(error));
-                    self.refresh_task = None;
-                    // Queue the displayed slot for another attempt.  Showing an
-                    // error and then never trying again left the map blank until
-                    // the user happened to pan.
-                    if let Some(ts) = self.radar_requested_ts {
-                        self.note_frame_failure(ts);
-                    }
-                }
-            }
-        }
         while let Ok(result) = self.border_rx.try_recv() {
             // `TilesBuilt` is unconditional — it only bumps the
             // progress counter regardless of staleness, but we dedup
@@ -2255,12 +2182,6 @@ impl App {
         for task in self.preload_tasks.drain(..) {
             task.abort();
         }
-        if let Some(task) = self.radar_preload_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.refresh_task.take() {
-            task.abort();
-        }
         if let Some(task) = self.border_task.take() {
             task.abort();
         }
@@ -2529,10 +2450,6 @@ impl App {
                 None => self.timestamps.len().saturating_sub(1),
             }
         };
-        // Frames outside the new window are dead weight in memory; the on-disk
-        // GeoTIFFs remain, so re-widening reloads them without touching S3.
-        let keep: HashSet<i64> = self.timestamps.iter().copied().collect();
-        self.frame_cache.retain(|ts, _| keep.contains(ts));
         // A deeper window exposes older slots that earlier sessions may already
         // have fetched; rescan so they show as available immediately.
         self.disk_frames = self.meteogate.cached_timestamps();
@@ -2546,216 +2463,17 @@ impl App {
         );
     }
 
-    /// Spawn a background task that loads uncached radar frames near the
-    /// playhead at the current viewport, in parallel.  Uses a small semaphore
-    /// (2) so preload doesn't steal HTTP/CPU resources from higher-priority
-    /// work (borders, current frame, observations).  Aborts any existing
-    /// preload.
-    pub fn trigger_radar_preload(&mut self) {
-        // Never preload mid-drag.  `request_meteogate_refresh` runs on
-        // every mouse-move tick and, while the current frame still covers
-        // the viewport, reaches this call each time.  Aborting and
-        // relaunching the 11-frame preload pipeline every tick spawns
-        // GeoTIFF decodes that `spawn_blocking` cannot cancel, so they
-        // pile up on the blocking pool and make dragging progressively
-        // slower.  Preload resumes once the drag ends.
-        if self.is_dragging {
-            return;
-        }
-        if let Some(task) = self.radar_preload_task.take() {
-            task.abort();
-        }
-        if self.timestamps.is_empty() || !self.layers.enabled(LayerId::Radar) {
-            return;
-        }
-        let zoom = self.viewport.zoom;
-        let tile_zoom = zoom.round().clamp(1.0, 7.0) as u8;
-        let bounds = self.viewport.bounds(self.map_width, self.map_height);
-        let fetch_bounds = bounds.expanded(0.5);
-        let current_ts = self.timestamps.get(self.frame_index).copied();
-        // Preload a window around the playhead rather than the whole timeline.
-        // At 24 h that would be 288 slots, and every zoom change clears
-        // `frame_cache` and re-decodes them: the GeoTIFFs come off disk, but
-        // each still costs a ~140 ms parse, so a full sweep would burn a minute
-        // of CPU per zoom.  The window re-centres as the playhead moves, so
-        // playback stays fed while the cost per trigger stays bounded.
-        //
-        // Distance is measured around the ring, so the window spans the wrap
-        // instead of stopping dead at either end: sitting on the newest frame
-        // preloads the oldest ones too, which is where the loop lands next.
-        let len = self.timestamps.len();
-        let now = Instant::now();
-        let mut by_distance: Vec<(usize, i64)> = self
-            .timestamps
-            .iter()
-            .enumerate()
-            .filter(|(_, ts)| !self.frame_cache.contains_key(ts) && Some(**ts) != current_ts)
-            // A slot that just failed is held back until its backoff expires,
-            // so a genuinely unavailable frame doesn't get hammered on every
-            // pan while a transient one still recovers quickly.
-            .filter(|(_, ts)| {
-                self.radar_failures.get(ts).is_none_or(|retry| {
-                    now >= retry.next_at && !FRAME_RETRY_POLICY.exhausted(retry.attempts)
-                })
-            })
-            .map(|(i, &ts)| (ring_distance(i, self.frame_index, len), ts))
-            .collect();
-        // Nearest the playhead first: those are the frames playback reaches
-        // soonest, and the truncation drops the most distant.
-        by_distance.sort_by_key(|&(d, _)| d);
-        by_distance.truncate(PRELOAD_WINDOW);
-        let to_load: Vec<i64> = by_distance.into_iter().map(|(_, ts)| ts).collect();
-        if to_load.is_empty() {
-            return;
-        }
-        // Push the retry clock forward for every failed slot we are about to
-        // request.  `retry_due_frames` runs each tick, so without this a slot
-        // would still read as "due" while its fetch was in flight and every
-        // tick would abort and relaunch the pass — the frame would never land.
-        for ts in &to_load {
-            if let Some(retry) = self.radar_failures.get_mut(ts) {
-                retry.next_at = Instant::now() + FRAME_RETRY_POLICY.delay_for(retry.attempts);
-            }
-        }
-        let provider = self.meteogate.clone();
-        let tx = self.radar_preload_tx.clone();
-        self.radar_preload_task = Some(tokio::spawn(async move {
-            const MAX_CONCURRENT_PRELOADS: usize = 2;
-            let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PRELOADS));
-            let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
-            for ts in to_load {
-                let provider = provider.clone();
-                let tx = tx.clone();
-                let sem = Arc::clone(&sem);
-                futs.push(async move {
-                    let _permit = sem.acquire().await;
-                    // Failures are reported too, so the slot can be retried
-                    // instead of silently staying blank forever.
-                    let frame = provider.frame(ts, fetch_bounds, zoom).await.ok();
-                    let _ = tx.send(RadarPreloadResult {
-                        timestamp: ts,
-                        tile_zoom,
-                        frame,
-                    });
-                });
-            }
-            while futs.next().await.is_some() {}
-        }));
+    /// Record a failed field fetch and schedule the next attempt (F-1): a
+    /// transient field-fetch failure retries with backoff instead of
+    /// permanently wedging that frame.
+    fn note_field_failure(&mut self, ts: i64) {
+        note_failure(&mut self.field_failures, ts, &self.dirs.log_path, "field");
     }
 
-    /// Drain completed preload results into `frame_cache`.
-    pub fn drain_preload_results(&mut self) -> bool {
-        let mut changed = false;
-        let current_zoom = self.viewport.zoom.round().clamp(1.0, 7.0) as u8;
-        while let Ok(result) = self.radar_preload_rx.try_recv() {
-            if result.tile_zoom != current_zoom {
-                continue;
-            }
-            if !self.timestamps.contains(&result.timestamp) {
-                continue;
-            }
-            let Some(frame) = result.frame else {
-                self.note_frame_failure(result.timestamp);
-                continue;
-            };
-            // The provider resolves a requested slot to whatever is actually
-            // published, so key the cache by the time the frame really holds.
-            // Caching under the requested slot instead would show the same
-            // data on two timeline positions and mark both as loaded.
-            let actual_ts = frame.time;
-            if actual_ts != result.timestamp {
-                changed |= self.drop_phantom_slot(result.timestamp, actual_ts);
-                if !self.timestamps.contains(&actual_ts) {
-                    continue;
-                }
-            }
-            // Loading it wrote the GeoTIFF to disk, so it stays reloadable
-            // after `prune_frame_cache` drops it from RAM.
-            self.disk_frames.insert(actual_ts);
-            self.frame_cache.insert(actual_ts, frame);
-            // Both the requested and the resolved slot are settled now.
-            self.radar_failures.remove(&result.timestamp);
-            self.radar_failures.remove(&actual_ts);
-            changed = true;
-        }
-        self.prune_frame_cache();
-        changed
-    }
-
-    /// Record a failed slot and schedule the next attempt.
-    ///
-    /// The backoff grows per attempt but is capped, so retries continue for as
-    /// long as the slot is on the timeline: a frame missing because of an
-    /// outage fills itself in once the outage ends, with no user action.
-    fn note_frame_failure(&mut self, ts: i64) {
-        let entry = self.radar_failures.entry(ts).or_insert(FrameRetry {
-            attempts: 0,
-            next_at: Instant::now(),
-        });
-        entry.attempts = entry.attempts.saturating_add(1);
-        let backoff = FRAME_RETRY_POLICY.delay_for(entry.attempts);
-        entry.next_at = Instant::now() + backoff;
-        let msg = if entry.attempts >= FRAME_RETRY_GIVE_UP {
-            format!(
-                "radar: frame {ts} failed (attempt {}) — giving up this session",
-                entry.attempts
-            )
-        } else {
-            format!(
-                "radar: frame {ts} failed (attempt {}) — retrying in {backoff:?}",
-                entry.attempts
-            )
-        };
-        write_log(&self.dirs.log_path, msg);
-    }
-
-    /// Re-launch a preload pass when a failed slot has become due for another
-    /// attempt.  Called every tick; cheap when nothing is pending.
-    ///
-    /// Without this, a failed slot would only be retried if some *other* event
-    /// happened to trigger a preload, so a frame that failed while the user sat
-    /// still would stay missing indefinitely.
-    pub fn retry_due_frames(&mut self) {
-        if self.radar_failures.is_empty() || self.is_dragging {
-            return;
-        }
-        // Forget slots that have scrolled off the timeline entirely.
-        let live: HashSet<i64> = self.timestamps.iter().copied().collect();
-        self.radar_failures.retain(|ts, _| live.contains(ts));
-
-        let now = Instant::now();
-
-        // The frame on screen is not part of a preload pass, so it needs its
-        // own re-request — and it is the one the user is actually waiting for.
-        let current_ts = self.timestamps.get(self.frame_index).copied();
-        if let Some(ts) = current_ts {
-            let due = self.radar_failures.get(&ts).is_some_and(|retry| {
-                now >= retry.next_at && !FRAME_RETRY_POLICY.exhausted(retry.attempts)
-            });
-            if due && self.refresh_task.is_none() && !self.frame_cache.contains_key(&ts) {
-                if let Some(retry) = self.radar_failures.get_mut(&ts) {
-                    // Same in-flight guard as the preload path.
-                    retry.next_at = now + FRAME_RETRY_POLICY.delay_for(retry.attempts);
-                }
-                self.request_meteogate_refresh(self.map_width, self.map_height);
-                return;
-            }
-        }
-
-        let due = self.radar_failures.iter().any(|(ts, retry)| {
-            now >= retry.next_at
-                && !FRAME_RETRY_POLICY.exhausted(retry.attempts)
-                && !self.frame_cache.contains_key(ts)
-        });
-        if due {
-            self.trigger_radar_preload();
-        }
-    }
-
-    /// How readily `ts` can be displayed: decoded in RAM, on disk needing only
-    /// a decode, or absent and needing a fetch.
+    /// How readily `ts` can be displayed: its `.frd` bytes already RAM-warm,
+    /// on disk needing only a decode, or absent and needing a fetch.
     pub fn slot_state(&self, ts: i64) -> crate::ui::SlotState {
-        if self.frame_cache.contains_key(&ts) {
+        if self.meteogate.field_is_warm(ts) {
             crate::ui::SlotState::InRam
         } else if self.disk_frames.contains(&ts) {
             crate::ui::SlotState::OnDisk
@@ -2764,59 +2482,13 @@ impl App {
         }
     }
 
-    /// Evict cached frames furthest from the playhead once the cache exceeds
-    /// [`FRAME_CACHE_MAX`].
-    fn prune_frame_cache(&mut self) {
-        for ts in frames_to_evict(
-            &self.frame_cache.keys().copied().collect::<Vec<_>>(),
-            &self.timestamps,
-            self.frame_index,
-            FRAME_CACHE_MAX,
-        ) {
-            self.frame_cache.remove(&ts);
-        }
-    }
-
-    /// Drop a requested slot that the provider resolved to a different time.
-    ///
-    /// Such a slot is not actually published, so leaving it on the timeline
-    /// would render its neighbour's data a second time and report it as
-    /// loaded.  Returns `true` when the timeline changed.
-    fn drop_phantom_slot(&mut self, req_ts: i64, resolved_ts: i64) -> bool {
-        let Some((timestamps, frame_index)) = timeline_without_phantom(
-            &self.timestamps,
-            self.frame_index,
-            req_ts,
-            resolved_ts,
-            self.playback_mode == PlaybackMode::Live,
-        ) else {
-            return false;
-        };
-        self.timestamps = timestamps;
-        self.frame_index = frame_index;
-        self.frame_cache.remove(&req_ts);
-        write_log(
-            &self.dirs.log_path,
-            format!("meteogate: removed phantom slot {req_ts} (resolved to {resolved_ts})"),
-        );
-        true
-    }
-
-    fn merge_radar_frame(&mut self, frame: RadarFrame) {
-        if let Some(existing) = &mut self.radar_frame {
-            existing.merge_tiles(frame);
-        } else {
-            self.radar_frame = Some(frame);
-        }
-    }
-
     pub fn frame_label(&self) -> String {
-        let Some(frame) = self.radar_frame.as_ref() else {
+        let Some(&ts) = self.timestamps.get(self.frame_index) else {
             return "no frame".to_string();
         };
-        match DateTime::from_timestamp(frame.time, 0) {
+        match DateTime::from_timestamp(ts, 0) {
             Some(dt) => dt.with_timezone(&Local).format("%H:%M").to_string(),
-            None => frame.time.to_string(),
+            None => ts.to_string(),
         }
     }
 
@@ -2957,21 +2629,11 @@ impl App {
 }
 
 #[derive(Debug)]
-struct RadarRefreshResult {
+struct FieldRefreshResult {
     id: u64,
-    result: RadarRefreshPayload,
-}
-
-#[derive(Debug)]
-enum RadarRefreshPayload {
-    /// One tile ready in a streaming frame load.  The receiver should
-    /// merge this into the current `radar_frame` incrementally.
-    Tile(RadarTile),
-    /// All tiles have been streamed.  The frame carries metadata
-    /// (time/path/zoom).  Its `tiles` vec may be empty — tiles were
-    /// already delivered via `Tile`.
-    Ready(RadarFrame),
-    Error(String),
+    /// The ts this fetch was requested for — see [`field_result_wanted`].
+    ts: i64,
+    result: Result<RadarField, String>,
 }
 
 #[derive(Debug)]
@@ -3498,55 +3160,7 @@ mod tests {
         assert!(task.is_visible(start + Duration::from_millis(200)));
     }
 
-    #[test]
-    fn frame_cache_eviction_keeps_the_window_around_the_playhead() {
-        // A full 24 h timeline with every slot cached.
-        let timestamps: Vec<i64> = (0..288).map(|i| 1_000_000 - i * 300).collect();
-        let cached = timestamps.clone();
-        let playhead = 100;
-        let evicted = frames_to_evict(&cached, &timestamps, playhead, 48);
-
-        assert_eq!(evicted.len(), 288 - 48, "cache must be brought down to cap");
-        let kept: Vec<i64> = cached
-            .iter()
-            .copied()
-            .filter(|ts| !evicted.contains(ts))
-            .collect();
-        assert_eq!(kept.len(), 48);
-        // The displayed frame must survive — evicting it would blank the map.
-        assert!(kept.contains(&timestamps[playhead]));
-        // What survives is contiguous around the playhead, not scattered.
-        let kept_idx: Vec<usize> = kept
-            .iter()
-            .map(|ts| timestamps.iter().position(|t| t == ts).unwrap())
-            .collect();
-        let far = kept_idx.iter().map(|i| i.abs_diff(playhead)).max().unwrap();
-        assert!(
-            far <= 24,
-            "kept frames should hug the playhead, furthest={far}"
-        );
-    }
-
-    #[test]
-    fn frame_cache_eviction_drops_frames_no_longer_on_the_timeline_first() {
-        let timestamps: Vec<i64> = (0..4).map(|i| 1_000_000 - i * 300).collect();
-        // Two cached frames that fell off the timeline (e.g. after `i` narrowed
-        // the window) plus the four live ones.
-        let mut cached = vec![55_555, 66_666];
-        cached.extend(timestamps.iter().copied());
-        let evicted = frames_to_evict(&cached, &timestamps, 0, 4);
-        assert_eq!(
-            evicted.len(),
-            2,
-            "only the excess is dropped, not the whole tail"
-        );
-        assert!(evicted.contains(&55_555) && evicted.contains(&66_666));
-        for ts in &timestamps {
-            assert!(!evicted.contains(ts), "live timeline frames must be kept");
-        }
-    }
-
-    /// `note_frame_failure` has no seam to drive without a fully constructed
+    /// `note_field_failure` has no seam to drive without a fully constructed
     /// `App`, so this asserts the policy call it now delegates to
     /// (`FRAME_RETRY_POLICY.delay_for(entry.attempts)`, `attempts` already
     /// incremented to 1 on the first failure — see the doc comment on
@@ -3567,6 +3181,84 @@ mod tests {
         assert!(FRAME_RETRY_POLICY.exhausted(8));
     }
 
+    // ── F-1: field-fetch failures retry with backoff, never wedge ───────
+
+    #[test]
+    fn retry_due_gates_immediate_reretry_after_a_failure() {
+        let mut failures: HashMap<i64, FrameRetry> = HashMap::new();
+        let log = std::env::temp_dir().join("front-test-field-retry.log");
+
+        assert!(
+            retry_due(&failures, 42, Instant::now()),
+            "no record yet: eligible"
+        );
+
+        note_failure(&mut failures, 42, &log, "field");
+        assert!(
+            !retry_due(&failures, 42, Instant::now()),
+            "must not hammer the same tick as the failure — this is the F-1 gap"
+        );
+
+        // First failure's backoff is `FRAME_RETRY_POLICY.delay_for(1)` = 4s.
+        let later = Instant::now() + Duration::from_secs(5);
+        assert!(
+            retry_due(&failures, 42, later),
+            "due once the backoff elapses — the ts is never permanently wedged"
+        );
+
+        // A second failure doubles the backoff rather than giving up.
+        note_failure(&mut failures, 42, &log, "field");
+        assert_eq!(failures[&42].attempts, 2);
+        assert!(!retry_due(
+            &failures,
+            42,
+            Instant::now() + Duration::from_secs(5)
+        ));
+        assert!(retry_due(
+            &failures,
+            42,
+            Instant::now() + Duration::from_secs(9)
+        ));
+
+        // Clearing on success (what `drain_field_results`/
+        // `drain_field_preload_results` do) makes it immediately eligible
+        // again.
+        failures.remove(&42);
+        assert!(retry_due(&failures, 42, Instant::now()));
+    }
+
+    #[test]
+    fn field_failures_give_up_after_the_policy_limit_but_stay_pinned_rather_than_looping() {
+        let mut failures: HashMap<i64, FrameRetry> = HashMap::new();
+        let log = std::env::temp_dir().join("front-test-field-giveup.log");
+        for _ in 0..FRAME_RETRY_GIVE_UP {
+            note_failure(&mut failures, 7, &log, "field");
+        }
+        assert!(FRAME_RETRY_POLICY.exhausted(failures[&7].attempts));
+        assert!(
+            !retry_due(&failures, 7, Instant::now() + Duration::from_secs(1000)),
+            "an exhausted slot is given up on, not retried forever"
+        );
+    }
+
+    #[test]
+    fn field_result_wanted_rejects_a_stale_fetch_after_a_warm_step() {
+        // Reviewer-traced race: request_field_refresh(A) goes cold (spawns an
+        // async fetch), then before it resolves the user warm-steps to B —
+        // field_requested_ts becomes B without a new id being minted. When
+        // the stale A fetch lands, its own `ts` (A) no longer matches the
+        // now-requested B, so it must not be allowed to clobber `current_field`.
+        let field_requested_ts = Some(2_i64); // B, set by the warm step
+        assert!(
+            !field_result_wanted(field_requested_ts, 1), // stale result for A
+            "a result for a frame that's no longer requested must not apply"
+        );
+        assert!(
+            field_result_wanted(field_requested_ts, 2),
+            "a result for the currently-requested frame still applies"
+        );
+    }
+
     #[test]
     fn ring_distance_measures_across_the_wrap() {
         // 10 slots: index 0 is newest, 9 oldest, and playback joins them.
@@ -3580,29 +3272,6 @@ mod tests {
             0,
             "an empty timeline has no distance"
         );
-    }
-
-    #[test]
-    fn eviction_keeps_the_frames_just_past_the_wrap() {
-        // Playhead on the newest frame, every slot cached, cap 48.  The next
-        // frames playback shows are the oldest ones, across the seam.
-        let timestamps: Vec<i64> = (0..288).map(|i| 1_000_000 - i * 300).collect();
-        let evicted = frames_to_evict(&timestamps, &timestamps, 0, 48);
-        let kept: Vec<i64> = timestamps
-            .iter()
-            .copied()
-            .filter(|ts| !evicted.contains(ts))
-            .collect();
-        assert_eq!(kept.len(), 48);
-        assert!(kept.contains(&timestamps[0]), "displayed frame survives");
-        // The oldest frames — one step away round the ring — must survive too.
-        assert!(
-            kept.contains(&timestamps[287]),
-            "the frame playback wraps onto was evicted"
-        );
-        assert!(kept.contains(&timestamps[286]));
-        // The genuinely distant middle of the timeline is what goes.
-        assert!(!kept.contains(&timestamps[144]));
     }
 
     fn dummy_obs_point() -> ObservationPoint {
@@ -3694,50 +3363,6 @@ mod tests {
             i = stepped_index(i, len, Step::Newer).unwrap();
         }
         assert_eq!(i, 0, "and so does stepping back the other way");
-    }
-
-    #[test]
-    fn frame_cache_under_cap_is_left_alone() {
-        let timestamps: Vec<i64> = (0..10).map(|i| 1_000_000 - i * 300).collect();
-        assert!(frames_to_evict(&timestamps, &timestamps, 0, 48).is_empty());
-    }
-
-    #[test]
-    fn phantom_slot_is_removed_from_the_timeline() {
-        let ts = [500i64, 400, 300];
-        // 400 was requested but the provider served 300's data.
-        let (remaining, _) = timeline_without_phantom(&ts, 0, 400, 300, false).unwrap();
-        assert_eq!(remaining, vec![500, 300], "phantom slot must not remain");
-    }
-
-    #[test]
-    fn viewer_keeps_watching_the_same_time_across_a_removal() {
-        let ts = [500i64, 400, 300];
-        // Viewing 300 (index 2) while an earlier slot 400 turns out phantom.
-        // Index must follow the time, not stay at 2 (which no longer exists).
-        let (remaining, index) = timeline_without_phantom(&ts, 2, 400, 300, false).unwrap();
-        assert_eq!(remaining[index], 300, "must still display the same time");
-        assert_eq!(index, 1);
-    }
-
-    #[test]
-    fn viewing_the_phantom_itself_falls_back_to_the_resolved_time() {
-        let ts = [500i64, 400, 300];
-        let (remaining, index) = timeline_without_phantom(&ts, 1, 400, 300, false).unwrap();
-        assert_eq!(remaining[index], 300, "falls back to what was resolved");
-    }
-
-    #[test]
-    fn live_mode_snaps_back_to_the_newest_frame() {
-        let ts = [500i64, 400, 300];
-        let (_, index) = timeline_without_phantom(&ts, 2, 400, 300, true).unwrap();
-        assert_eq!(index, 0, "live always shows newest");
-    }
-
-    #[test]
-    fn unknown_slot_is_not_a_removal() {
-        let ts = [500i64, 400, 300];
-        assert!(timeline_without_phantom(&ts, 0, 999, 300, false).is_none());
     }
 
     /// A coarse GeoIP-only first fix (this dev box measures 10 km) must still

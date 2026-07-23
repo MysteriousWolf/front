@@ -232,7 +232,6 @@ pub fn near_european_capital(lat: f64, lon: f64) -> bool {
         dlat * dlat + dlon * dlon < threshold_sq
     })
 }
-const TILE_SIZE: f64 = 256.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GeoPoint {
@@ -258,13 +257,6 @@ pub struct Bounds {
     pub max_x: f64,
     pub min_y: f64,
     pub max_y: f64,
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub struct TileCoord {
-    pub z: u8,
-    pub x: u32,
-    pub y: u32,
 }
 
 impl GeoPoint {
@@ -393,14 +385,6 @@ impl Bounds {
         self.max_y - self.min_y
     }
 
-    pub fn intersects_tile(self, tile: TileCoord) -> bool {
-        let b = tile_bounds(tile);
-        self.min_x <= b.max_x
-            && self.max_x >= b.min_x
-            && self.min_y <= b.max_y
-            && self.max_y >= b.min_y
-    }
-
     /// Returns `true` if this `Bounds` overlaps `other`.
     pub fn intersects(self, other: Bounds) -> bool {
         self.min_x <= other.max_x
@@ -449,154 +433,6 @@ pub fn world_to_lat_lon(point: WorldPoint) -> GeoPoint {
     let n = PI - 2.0 * PI * point.y;
     let lat = n.sinh().atan().to_degrees();
     GeoPoint::new(lon, lat)
-}
-
-pub fn tile_for_world(point: WorldPoint, z: u8) -> TileCoord {
-    let n = 2_u32.pow(z as u32) as f64;
-    TileCoord {
-        z,
-        x: (point.x * n).floor().clamp(0.0, n - 1.0) as u32,
-        y: (point.y * n).floor().clamp(0.0, n - 1.0) as u32,
-    }
-}
-
-pub fn visible_tiles(bounds: Bounds, z: u8) -> Vec<TileCoord> {
-    let n = 2_u32.pow(z as u32);
-    let min_x = (bounds.min_x * n as f64).floor().clamp(0.0, (n - 1) as f64) as u32;
-    let max_x = (bounds.max_x * n as f64).floor().clamp(0.0, (n - 1) as f64) as u32;
-    let min_y = (bounds.min_y * n as f64).floor().clamp(0.0, (n - 1) as f64) as u32;
-    let max_y = (bounds.max_y * n as f64).floor().clamp(0.0, (n - 1) as f64) as u32;
-    let mut tiles = Vec::new();
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            tiles.push(TileCoord { z, x, y });
-        }
-    }
-    tiles
-}
-
-pub fn tile_bounds(tile: TileCoord) -> Bounds {
-    let n = 2_u32.pow(tile.z as u32) as f64;
-    Bounds {
-        min_x: tile.x as f64 / n,
-        max_x: (tile.x + 1) as f64 / n,
-        min_y: tile.y as f64 / n,
-        max_y: (tile.y + 1) as f64 / n,
-    }
-}
-
-pub fn tile_pixel_to_world(tile: TileCoord, px: u32, py: u32, size: u32) -> WorldPoint {
-    let n = 2_u32.pow(tile.z as u32) as f64;
-    WorldPoint {
-        x: (tile.x as f64 + px as f64 / size as f64) / n,
-        y: (tile.y as f64 + py as f64 / size as f64) / n,
-    }
-}
-
-pub fn world_to_tile_pixel(point: WorldPoint, tile: TileCoord, size: u32) -> (f64, f64) {
-    let n = 2_u32.pow(tile.z as u32) as f64;
-    (
-        (point.x * n - tile.x as f64) * size as f64,
-        (point.y * n - tile.y as f64) * size as f64,
-    )
-}
-
-pub fn world_span_at_zoom(z: u8) -> f64 {
-    TILE_SIZE / (TILE_SIZE * 2_u32.pow(z as u32) as f64)
-}
-
-/// Returns tile coordinates covering `bounds` at zoom `z`, ordered
-/// center-first in clockwise concentric rings.  The center tile is
-/// determined from `center` (viewport centre in world coords).
-/// This ensures tiles closest to the viewport centre are streamed
-/// and rendered first during zoom/pan transitions.
-pub fn tiles_spiral_from(bounds: Bounds, z: u8, center: WorldPoint) -> Vec<TileCoord> {
-    let n = 2u64.pow(z as u32) as f64;
-    let ct = tile_for_world(center, z);
-    let cx = ct.x as i64;
-    let cy = ct.y as i64;
-
-    let min_tx = (bounds.min_x * n).floor().max(0.0) as i64;
-    let max_tx = (bounds.max_x * n).floor().min(n - 1.0) as i64;
-    let min_ty = (bounds.min_y * n).floor().max(0.0) as i64;
-    let max_ty = (bounds.max_y * n).floor().min(n - 1.0) as i64;
-
-    let max_ring = (cx - min_tx)
-        .max(max_tx - cx)
-        .max(cy - min_ty)
-        .max(max_ty - cy);
-
-    let mut tiles = Vec::new();
-
-    // Centre tile first
-    if cx >= min_tx && cx <= max_tx && cy >= min_ty && cy <= max_ty {
-        tiles.push(TileCoord {
-            z,
-            x: cx as u32,
-            y: cy as u32,
-        });
-    }
-
-    for ring in 1..=max_ring {
-        let top = cy - ring;
-        let bottom = cy + ring;
-        let left = cx - ring;
-        let right = cx + ring;
-
-        // Top edge left → right
-        if top >= min_ty && top <= max_ty {
-            let x0 = left.max(min_tx);
-            let x1 = right.min(max_tx);
-            for x in x0..=x1 {
-                tiles.push(TileCoord {
-                    z,
-                    x: x as u32,
-                    y: top as u32,
-                });
-            }
-        }
-
-        // Right edge top → bottom (skip first — already covered by top edge)
-        if right >= min_tx && right <= max_tx {
-            let y0 = (top + 1).max(min_ty);
-            let y1 = bottom.min(max_ty);
-            for y in y0..=y1 {
-                tiles.push(TileCoord {
-                    z,
-                    x: right as u32,
-                    y: y as u32,
-                });
-            }
-        }
-
-        // Bottom edge right → left (skip first)
-        if bottom >= min_ty && bottom <= max_ty {
-            let x0 = left.max(min_tx);
-            let x1 = (right - 1).min(max_tx);
-            for x in (x0..=x1).rev() {
-                tiles.push(TileCoord {
-                    z,
-                    x: x as u32,
-                    y: bottom as u32,
-                });
-            }
-        }
-
-        // Left edge bottom → top (skip first and last)
-        if left >= min_tx && left <= max_tx {
-            let y0 = (top + 1).max(min_ty);
-            let y1 = (bottom - 1).min(max_ty);
-            for y in (y0..=y1).rev() {
-                tiles.push(TileCoord {
-                    z,
-                    x: left as u32,
-                    y: y as u32,
-                });
-            }
-        }
-    }
-
-    tiles
 }
 
 #[cfg(test)]
@@ -673,36 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tile_bounds_at_z1_covers_quadrant() {
-        // At z=1 there are 4 tiles: (0,0), (1,0), (0,1), (1,1).
-        // Tile (0,0) should cover [0,0.5]×[0,0.5].
-        let b = tile_bounds(TileCoord { z: 1, x: 0, y: 0 });
-        assert!((b.min_x - 0.0).abs() < 1e-9);
-        assert!((b.max_x - 0.5).abs() < 1e-9);
-        assert!((b.min_y - 0.0).abs() < 1e-9);
-        assert!((b.max_y - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_tile_pixel_to_world_and_world_to_tile_pixel_roundtrip() {
-        let tc = TileCoord { z: 4, x: 5, y: 3 };
-        let size = 256u32;
-        let px = 64u32;
-        let py = 128u32;
-        let world = tile_pixel_to_world(tc, px, py, size);
-        let (rx, ry) = world_to_tile_pixel(world, tc, size);
-        assert!((rx - px as f64).abs() < 1e-6, "pixel x roundtrip");
-        assert!((ry - py as f64).abs() < 1e-6, "pixel y roundtrip");
-    }
-
-    #[test]
-    fn test_world_span_at_zoom_halves_per_zoom_step() {
-        let s0 = world_span_at_zoom(0);
-        let s1 = world_span_at_zoom(1);
-        assert!((s0 / s1 - 2.0).abs() < 1e-9, "span halves per zoom step");
-    }
-
-    #[test]
     fn test_viewport_pan_stays_in_bounds() {
         let mut vp = Viewport::from_lat_lon(EUROPE_LAT, EUROPE_LON, 4.0);
         for _ in 0..100 {
@@ -726,59 +532,6 @@ mod tests {
         let point = lat_lon_to_world(0.0, 0.0);
         assert!((point.x - 0.5).abs() < 0.0001);
         assert!((point.y - 0.5).abs() < 0.0001);
-    }
-
-    #[test]
-    fn tile_math_clamps_to_valid_range() {
-        assert_eq!(tile_for_world(WorldPoint { x: 1.0, y: 1.0 }, 2).x, 3);
-        assert_eq!(
-            visible_tiles(
-                Bounds {
-                    min_x: 0.0,
-                    max_x: 1.0,
-                    min_y: 0.0,
-                    max_y: 1.0,
-                },
-                1
-            )
-            .len(),
-            4
-        );
-    }
-
-    #[test]
-    fn tiles_spiral_center_first() {
-        // A 3×3 tile set at zoom 3, centre at (1, 1).
-        let bounds = Bounds {
-            min_x: 0.0,
-            max_x: 0.3,
-            min_y: 0.0,
-            max_y: 0.3,
-        };
-        let center = WorldPoint { x: 0.15, y: 0.15 };
-        let tiles = super::tiles_spiral_from(bounds, 3, center);
-        assert!(!tiles.is_empty(), "should produce tile coords");
-        // First tile must be the centre tile
-        assert_eq!(tiles[0].x, 1, "first tile must be centre x");
-        assert_eq!(tiles[0].y, 1, "first tile must be centre y");
-        // All tiles must be unique
-        let mut seen = std::collections::HashSet::new();
-        for t in &tiles {
-            assert!(seen.insert((t.x, t.y)), "duplicate tile ({}, {})", t.x, t.y);
-        }
-    }
-
-    #[test]
-    fn tiles_spiral_single_tile() {
-        let bounds = Bounds {
-            min_x: 0.0,
-            max_x: 0.05,
-            min_y: 0.0,
-            max_y: 0.05,
-        };
-        let center = WorldPoint { x: 0.025, y: 0.025 };
-        let tiles = super::tiles_spiral_from(bounds, 3, center);
-        assert_eq!(tiles.len(), 1, "single tile at zoom 3 for tiny bounds");
     }
 
     #[test]

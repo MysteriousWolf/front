@@ -33,7 +33,7 @@ Version format: `YY.N` — two-digit year, dot, sequential release number starti
 
 ## What this is
 
-`front` (Fancy Radar ObservatioN Tool) is a Rust terminal UI application that renders a live weather radar map in the terminal. It uses ratatui for TUI rendering, tokio for async, and crossterm for terminal control. Data comes from three European weather APIs: MeteoGate (radar tiles via S3), MeteoAlarm (weather warnings), and EUMETNET (surface observations via MeteoGate).
+`front` (Fancy Radar ObservatioN Tool) is a Rust terminal UI application that renders a live weather radar map in the terminal. It uses ratatui for TUI rendering, tokio for async, and crossterm for terminal control. Data comes from three European weather APIs: MeteoGate (radar frames via S3), MeteoAlarm (weather warnings), and EUMETNET (surface observations via MeteoGate).
 
 ## Commands
 
@@ -64,7 +64,9 @@ The `mqtt` feature (enabled by default) adds MQTT live-update support for MeteoA
 
 The central state machine. Owns all data (viewport, radar frame, border layers, observation cache, warning layer) and all background task handles. Background work is fully async; results are delivered through unbounded `tokio::sync::mpsc` channels and drained on each event-loop tick by:
 
-- `drain_refresh_results()` — radar tiles and border layer data
+- `drain_border_results()` — border layer data
+- `drain_field_results()` — the displayed frame's radar `RadarField` (decoded grid)
+- `drain_field_preload_results()` — playback-window frames warmed into the `.frd` RAM cache
 - `drain_obs_results()` — observation points (streamed progressively)
 - `drain_warning_results()` — MeteoAlarm warning polygons
 - `drain_frame_list()` — radar timestamp list
@@ -75,6 +77,16 @@ Each background task is identified by a monotonic `refresh_id`; stale results (i
 ### Rendering (`src/ui.rs`)
 
 Pure ratatui rendering; called on every tick. The map area is drawn using braille characters (2×4 dot grid per terminal cell) to maximise spatial resolution. Three mutually exclusive render modes exist: `Braille`, `Color`, and `Text` — each can be assigned to at most one layer at a time (`RenderModeState` in `src/layers.rs`).
+
+Radar is drawn by **direct grid resampling**, not tiles: `raster_radar` takes a
+sampler closure `Fn(lat, lon) -> Option<(Rgb8, u8)>` and, for each screen
+sub-cell, projects screen → world → lat/lon (`world_to_lat_lon`) and bilinearly
+samples the current frame's `RadarField` (the decoded 1 km grid). Resolution is
+adaptive to the view by construction and zoom/pan never rebuild anything — they
+only change which lat/lons are sampled. Sampling runs in the existing parallel
+row-bands. The displayed frame is `App.current_field`; playback stepping swaps it
+from a warm cache (`.frd` bytes RAM-cached window-wide, decoded grids behind a
+bounded LRU) with no refetch.
 
 Border lines are rasterised into a `BorderMask` (a flat cell grid) which is cached and invalidated only when the viewport or border data changes. The mask supports a `fallback_mask_cache` to avoid a blank flash during resolution transitions.
 
@@ -128,7 +140,7 @@ layer from silently booting up disabled for existing users —
 
 | File | Purpose |
 |---|---|
-| `meteogate.rs` | Radar frame list and tile fetch from MeteoGate S3 + ORD REST API. Implements streaming tile delivery (centre-first spiral). |
+| `meteogate.rs` | Radar frame list + full-frame GeoTIFF fetch from MeteoGate S3 + ORD REST API, decoded to a compact `.frd` grid (1 km LAEA, cached on disk + in a RAM byte cache). Exposes `RadarField` — a decoded grid the renderer bilinearly resamples directly per screen sub-cell (no tiles). |
 | `maps.rs` | Natural Earth GeoJSON download and border tile generation. `BorderResolution` (Low110m → Regional10m) selected by zoom level. |
 | `meteoalarm.rs` | MeteoAlarm EDR API + optional MQTT live updates. |
 | `eumetnet.rs` | EUMETNET surface observations. Fetches in three phases (capitals → major cities → full viewport) sending `PartialCommit` between phases for progressive display. |
